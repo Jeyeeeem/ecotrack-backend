@@ -20,8 +20,8 @@ app.post("/register", async (req, res) => {
 
   try {
     const result = await pool.query(
-      "INSERT INTO users (name, email, password_hash, role) VALUES ($1, $2, $3, $4) RETURNING user_id, name, email, role",
-      [name, email, password, role]
+      "INSERT INTO users (name, username, email, password_hash, role) VALUES ($1, $2, $3, $4, $5) RETURNING user_id, name, email, role",
+      [name, name, email, password, role]
     );
     const user = result.rows[0];
     res.status(201).json({
