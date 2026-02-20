@@ -165,27 +165,27 @@ app.get("/business/directory", async (req, res) => {
 
     const result = await pool.query(`
       SELECT 
-        u.user_id,
-        u.name as business_name,
-        COALESCE(bp.address, 'Location not provided') as location,
-        COALESCE(bp.ecotrust_level, 1) as ecotrust_level,
-        COALESCE(bp.badge, 'New Partner') as badge,
-        COALESCE(bp.points, 0) as points,
-        COALESCE(bp.carbon_this_month, 0) as carbon_impact
-      FROM users u
-      LEFT JOIN business_profiles bp ON u.user_id = bp.user_id
-      WHERE u.role = 'business'
-      ORDER BY bp.ecotrust_level DESC, bp.points DESC
+        bp.business_id,
+        bp.business_name,
+        bp.address,
+        COALESCE(es.current_score, 0) AS current_score,
+        COALESCE(es.total_points_earned, 0) AS total_points_earned,
+        COALESCE(es.level, 'Bronze') AS level,
+        COALESCE(es.rank, 0) AS rank
+      FROM business_profiles bp
+      LEFT JOIN ecotrust_scores es 
+        ON bp.business_id = es.business_id
+      ORDER BY es.current_score DESC NULLS LAST
     `);
 
     const businesses = result.rows.map(row => ({
-      userId: row.user_id,
+      businessId: row.business_id,
       businessName: row.business_name,
-      location: row.location,
-      ecoTrustLevel: row.ecotrust_level,
-      badge: row.badge,
-      points: row.points,
-      carbonImpact: parseFloat(row.carbon_impact)
+      location: row.address,
+      currentScore: row.current_score,
+      totalPoints: row.total_points_earned,
+      level: row.level,
+      rank: row.rank
     }));
 
     res.json({
@@ -202,108 +202,6 @@ app.get("/business/directory", async (req, res) => {
       success: false,
       businesses: null,
       message: "Database error"
-    });
-  }
-});
-
-
-// Get business profile
-app.get("/business/profile/:userId", async (req, res) => {
-
-  const { userId } = req.params;
-
-  try {
-
-    const userResult = await pool.query(
-      "SELECT user_id, name, email FROM users WHERE user_id = $1",
-      [userId]
-    );
-
-    if (userResult.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: "User not found",
-        profile: null
-      });
-    }
-
-    const user = userResult.rows[0];
-
-    const profileResult = await pool.query(
-      `SELECT 
-        ecotrust_level,
-        points,
-        badge,
-        address,
-        contact,
-        carbon_this_month,
-        carbon_reduced,
-        carbon_total_reduced,
-        ai_deliveries,
-        distance_saved,
-        ai_suggestions
-      FROM business_profiles
-      WHERE user_id = $1`,
-      [userId]
-    );
-
-    let profile;
-
-    if (profileResult.rows.length > 0) {
-
-      const data = profileResult.rows[0];
-
-      profile = {
-        userId: user.user_id,
-        businessName: user.name,
-        ecoTrustLevel: data.ecotrust_level || 1,
-        points: data.points || 0,
-        badge: data.badge || "New Partner",
-        address: data.address || "Address not provided",
-        contact: data.contact || "Contact not provided",
-        email: user.email,
-        carbonThisMonth: parseFloat(data.carbon_this_month) || 0,
-        carbonReduced: parseFloat(data.carbon_reduced) || 0,
-        carbonTotalReduced: parseFloat(data.carbon_total_reduced) || 0,
-        aiDeliveries: data.ai_deliveries || 0,
-        distanceSaved: data.distance_saved || 0,
-        aiSuggestions: data.ai_suggestions || 0
-      };
-
-    } else {
-
-      profile = {
-        userId: user.user_id,
-        businessName: user.name,
-        ecoTrustLevel: 1,
-        points: 0,
-        badge: "New Partner",
-        address: "Address not provided",
-        contact: "Contact not provided",
-        email: user.email,
-        carbonThisMonth: 0,
-        carbonReduced: 0,
-        carbonTotalReduced: 0,
-        aiDeliveries: 0,
-        distanceSaved: 0,
-        aiSuggestions: 0
-      };
-    }
-
-    res.json({
-      success: true,
-      profile,
-      message: null
-    });
-
-  } catch (err) {
-
-    console.error(err);
-
-    res.status(500).json({
-      success: false,
-      message: "Database error",
-      profile: null
     });
   }
 });
