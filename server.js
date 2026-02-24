@@ -1,6 +1,7 @@
 const express = require("express");
 const app = express();
 const pool = require("./database");
+const bcrypt = require("bcrypt");
 
 app.use(express.json());
 
@@ -28,12 +29,16 @@ app.post("/register", async (req, res) => {
   }
 
   try {
+
+    // 🔐 HASH PASSWORD
+    const hashedPassword = await bcrypt.hash(password, 10);
+
     const result = await pool.query(
       `INSERT INTO users 
       (name, username, email, password_hash, role) 
       VALUES ($1, $2, $3, $4, $5) 
       RETURNING user_id, name, email, role`,
-      [name, name, email, password, role]
+      [name, name, email, hashedPassword, role]
     );
 
     const user = result.rows[0];
@@ -50,7 +55,6 @@ app.post("/register", async (req, res) => {
     });
 
   } catch (err) {
-
     console.error(err);
 
     if (err.code === "23505") {
@@ -67,13 +71,18 @@ app.post("/register", async (req, res) => {
   }
 });
 
-
-// Login user (case-insensitive email, safer version)
+// Login user
 app.post("/login", async (req, res) => {
 
   const { email, password } = req.body;
 
+  console.log("🔍 [LOGIN] Received request:");
+  console.log("   Email:", email);
+  console.log("   Password:", password);
+  console.log("   Password length:", password ? password.length : 0);
+
   if (!email || !password) {
+    console.log("🔍 [LOGIN] Missing email or password");
     return res.status(400).json({
       success: false,
       message: "Email and password required"
@@ -82,6 +91,7 @@ app.post("/login", async (req, res) => {
 
   try {
 
+    console.log("🔍 [LOGIN] Querying database for email:", email);
     const result = await pool.query(
       `SELECT user_id, name, email, role, password_hash
        FROM users
@@ -89,7 +99,10 @@ app.post("/login", async (req, res) => {
       [email]
     );
 
+    console.log("🔍 [LOGIN] Database rows found:", result.rows.length);
+    
     if (result.rows.length === 0) {
+      console.log("🔍 [LOGIN] User not found in database");
       return res.status(401).json({
         success: false,
         message: "Invalid email or password"
@@ -97,8 +110,19 @@ app.post("/login", async (req, res) => {
     }
 
     const user = result.rows[0];
+    console.log("🔍 [LOGIN] User found:");
+    console.log("   User ID:", user.user_id);
+    console.log("   Name:", user.name);
+    console.log("   Email:", user.email);
+    console.log("   Role:", user.role);
+    console.log("   Stored hash:", user.password_hash.substring(0, 20) + "...");
 
-    if (user.password_hash !== password) {
+    // 🔐 Compare hashed password properly
+    console.log("🔍 [LOGIN] Comparing password...");
+    const isMatch = await bcrypt.compare(password, user.password_hash);
+    console.log("🔍 [LOGIN] Password match result:", isMatch);
+
+    if (!isMatch) {
       return res.status(401).json({
         success: false,
         message: "Invalid email or password"
@@ -117,9 +141,7 @@ app.post("/login", async (req, res) => {
     });
 
   } catch (err) {
-
     console.error(err);
-
     res.status(500).json({
       success: false,
       message: "Database error"
