@@ -177,6 +177,46 @@ app.get("/admin/users", async (req, res) => {
   }
 });
 
+// Update user role
+app.put("/admin/users/:email/role", async (req, res) => {
+  const { email } = req.params;
+  const { role } = req.body;
+
+  if (!role) {
+    return res.status(400).json({
+      success: false,
+      message: "Role is required"
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      `UPDATE users SET role = $1 WHERE LOWER(email) = LOWER($2) RETURNING user_id, name, email, role`,
+      [role, email]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found"
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Role updated successfully",
+      user: result.rows[0]
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      success: false,
+      message: "Database error"
+    });
+  }
+});
+
 
 // ====================== BUSINESS DIRECTORY ROUTES ======================
 
