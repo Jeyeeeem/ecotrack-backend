@@ -1,7 +1,7 @@
 const express = require("express");
 const app = express();
 const pool = require("./database");
-const bcrypt = require("bcrypt");
+const bcrypt = require("bcryptjs");
 
 app.use(express.json());
 
