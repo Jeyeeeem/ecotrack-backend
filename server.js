@@ -612,6 +612,447 @@ app.post("/api/inventory/approve", async (req, res) => {
   }
 });
 
+// Get inventory approval history
+app.get("/api/inventory/history", async (req, res) => {
+  try {
+    // Get resolved/declined inventory alerts
+    const result = await pool.query(`
+      SELECT 
+        id,
+        product_id,
+        product_name,
+        alert_type,
+        risk_level,
+        details,
+        days_left,
+        temperature,
+        humidity,
+        location,
+        quantity,
+        value,
+        status,
+        created_at,
+        updated_at,
+        submitted_by
+      FROM alerts
+      WHERE status IN ('resolved', 'declined')
+      ORDER BY updated_at DESC
+      LIMIT 50
+    `);
+
+    // Get summary stats
+    const statsResult = await pool.query(`
+      SELECT 
+        COUNT(*) as total_decisions,
+        COUNT(*) FILTER (WHERE status = 'resolved') as total_resolved,
+        COUNT(*) FILTER (WHERE status = 'declined') as total_declined
+      FROM alerts
+      WHERE status IN ('resolved', 'declined')
+    `);
+
+    const historyItems = result.rows.map(row => ({
+      id: row.id,
+      itemNumber: `#${row.id}`,
+      priority: row.risk_level || 'MEDIUM',
+      productName: row.product_name || 'Unknown Product',
+      location: row.location || 'Unknown',
+      quantity: row.quantity ? `${row.quantity} kg` : '0 kg',
+      daysLeft: row.days_left || 0,
+      aiSuggestion: row.details || 'No details available',
+      status: row.status === 'resolved' ? 'APPROVED' : 'DECLINED',
+      decidedBy: 'Inventory Manager',
+      decidedAt: row.updated_at || row.created_at,
+      submittedBy: row.submitted_by || 'System',
+      submittedAt: row.created_at,
+      temperature: row.temperature,
+      humidity: row.humidity,
+      alertType: row.alert_type
+    }));
+
+    const stats = statsResult.rows[0] || {
+      total_decisions: 0,
+      total_resolved: 0,
+      total_declined: 0
+    };
+
+    res.json({
+      success: true,
+      history: historyItems,
+      summary: {
+        totalDecisions: parseInt(stats.total_decisions) || 0,
+        totalResolved: parseInt(stats.total_resolved) || 0,
+        totalDeclined: parseInt(stats.total_declined) || 0,
+        approvalRate: stats.total_decisions > 0 
+          ? Math.round((stats.total_resolved / stats.total_decisions) * 100) 
+          : 0
+      },
+      message: null
+    });
+
+  } catch (err) {
+    console.error("Inventory history error:", err);
+    res.status(500).json({
+      success: false,
+      message: "Database error",
+      history: [],
+      summary: { totalDecisions: 0, totalResolved: 0, totalDeclined: 0, approvalRate: 0 }
+    });
+  }
+});
+
+
+// ====================== SUSTAINABILITY MANAGER ROUTES ======================
+
+// Get sustainability dashboard data (pending carbon verifications)
+app.get("/api/sustainability/dashboard", async (req, res) => {
+  try {
+    // Get pending carbon footprint verifications from deliveries
+    // This queries deliveries that have completed and need carbon verification
+    const pendingResult = await pool.query(`
+      SELECT 
+        d.delivery_id,
+        d.route_id,
+        d.status as delivery_status,
+        d.driver_name,
+        d.vehicle_type,
+        d.departure_time,
+        d.arrival_time,
+        d.from_location,
+        d.to_location,
+        d.distance_km,
+        d.fuel_consumption,
+        d.estimated_fuel_consumption_liters,
+        d.carbon_emissions,
+        d.estimated_carbon_kg,
+        d.created_at as submitted_at,
+        d.business_id,
+        bp.business_name
+      FROM deliveries d
+      LEFT JOIN business_profiles bp ON d.business_id = bp.business_id
+      WHERE d.carbon_verification_status = 'pending'
+         OR d.carbon_verification_status IS NULL
+      ORDER BY d.created_at DESC
+      LIMIT 20
+    `);
+
+    // If no deliveries with carbon_verification_status, get from route_approvals that need verification
+    const pendingFromRoutes = await pool.query(`
+      SELECT 
+        ra.id as route_id,
+        ra.route_type,
+        ra.from_location,
+        ra.to_location,
+        ra.driver_name,
+        ra.vehicle_type,
+        ra.departure_time,
+        ra.original_distance,
+        ra.original_fuel,
+        ra.original_co2,
+        ra.optimized_fuel,
+        ra.optimized_co2,
+        ra.savings_km,
+        ra.savings_fuel,
+        ra.savings_co2,
+        ra.status as approval_status,
+        ra.submitted_at,
+        'route_approval' as source_type
+      FROM route_approvals ra
+      WHERE ra.carbon_verification_status = 'pending'
+         OR ra.carbon_verification_status IS NULL
+      ORDER BY ra.submitted_at DESC
+      LIMIT 20
+    `);
+
+    // Get summary stats for sustainability manager
+    const statsResult = await pool.query(`
+      SELECT 
+        (SELECT COUNT(*) FROM deliveries WHERE carbon_verification_status = 'pending' OR carbon_verification_status IS NULL) as pending_deliveries,
+        (SELECT COUNT(*) FROM deliveries WHERE carbon_verification_status = 'verified') as verified_deliveries,
+        (SELECT COUNT(*) FROM deliveries WHERE carbon_verification_status = 'revision_requested') as revision_requested,
+        COALESCE(SUM(estimated_carbon_kg), 0) FILTER (WHERE carbon_verification_status = 'verified') as total_co2_verified,
+        COALESCE(SUM(estimated_fuel_consumption_liters), 0) FILTER (WHERE carbon_verification_status = 'verified') as total_fuel_verified
+      FROM deliveries
+    `);
+
+    // Map pending deliveries to verification items
+    const pendingItems = pendingResult.rows.map(row => ({
+      id: row.delivery_id,
+      deliveryId: `DEL-${row.delivery_id}`,
+      type: 'delivery',
+      routeId: row.route_id,
+      date: row.departure_time || row.created_at,
+      route: `${row.from_location || 'Warehouse'} → ${row.to_location || 'Destination'}`,
+      driver: row.driver_name || 'Unassigned',
+      vehicle: row.vehicle_type || 'Van',
+      estimatedFuel: parseFloat(row.estimated_fuel_consumption_liters) || 0,
+      actualFuel: parseFloat(row.fuel_consumption) || parseFloat(row.estimated_fuel_consumption_liters) || 0,
+      estimatedCO2: parseFloat(row.estimated_carbon_kg) || 0,
+      actualCO2: parseFloat(row.carbon_emissions) || parseFloat(row.estimated_carbon_kg) || 0,
+      distance: parseFloat(row.distance_km) || 0,
+      businessName: row.business_name || 'N/A',
+      submittedAt: row.submitted_at || row.created_at,
+      status: row.carbon_verification_status || 'pending'
+    }));
+
+    // Also add route approvals pending verification
+    const routeItems = pendingFromRoutes.rows.map(row => ({
+      id: row.route_id,
+      deliveryId: `DEL-${row.route_id}`,
+      type: 'route_approval',
+      routeId: row.route_id,
+      date: row.departure_time || row.submitted_at,
+      route: `${row.from_location || 'Warehouse'} → ${row.to_location || 'Destination'}`,
+      driver: row.driver_name || 'Unassigned',
+      vehicle: row.vehicle_type || 'Van',
+      estimatedFuel: parseFloat(row.original_fuel) || 0,
+      actualFuel: parseFloat(row.optimized_fuel) || parseFloat(row.original_fuel) || 0,
+      estimatedCO2: parseFloat(row.original_co2) || 0,
+      actualCO2: parseFloat(row.optimized_co2) || parseFloat(row.original_co2) || 0,
+      distance: parseFloat(row.original_distance) || 0,
+      savingsCO2: parseFloat(row.savings_co2) || 0,
+      savingsFuel: parseFloat(row.savings_fuel) || 0,
+      businessName: 'N/A',
+      submittedAt: row.submitted_at,
+      status: row.carbon_verification_status || 'pending'
+    }));
+
+    // Combine both lists
+    const allPending = [...pendingItems, ...routeItems];
+
+    const stats = statsResult.rows[0] || {
+      pending_deliveries: 0,
+      verified_deliveries: 0,
+      revision_requested: 0,
+      total_co2_verified: 0,
+      total_fuel_verified: 0
+    };
+
+    res.json({
+      success: true,
+      summary: {
+        pendingVerifications: allPending.length || parseInt(stats.pending_deliveries) || 0,
+        verifiedToday: parseInt(stats.verified_deliveries) || 0,
+        revisionRequested: parseInt(stats.revision_requested) || 0,
+        totalCO2Verified: parseFloat(stats.total_co2_verified) || 0,
+        totalFuelVerified: parseFloat(stats.total_fuel_verified) || 0,
+        pendingFromDeliveries: pendingItems.length,
+        pendingFromRoutes: routeItems.length
+      },
+      pendingVerifications: allPending,
+      message: null
+    });
+
+  } catch (err) {
+    console.error("Sustainability dashboard error:", err);
+    res.status(500).json({
+      success: false,
+      message: "Database error",
+      summary: { pendingVerifications: 0, verifiedToday: 0, revisionRequested: 0, totalCO2Verified: 0, totalFuelVerified: 0 },
+      pendingVerifications: []
+    });
+  }
+});
+
+// Verify or request revision for carbon footprint
+app.post("/api/sustainability/verify", async (req, res) => {
+  const { verificationId, decision, comment, sourceType } = req.body;
+
+  if (!verificationId || !decision) {
+    return res.status(400).json({
+      success: false,
+      message: "Verification ID and decision are required"
+    });
+  }
+
+  try {
+    const carbonStatus = decision.toUpperCase() === 'VERIFY' ? 'verified' : 'revision_requested';
+    
+    let result;
+    
+    // Handle both delivery and route_approval sources
+    if (sourceType === 'route_approval' || sourceType === 'route') {
+      result = await pool.query(`
+        UPDATE route_approvals 
+        SET carbon_verification_status = $1, 
+            carbon_verification_comment = $2,
+            carbon_verified_at = NOW(),
+            carbon_verified_by = 'sustainability_manager'
+        WHERE id = $3
+        RETURNING id, carbon_verification_status
+      `, [carbonStatus, comment, verificationId]);
+    } else {
+      // Default to delivery table
+      result = await pool.query(`
+        UPDATE deliveries 
+        SET carbon_verification_status = $1, 
+            carbon_verification_comment = $2,
+            carbon_verified_at = NOW(),
+            carbon_verified_by = 'sustainability_manager'
+        WHERE delivery_id = $3
+        RETURNING delivery_id, carbon_verification_status
+      `, [carbonStatus, comment, verificationId]);
+    }
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Verification record not found"
+      });
+    }
+
+    // If verified, award EcoTrust points (simplified logic)
+    if (decision.toUpperCase() === 'VERIFY') {
+      // Update business ecotrust score (simplified)
+      console.log(`[Sustainability] Verified carbon for record ${verificationId}, points would be awarded`);
+    }
+
+    res.json({
+      success: true,
+      message: `Carbon footprint ${carbonStatus.replace('_', ' ')} successfully`
+    });
+
+  } catch (err) {
+    console.error("Verify carbon error:", err);
+    res.status(500).json({
+      success: false,
+      message: "Database error"
+    });
+  }
+});
+
+// Get sustainability verification history
+app.get("/api/sustainability/history", async (req, res) => {
+  try {
+    // Get verified carbon footprints from deliveries
+    const deliveryHistory = await pool.query(`
+      SELECT 
+        d.delivery_id as id,
+        d.delivery_id as verification_id,
+        'delivery' as source_type,
+        d.from_location,
+        d.to_location,
+        d.driver_name,
+        d.distance_km,
+        d.estimated_carbon_kg as carbon_emissions,
+        d.carbon_emissions as actual_carbon,
+        d.estimated_fuel_consumption_liters as estimated_fuel,
+        d.fuel_consumption as actual_fuel,
+        d.carbon_verification_status as status,
+        d.carbon_verification_comment as verification_comment,
+        d.carbon_verified_at as verified_at,
+        d.created_at as submitted_at,
+        bp.business_name
+      FROM deliveries d
+      LEFT JOIN business_profiles bp ON d.business_id = bp.business_id
+      WHERE d.carbon_verification_status IN ('verified', 'revision_requested')
+      ORDER BY d.carbon_verified_at DESC
+      LIMIT 50
+    `);
+
+    // Get verified from route_approvals
+    const routeHistory = await pool.query(`
+      SELECT 
+        ra.id as id,
+        ra.id as verification_id,
+        'route_approval' as source_type,
+        ra.from_location,
+        ra.to_location,
+        ra.driver_name,
+        ra.original_distance as distance_km,
+        ra.original_co2 as carbon_emissions,
+        ra.optimized_co2 as actual_carbon,
+        ra.original_fuel as estimated_fuel,
+        ra.optimized_fuel as actual_fuel,
+        ra.carbon_verification_status as status,
+        ra.carbon_verification_comment as verification_comment,
+        ra.carbon_verified_at as verified_at,
+        ra.submitted_at,
+        'N/A' as business_name
+      FROM route_approvals ra
+      WHERE ra.carbon_verification_status IN ('verified', 'revision_requested')
+      ORDER BY ra.carbon_verified_at DESC
+      LIMIT 50
+    `);
+
+    // Combine and format history
+    const formatHistoryItem = (row) => ({
+      id: row.id,
+      verificationId: row.verification_id,
+      type: row.source_type,
+      route: `${row.from_location || 'Warehouse'} → ${row.to_location || 'Destination'}`,
+      driver: row.driver_name || 'Unassigned',
+      date: row.verified_at || row.submitted_at,
+      estimatedCO2: parseFloat(row.carbon_emissions) || 0,
+      actualCO2: parseFloat(row.actual_carbon) || parseFloat(row.carbon_emissions) || 0,
+      estimatedFuel: parseFloat(row.estimated_fuel) || 0,
+      actualFuel: parseFloat(row.actual_fuel) || parseFloat(row.estimated_fuel) || 0,
+      distance: parseFloat(row.distance_km) || 0,
+      status: row.status,
+      comment: row.verification_comment,
+      businessName: row.business_name || 'N/A'
+    });
+
+    const allHistory = [
+      ...deliveryHistory.rows.map(formatHistoryItem),
+      ...routeHistory.rows.map(formatHistoryItem)
+    ].sort((a, b) => new Date(b.date) - new Date(a.date));
+
+    // Get summary stats
+    const statsResult = await pool.query(`
+      SELECT 
+        (SELECT COUNT(*) FROM deliveries WHERE carbon_verification_status = 'verified' 
+          AND DATE(carbon_verified_at) = CURRENT_DATE) as verified_today_deliveries,
+        (SELECT COUNT(*) FROM route_approvals WHERE carbon_verification_status = 'verified'
+          AND DATE(carbon_verified_at) = CURRENT_DATE) as verified_today_routes,
+        (SELECT COUNT(*) FROM deliveries WHERE carbon_verification_status = 'verified') as total_verified_deliveries,
+        (SELECT COUNT(*) FROM route_approvals WHERE carbon_verification_status = 'verified') as total_verified_routes,
+        (SELECT COUNT(*) FROM deliveries WHERE carbon_verification_status = 'revision_requested') as total_revisions_deliveries,
+        (SELECT COUNT(*) FROM route_approvals WHERE carbon_verification_status = 'revision_requested') as total_revisions_routes,
+        COALESCE(SUM(estimated_carbon_kg), 0) FILTER (WHERE carbon_verification_status = 'verified') as total_co2_deliveries
+      FROM deliveries
+    `);
+
+    const stats = statsResult.rows[0] || {
+      verified_today_deliveries: 0,
+      verified_today_routes: 0,
+      total_verified_deliveries: 0,
+      total_verified_routes: 0,
+      total_revisions_deliveries: 0,
+      total_revisions_routes: 0,
+      total_co2_deliveries: 0
+    };
+
+    const verifiedToday = (parseInt(stats.verified_today_deliveries) || 0) + (parseInt(stats.verified_today_routes) || 0);
+    const totalVerified = (parseInt(stats.total_verified_deliveries) || 0) + (parseInt(stats.total_verified_routes) || 0);
+    const totalRevisions = (parseInt(stats.total_revisions_deliveries) || 0) + (parseInt(stats.total_revisions_routes) || 0);
+
+    // Calculate EcoTrust points (simplified: 10 points per verified record)
+    const totalPoints = totalVerified * 10;
+
+    res.json({
+      success: true,
+      history: allHistory,
+      summary: {
+        verifiedToday: verifiedToday,
+        totalVerified: totalVerified,
+        totalRevisions: totalRevisions,
+        totalCO2Verified: parseFloat(stats.total_co2_deliveries) || 0,
+        ecoTrustPoints: totalPoints
+      },
+      message: null
+    });
+
+  } catch (err) {
+    console.error("Sustainability history error:", err);
+    res.status(500).json({
+      success: false,
+      message: "Database error",
+      history: [],
+      summary: { verifiedToday: 0, totalVerified: 0, totalRevisions: 0, totalCO2Verified: 0, ecoTrustPoints: 0 }
+    });
+  }
+});
+
 
 // ====================== START SERVER ======================
 
