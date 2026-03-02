@@ -227,6 +227,74 @@ app.put("/api/admin/users/:email/role", async (req, res) => {
 });
 
 
+// ====================== PUBLIC BUSINESS ROUTES ======================
+
+// Get public business information (address, contact, email) - no auth required
+app.get("/api/public/business", async (req, res) => {
+  try {
+    const { business_id } = req.query;
+
+    let query = `
+      SELECT 
+        bp.business_id,
+        bp.business_name,
+        bp.address,
+        bp.contact,
+        bp.email,
+        bp.description,
+        COALESCE(es.current_score, 0) AS current_score,
+        COALESCE(es.level, 'Bronze') AS level
+      FROM business_profiles bp
+      LEFT JOIN ecotrust_scores es 
+        ON bp.business_id = es.business_id
+    `;
+
+    let params = [];
+    if (business_id) {
+      query += ` WHERE bp.business_id = $1`;
+      params = [business_id];
+    }
+
+    query += ` ORDER BY bp.business_name ASC`;
+
+    const result = await pool.query(query, params);
+
+    if (result.rows.length === 0) {
+      return res.json({
+        success: true,
+        businesses: [],
+        message: "No businesses found"
+      });
+    }
+
+    const businesses = result.rows.map(row => ({
+      businessId: row.business_id,
+      businessName: row.business_name,
+      address: row.address,
+      contact: row.contact,
+      email: row.email,
+      description: row.description,
+      ecoTrustScore: row.current_score,
+      level: row.level
+    }));
+
+    res.json({
+      success: true,
+      businesses: businesses,
+      message: null
+    });
+
+  } catch (err) {
+    console.error("Public business error:", err);
+    res.status(500).json({
+      success: false,
+      businesses: null,
+      message: "Database error"
+    });
+  }
+});
+
+
 // ====================== BUSINESS DIRECTORY ROUTES ======================
 
 // Get business directory
