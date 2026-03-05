@@ -432,6 +432,213 @@ app.get("/api/logistics/history", async (req, res) => {
   }
 });
 
+// NEW: GET /api/logistics/pending - Get pending route approvals for logistics manager
+app.get("/api/logistics/pending", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, route_type, from_location, to_location, driver_name, vehicle_type,
+        departure_time, original_distance, optimized_distance, original_time, optimized_time,
+        original_fuel, optimized_fuel, original_co2, optimized_co2, savings_km, savings_fuel, savings_co2,
+        ai_suggestion, status, submitted_by, submitted_at
+      FROM route_approvals 
+      WHERE status = 'PENDING' 
+      ORDER BY submitted_at DESC LIMIT 50`
+    );
+
+    const pending = result.rows.map(row => ({
+      approval_id: row.id,
+      route_id: row.id,
+      routeType: row.route_type || 'STANDARD',
+      from: row.from_location || 'Warehouse',
+      to: row.to_location || 'Destination',
+      location: row.from_location || 'Warehouse',
+      driver_name: row.driver_name || 'Unassigned',
+      driver_full_name: row.driver_name || 'Unassigned',
+      vehicle_type: row.vehicle_type || 'Van',
+      departure_time: row.departure_time,
+      created_at: row.submitted_at || new Date().toISOString(),
+      submitted_at: row.submitted_at,
+      submitted_by: row.submitted_by || 'System',
+      submitted_by_name: row.submitted_by || 'System',
+      
+      // Route optimization data
+      original_distance: parseFloat(row.original_distance) || 0,
+      optimized_distance: parseFloat(row.optimized_distance) || 0,
+      total_distance_km: parseFloat(row.original_distance) || 0,
+      estimated_fuel_consumption_liters: parseFloat(row.original_fuel) || 0,
+      optimized_fuel: parseFloat(row.optimized_fuel) || 0,
+      estimated_carbon_kg: parseFloat(row.original_co2) || 0,
+      optimized_carbon_kg: parseFloat(row.optimized_co2) || 0,
+      
+      // Savings
+      savings_km: parseFloat(row.savings_km) || 0,
+      savings_fuel: parseFloat(row.savings_fuel) || 0,
+      savings_co2: parseFloat(row.savings_co2) || 0,
+      
+      // AI
+      ai_recommendation: row.ai_suggestion || 'Optimize this route for better efficiency',
+      product_name: row.route_type ? `Route ${row.route_type}` : 'Route Optimization',
+      
+      status: row.status || 'pending'
+    }));
+
+    res.json({ success: true, data: pending, message: null });
+  } catch (err) {
+    console.error("Logistics pending error:", err);
+    res.status(500).json({ success: false, data: [], message: "Database error" });
+  }
+});
+
+// NEW: GET /api/logistics/stats - Get logistics statistics
+app.get("/api/logistics/stats", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT 
+        (SELECT COUNT(*) FROM route_approvals WHERE status = 'PENDING') as pending_count,
+        (SELECT COUNT(*) FROM route_approvals WHERE status = 'APPROVED') as approved_count,
+        (SELECT COUNT(*) FROM route_approvals WHERE status = 'DECLINED') as declined_count,
+        COALESCE(AVG(savings_co2), 0) FILTER (WHERE status = 'APPROVED') as avg_co2_saved,
+        COALESCE(SUM(savings_km), 0) FILTER (WHERE status = 'APPROVED') as total_km_saved,
+        COALESCE(SUM(savings_fuel), 0) FILTER (WHERE status = 'APPROVED') as total_fuel_saved,
+        COALESCE(SUM(savings_co2), 0) FILTER (WHERE status = 'APPROVED') as total_co2_saved
+      FROM route_approvals`
+    );
+
+    const stats = result.rows[0] || {};
+    
+    res.json({
+      success: true,
+      data: {
+        pending_count: parseInt(stats.pending_count) || 0,
+        approved_count: parseInt(stats.approved_count) || 0,
+        declined_count: parseInt(stats.declined_count) || 0,
+        avg_co2_saved: parseFloat(stats.avg_co2_saved) || 0,
+        total_km_saved: parseFloat(stats.total_km_saved) || 0,
+        total_fuel_saved: parseFloat(stats.total_fuel_saved) || 0,
+        total_co2_saved: parseFloat(stats.total_co2_saved) || 0
+      },
+      message: null
+    });
+  } catch (err) {
+    console.error("Logistics stats error:", err);
+    res.status(500).json({ success: false, data: {}, message: "Database error" });
+  }
+});
+
+// NEW: GET /api/logistics/driver-monitor - Get drivers with their active routes
+app.get("/api/logistics/driver-monitor", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT 
+        u.user_id,
+        u.name as full_name,
+        u.email,
+        d.delivery_id,
+        d.route_id,
+        d.status as route_status,
+        d.from_location,
+        d.to_location,
+        d.departure_time,
+        d.arrival_time,
+        d.distance_km,
+        ra.route_type,
+        ra.optimized_distance
+      FROM users u
+      LEFT JOIN deliveries d ON d.driver_name = u.name AND d.status IN ('accepted', 'in_progress')
+      LEFT JOIN route_approvals ra ON d.route_id = ra.id
+      WHERE u.role = 'driver'
+      ORDER BY u.name, d.departure_time DESC`
+    );
+
+    const driversMap = new Map();
+    result.rows.forEach(row => {
+      if (!driversMap.has(row.user_id)) {
+        driversMap.set(row.user_id, {
+          user_id: row.user_id,
+          full_name: row.full_name,
+          email: row.email,
+          route_name: row.delivery_id ? `${row.from_location} → ${row.to_location}` : null,
+          route_status: row.route_status,
+          stops_total: 0,
+          stops_completed: 0,
+          stops: row.delivery_id ? [
+            { address: row.from_location, status: row.route_status === 'in_progress' ? 'completed' : 'pending' },
+            { address: row.to_location, status: row.route_status === 'in_progress' ? 'pending' : 'pending' }
+          ] : []
+        });
+      }
+    });
+
+    const drivers = Array.from(driversMap.values());
+    res.json({ success: true, data: drivers, message: null });
+  } catch (err) {
+    console.error("Driver monitor error:", err);
+    res.status(500).json({ success: false, data: [], message: "Database error" });
+  }
+});
+
+// NEW: PATCH /api/logistics/:id/approve - Approve a route
+app.patch("/api/logistics/:id/approve", async (req, res) => {
+  const { id } = req.params;
+  const { comment } = req.body;
+  
+  try {
+    const result = await pool.query(
+      `UPDATE route_approvals 
+       SET status = 'APPROVED', manager_comment = $1, approved_at = NOW() 
+       WHERE id = $2 
+       RETURNING id, status, route_type, from_location, to_location`,
+      [comment || '', id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Route not found" });
+    }
+
+    res.json({ 
+      success: true, 
+      message: "Route approved successfully",
+      data: result.rows[0]
+    });
+  } catch (err) {
+    console.error("Approve route error:", err);
+    res.status(500).json({ success: false, message: "Database error" });
+  }
+});
+
+// NEW: PATCH /api/logistics/:id/decline - Decline a route
+app.patch("/api/logistics/:id/decline", async (req, res) => {
+  const { id } = req.params;
+  const { reason, comment } = req.body;
+  
+  if (!reason && !comment) {
+    return res.status(400).json({ success: false, message: "Reason is required to decline a route" });
+  }
+
+  try {
+    const result = await pool.query(
+      `UPDATE route_approvals 
+       SET status = 'DECLINED', manager_comment = $1, approved_at = NOW() 
+       WHERE id = $2 
+       RETURNING id, status, route_type, from_location, to_location`,
+      [reason || comment || 'Declined by logistics manager', id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Route not found" });
+    }
+
+    res.json({ 
+      success: true, 
+      message: "Route declined successfully",
+      data: result.rows[0]
+    });
+  } catch (err) {
+    console.error("Decline route error:", err);
+    res.status(500).json({ success: false, message: "Database error" });
+  }
+});
+
 app.post("/api/logistics/approve", async (req, res) => {
   const { routeId, decision, comment } = req.body;
   if (!routeId || !decision) {
