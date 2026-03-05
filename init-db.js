@@ -4,6 +4,44 @@ async function initDatabase() {
   try {
     console.log('🔄 Initializing database...');
     
+    // Create deliveries table
+    try {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS deliveries (
+          delivery_id SERIAL PRIMARY KEY,
+          route_id INTEGER,
+          business_id INTEGER,
+          status VARCHAR(50) DEFAULT 'pending',
+          driver_name VARCHAR(255),
+          vehicle_type VARCHAR(100),
+          departure_time TIMESTAMP,
+          arrival_time TIMESTAMP,
+          completed_at TIMESTAMP,
+          from_location VARCHAR(255),
+          to_location VARCHAR(255),
+          distance_km DECIMAL(10,2),
+          fuel_consumption DECIMAL(10,2),
+          estimated_fuel_consumption_liters DECIMAL(10,2),
+          carbon_emissions DECIMAL(10,2),
+          estimated_carbon_kg DECIMAL(10,2),
+          stops_json JSONB,
+          delivery_items_json JSONB,
+          carbon_verification_status VARCHAR(50),
+          carbon_verification_comment TEXT,
+          carbon_verified_at TIMESTAMP,
+          carbon_verified_by VARCHAR(255),
+          delivery_notes TEXT,
+          driver_response VARCHAR(50),
+          driver_notes TEXT,
+          driver_responded_at TIMESTAMP,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      console.log('✅ deliveries table checked/created');
+    } catch (error) {
+      console.log('⚠️  deliveries table error:', error.message);
+    }
+    
     // Create route_approvals table
     try {
       await pool.query(`
@@ -305,6 +343,91 @@ async function initDatabase() {
       }
     } catch (error) {
       console.log('⚠️  Error inserting alerts:', error.message);
+    }
+    
+    // Insert sample deliveries if table is empty
+    try {
+      const { rows } = await pool.query('SELECT COUNT(*) as count FROM deliveries');
+      if (parseInt(rows[0].count) === 0) {
+        console.log('Inserting sample deliveries...');
+        
+        const sampleDeliveries = [
+          {
+            route_id: 1,
+            status: 'accepted',
+            driver_name: 'Carlos Reyes',
+            vehicle_type: 'Van-001',
+            departure_time: new Date(Date.now() + 3600000).toISOString(),
+            from_location: 'Warehouse A',
+            to_location: 'Metro Manila',
+            distance_km: 38.5,
+            estimated_fuel_consumption_liters: 12.0,
+            estimated_carbon_kg: 5.4,
+            stops_json: JSON.stringify([
+              { stopName: 'Market A', address: '123 Market St', sequence: 1 },
+              { stopName: 'Store B', address: '456 Store Ave', sequence: 2 },
+              { stopName: 'Restaurant C', address: '789 Food St', sequence: 3 }
+            ]),
+            delivery_items_json: JSON.stringify([
+              { item: 'Organic Tomatoes', quantity: '50kg' },
+              { item: 'Fresh Milk', quantity: '100kg' }
+            ])
+          },
+          {
+            route_id: 2,
+            status: 'assigned',
+            driver_name: 'Juan dela Cruz',
+            vehicle_type: 'Truck-002',
+            departure_time: new Date(Date.now() + 86400000).toISOString(),
+            from_location: 'Warehouse B',
+            to_location: 'Cebu City',
+            distance_km: 105.0,
+            estimated_fuel_consumption_liters: 21.0,
+            estimated_carbon_kg: 9.45,
+            stops_json: JSON.stringify([
+              { stopName: 'Hotel D', address: '100 Hotel Rd', sequence: 1 },
+              { stopName: 'Resort E', address: '200 Beach Rd', sequence: 2 }
+            ]),
+            delivery_items_json: JSON.stringify([
+              { item: 'Bananas', quantity: '75kg' }
+            ])
+          },
+          {
+            route_id: 3,
+            status: 'pending',
+            driver_name: 'Maria Santos',
+            vehicle_type: 'Van-003',
+            departure_time: new Date(Date.now() + 172800000).toISOString(),
+            from_location: 'Warehouse A',
+            to_location: 'Davao City',
+            distance_km: 72.0,
+            estimated_fuel_consumption_liters: 15.0,
+            estimated_carbon_kg: 6.75,
+            stops_json: JSON.stringify([
+              { stopName: 'Supermarket F', address: '300 Mall Ave', sequence: 1 }
+            ]),
+            delivery_items_json: JSON.stringify([
+              { item: 'Iceberg Lettuce', quantity: '30kg' }
+            ])
+          }
+        ];
+
+        for (const delivery of sampleDeliveries) {
+          await pool.query(
+            `INSERT INTO deliveries 
+              (route_id, status, driver_name, vehicle_type, departure_time, from_location, to_location,
+               distance_km, estimated_fuel_consumption_liters, estimated_carbon_kg, stops_json, delivery_items_json)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+            [delivery.route_id, delivery.status, delivery.driver_name, delivery.vehicle_type, 
+             delivery.departure_time, delivery.from_location, delivery.to_location, delivery.distance_km,
+             delivery.estimated_fuel_consumption_liters, delivery.estimated_carbon_kg, 
+             delivery.stops_json, delivery.delivery_items_json]
+          );
+        }
+        console.log('✅ Sample deliveries inserted');
+      }
+    } catch (error) {
+      console.log('⚠️  Error inserting deliveries:', error.message);
     }
     
     console.log('🎉 Database initialization complete!');
