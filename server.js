@@ -153,7 +153,7 @@ app.get("/api/business/directory", async (req, res) => {
 // LOGISTICS ROUTES (Integrated Web functionality)
 app.get("/api/logistics/dashboard", async (req, res) => {
   try {
-    // 1. Pending Approvals - Explicit columns to avoid SQL conflict
+    // 1. Pending Approvals
     const pendingQuery = `
       SELECT 
         ra.id as route_id, ra.route_type, ra.from_location, ra.to_location, ra.driver_name, ra.vehicle_type,
@@ -167,30 +167,28 @@ app.get("/api/logistics/dashboard", async (req, res) => {
     
     const pendingResult = await pool.query(pendingQuery);
 
-    // 2. Stats matching Web's count boxes
+    // 2. Stats matching Web's count boxes - Fixed Syntax Error
     const statsResult = await pool.query(
       `SELECT 
         COUNT(*) FILTER (WHERE status = 'PENDING') as pending_count,
         COUNT(*) FILTER (WHERE status = 'APPROVED') as approved_count,
         COUNT(*) FILTER (WHERE status = 'DECLINED') as declined_count,
-        COALESCE(AVG(savings_co2), 0) FILTER (WHERE status = 'APPROVED') as avg_co2_saved,
-        COALESCE(SUM(savings_co2), 0) FILTER (WHERE status = 'APPROVED') as total_co2_reduced,
-        COALESCE(SUM(savings_km), 0) FILTER (WHERE status = 'APPROVED') as total_km_saved
+        COALESCE(AVG(savings_co2) FILTER (WHERE status = 'APPROVED'), 0) as avg_co2_saved,
+        COALESCE(SUM(savings_co2) FILTER (WHERE status = 'APPROVED'), 0) as total_co2_reduced,
+        COALESCE(SUM(savings_km) FILTER (WHERE status = 'APPROVED'), 0) as total_km_saved
       FROM route_approvals`
     );
 
-    // 3. Driver Monitor matching Web's progress bars
+    // 3. Driver Monitor
     const driversResult = await pool.query(
       `SELECT u.user_id, u.name as full_name, u.email,
         d.from_location || ' → ' || d.to_location as route_name,
-        d.status as route_status,
-        0 as stops_completed,
-        2 as stops_total
+        d.status as route_status, 0 as stops_completed, 2 as stops_total
       FROM users u
       LEFT JOIN deliveries d ON d.driver_name = u.name AND d.status IN ('assigned', 'accepted', 'in_progress')
-      WHERE u.role = 'driver'
-      ORDER BY u.name ASC`);
+      WHERE u.role = 'driver' ORDER BY u.name ASC`);
 
+    const stats = statsResult.rows[0] || {};
     const pendingRoutes = pendingResult.rows.map(row => ({
       routeId: row.route_id.toString(),
       routeType: row.route_type || 'STANDARD',
@@ -213,8 +211,6 @@ app.get("/api/logistics/dashboard", async (req, res) => {
       submittedBy: row.submitted_by || 'System',
       submittedTime: row.submitted_at
     }));
-
-    const stats = statsResult.rows[0] || {};
 
     res.json({
       success: true,
