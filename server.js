@@ -854,8 +854,31 @@ app.get("/api/ecotrust/leaderboard", async (req, res) => {
 app.get("/api/logistics/dashboard", async (req, res) => {
   try {
     const pendingResult = await pool.query(
-      `SELECT ra.*, ra.id as route_id, ra.route_type as product_name, ra.from_location as location, ra.submitted_at as created_at
-      FROM route_approvals ra WHERE status = 'PENDING' ORDER BY submitted_at DESC LIMIT 20`
+      `SELECT 
+        ra.id as route_id, 
+        ra.route_type, 
+        ra.from_location, 
+        ra.to_location, 
+        ra.driver_name, 
+        ra.vehicle_type,
+        ra.departure_time, 
+        ra.original_distance, 
+        ra.optimized_distance, 
+        ra.original_fuel, 
+        ra.optimized_fuel, 
+        ra.original_co2, 
+        ra.optimized_co2, 
+        ra.savings_km, 
+        ra.savings_fuel, 
+        ra.savings_co2,
+        ra.ai_suggestion, 
+        ra.status, 
+        ra.submitted_by, 
+        ra.submitted_at
+      FROM route_approvals ra 
+      WHERE status = 'PENDING' 
+      ORDER BY submitted_at DESC 
+      LIMIT 20`
     );
 
     const statsResult = await pool.query(
