@@ -924,7 +924,7 @@ app.get("/api/logistics/dashboard", async (req, res) => {
             ma.requested_by::text as submitted_by,
             ma.created_at as submitted_at
           FROM manager_approvals ma
-          LEFT JOIN route_approvals ra ON ra.id = COALESCE(ma.related_record_id, ma.route_id, ma.delivery_id)
+          LEFT JOIN route_approvals ra ON ra.id = COALESCE(ma.route_id, ma.delivery_id)
           WHERE ma.approval_type = 'route_optimization'
             AND LOWER(ma.status) IN ('pending', 'awaiting_approval')
           ORDER BY ma.created_at DESC
@@ -1160,7 +1160,7 @@ app.get("/api/logistics/pending", async (req, res) => {
             ma.requested_by::text as submitted_by,
             ma.created_at as created_at
           FROM manager_approvals ma
-          LEFT JOIN route_approvals ra ON ra.id = COALESCE(ma.related_record_id, ma.route_id, ma.delivery_id)
+          LEFT JOIN route_approvals ra ON ra.id = COALESCE(ma.route_id, ma.delivery_id)
           WHERE ma.approval_type = 'route_optimization' AND LOWER(ma.status) IN ('pending', 'awaiting_approval')
           ORDER BY ma.created_at DESC
         `);
@@ -1292,12 +1292,12 @@ app.patch("/api/logistics/:id/approve", async (req, res) => {
         `UPDATE manager_approvals 
          SET status = 'approved', manager_comment = $1, decision_notes = $1, reviewed_at = NOW(), updated_at = NOW()
          WHERE id = $2 AND approval_type = 'route_optimization'
-         RETURNING related_record_id, route_id, delivery_id`,
+         RETURNING route_id, delivery_id`,
         [comment || '', id]
       );
       if (hasRouteApprovals) {
         if (maResult.rows.length > 0) {
-          const routeRef = maResult.rows[0].related_record_id || maResult.rows[0].route_id || maResult.rows[0].delivery_id;
+          const routeRef = maResult.rows[0].route_id || maResult.rows[0].delivery_id;
           if (routeRef) {
             await pool.query(
               `UPDATE route_approvals 
@@ -1396,12 +1396,12 @@ app.patch("/api/logistics/:id/decline", async (req, res) => {
         `UPDATE manager_approvals
          SET status = 'declined', manager_comment = $1, decision_notes = $1, reviewed_at = NOW(), updated_at = NOW()
          WHERE id = $2 AND approval_type = 'route_optimization'
-         RETURNING related_record_id, route_id, delivery_id`,
+         RETURNING route_id, delivery_id`,
         [reason || '', id]
       );
       if (hasRouteApprovals) {
         if (maResult.rows.length > 0) {
-          const routeRef = maResult.rows[0].related_record_id || maResult.rows[0].route_id || maResult.rows[0].delivery_id;
+          const routeRef = maResult.rows[0].route_id || maResult.rows[0].delivery_id;
           if (routeRef) {
             await pool.query(`UPDATE route_approvals SET status = 'DECLINED', manager_comment = $1, approved_at = NOW() WHERE id = $2`, [reason || '', routeRef]);
           }
@@ -1444,7 +1444,7 @@ app.get("/api/logistics/history", async (req, res) => {
               ma.reviewed_at as reviewed_at,
               COALESCE(ma.manager_comment, ma.decision_notes) as review_notes
             FROM manager_approvals ma
-            LEFT JOIN route_approvals ra ON ra.id = COALESCE(ma.related_record_id, ma.route_id, ma.delivery_id)
+            LEFT JOIN route_approvals ra ON ra.id = COALESCE(ma.route_id, ma.delivery_id)
             WHERE ma.approval_type = 'route_optimization'
               AND ma.status IN ('approved', 'declined', 'rejected')
             ORDER BY ma.reviewed_at DESC NULLS LAST, ma.updated_at DESC
@@ -1511,12 +1511,12 @@ app.post("/api/logistics/approve", async (req, res) => {
         `UPDATE manager_approvals
          SET status = LOWER($1), manager_comment = $2, decision_notes = $2, reviewed_at = NOW(), updated_at = NOW()
          WHERE id = $3 AND approval_type = 'route_optimization'
-         RETURNING related_record_id, route_id, delivery_id`,
+         RETURNING route_id, delivery_id`,
         [status, comment || '', routeId]
       );
       if (hasRouteApprovals) {
         if (maResult.rows.length > 0) {
-          const routeRef = maResult.rows[0].related_record_id || maResult.rows[0].route_id || maResult.rows[0].delivery_id;
+          const routeRef = maResult.rows[0].route_id || maResult.rows[0].delivery_id;
           if (routeRef) {
             await pool.query(`UPDATE route_approvals SET status = $1, manager_comment = $2, approved_at = NOW() WHERE id = $3`, [status, comment || '', routeRef]);
           }
