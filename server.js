@@ -57,6 +57,31 @@ app.use((req, res, next) => {
 app.get("/", (req, res) => res.send("Server is running!"));
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 
+const normalizeEcoTrustLevel = (score, level) => {
+  if (level) {
+    const lvl = String(level).toLowerCase();
+    if (lvl.includes("leader")) return 5;
+    if (lvl.includes("champion")) return 4;
+    if (lvl.includes("warrior")) return 3;
+    if (lvl.includes("newcomer")) return 1;
+  }
+  const numeric = Number(score) || 0;
+  if (numeric >= 1000) return 5;
+  if (numeric >= 500) return 4;
+  if (numeric >= 200) return 3;
+  if (numeric >= 50) return 2;
+  return 1;
+};
+
+const normalizeBadge = (level, ecoLevel) => {
+  if (level) return String(level);
+  if (ecoLevel >= 5) return "Eco Leader";
+  if (ecoLevel >= 4) return "Eco Champion";
+  if (ecoLevel >= 3) return "Eco Warrior";
+  if (ecoLevel >= 2) return "Eco Starter";
+  return "Newcomer";
+};
+
 // ============================================================
 // AUTH ROUTES
 // ============================================================
@@ -108,11 +133,20 @@ app.post("/api/login", async (req, res) => {
       return res.status(401).json({ success: false, message: "Invalid email or password" });
     }
     const token = generateToken(user);
+    const fullName = user.name || "";
     res.json({
       success: true,
       message: "Login successful",
       token,
-      user: { id: user.user_id, name: user.name, email: user.email, role: user.role, businessId: user.business_id }
+      user: {
+        id: user.user_id,
+        userId: user.user_id,
+        name: user.name,
+        fullName,
+        email: user.email,
+        role: user.role,
+        businessId: user.business_id
+      }
     });
   } catch (err) {
     console.error(err);
@@ -327,9 +361,13 @@ app.get("/api/business/directory", async (req, res) => {
         businessId: row.business_id, 
         businessName: row.business_name, 
         location: row.address, 
-        currentScore: row.current_score, 
-        totalPoints: row.total_points_earned, 
-        level: row.level 
+        address: row.address,
+        contactEmail: row.contact_email,
+        contactPhone: row.contact_phone,
+        currentScore: normalizeEcoTrustLevel(row.current_score, row.level),
+        points: Number(row.total_points_earned || 0),
+        badge: normalizeBadge(row.level, normalizeEcoTrustLevel(row.current_score, row.level)),
+        carbonImpact: 0
       })) 
     });
   } catch (err) { 
@@ -1205,7 +1243,9 @@ app.get("/api/sustainability/dashboard", async (req, res) => {
 app.post("/api/sustainability/verify", async (req, res) => {
   const { verificationId, decision, comment, sourceType } = req.body;
   try {
-    const carbonStatus = decision.toUpperCase() === 'VERIFY' ? 'verified' : 'revision_requested';
+    const normalizedDecision = String(decision || "").toUpperCase();
+    const isVerify = ["VERIFY", "VERIFIED", "APPROVE", "APPROVED"].includes(normalizedDecision);
+    const carbonStatus = isVerify ? 'verified' : 'revision_requested';
     if (sourceType === 'route_approval' || sourceType === 'route') {
       await pool.query(`UPDATE route_approvals SET carbon_verification_status = $1, carbon_verification_comment = $2, carbon_verified_at = NOW() WHERE id = $3`, [carbonStatus, comment, verificationId]);
     } else {
@@ -1246,19 +1286,117 @@ app.get("/api/sustainability/history", async (req, res) => {
 
 app.get("/api/driver/dashboard", async (req, res) => {
   try {
+    const { driver_name } = req.query;
+    const hasDriverFilter = !!driver_name;
+    const args = hasDriverFilter ? [driver_name] : [];
+    const clause = hasDriverFilter ? `AND d.driver_name = $1` : ``;
+
     const statsResult = await pool.query(`
-      SELECT COUNT(*) FILTER (WHERE status = 'completed') as total_completed, 
-             COALESCE(SUM(distance_km), 0) FILTER (WHERE status = 'completed') as total_km, 
-             COALESCE(SUM(fuel_consumption), 0) FILTER (WHERE status = 'completed') as total_fuel, 
-             COALESCE(SUM(estimated_carbon_kg), 0) FILTER (WHERE status = 'completed') as total_carbon 
-      FROM deliveries WHERE driver_name IS NOT NULL
+      SELECT COUNT(*) FILTER (WHERE d.status = 'completed') as total_completed, 
+             COALESCE(SUM(d.distance_km), 0) FILTER (WHERE d.status = 'completed') as total_km, 
+             COALESCE(SUM(d.fuel_consumption), 0) FILTER (WHERE d.status = 'completed') as total_fuel, 
+             COALESCE(SUM(d.carbon_emissions), 0) FILTER (WHERE d.status = 'completed') as total_carbon,
+             COUNT(*) FILTER (WHERE d.status IN ('assigned', 'accepted', 'in_progress')) as active_deliveries
+      FROM deliveries d
+      WHERE d.driver_name IS NOT NULL ${clause}
+    `, args);
+
+    const pendingAcceptanceResult = await pool.query(`
+      SELECT d.delivery_id, d.route_id, d.status, d.driver_name, d.vehicle_type, d.departure_time, d.arrival_time,
+             d.from_location, d.to_location, d.distance_km, d.estimated_fuel_consumption_liters, d.fuel_consumption,
+             d.estimated_carbon_kg, d.carbon_emissions, d.stops_json, d.delivery_items_json
+      FROM deliveries d
+      WHERE d.status = 'assigned' ${clause}
+      ORDER BY d.created_at DESC
+      LIMIT 20
+    `, args);
+
+    const activeResult = await pool.query(`
+      SELECT d.delivery_id, d.route_id, d.status, d.driver_name, d.vehicle_type, d.departure_time, d.arrival_time,
+             d.from_location, d.to_location, d.distance_km, d.estimated_fuel_consumption_liters, d.fuel_consumption,
+             d.estimated_carbon_kg, d.carbon_emissions, d.stops_json, d.delivery_items_json
+      FROM deliveries d
+      WHERE d.status IN ('accepted', 'in_progress') ${clause}
+      ORDER BY d.created_at DESC
+      LIMIT 20
+    `, args);
+
+    const completedResult = await pool.query(`
+      SELECT d.delivery_id, d.route_id, d.status, d.driver_name, d.vehicle_type, d.departure_time, d.arrival_time,
+             d.from_location, d.to_location, d.distance_km, d.estimated_fuel_consumption_liters, d.fuel_consumption,
+             d.estimated_carbon_kg, d.carbon_emissions, d.stops_json, d.delivery_items_json, d.completed_at
+      FROM deliveries d
+      WHERE d.status = 'completed' ${clause}
+      ORDER BY d.completed_at DESC NULLS LAST, d.created_at DESC
+      LIMIT 20
+    `, args);
+
+    const alertsResult = await pool.query(`
+      SELECT id, product_name, alert_type, risk_level, days_left, location, quantity
+      FROM alerts
+      WHERE status IN ('active', 'pending_review')
+      ORDER BY CASE risk_level WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END, created_at DESC
+      LIMIT 10
     `);
-    const stats = statsResult.rows[0];
+
+    const mapDelivery = (row) => ({
+      deliveryId: row.delivery_id,
+      routeId: row.route_id,
+      status: row.status,
+      driver: row.driver_name,
+      vehicle: row.vehicle_type,
+      departureTime: row.departure_time,
+      arrivalTime: row.arrival_time,
+      from: row.from_location,
+      to: row.to_location,
+      distance: parseFloat(row.distance_km) || 0,
+      estimatedFuel: parseFloat(row.estimated_fuel_consumption_liters) || 0,
+      actualFuel: parseFloat(row.fuel_consumption) || 0,
+      estimatedCO2: parseFloat(row.estimated_carbon_kg) || 0,
+      actualCO2: parseFloat(row.carbon_emissions) || 0,
+      stops: Array.isArray(row.stops_json)
+        ? row.stops_json.map((stop, idx) => ({
+            stopName: stop.stopName || stop.location_name || stop.location || `Stop ${idx + 1}`,
+            address: stop.address || stop.location || "",
+            status: stop.status || "pending",
+            latitude: stop.latitude ?? null,
+            longitude: stop.longitude ?? null
+          }))
+        : [],
+      items: Array.isArray(row.delivery_items_json)
+        ? row.delivery_items_json.map(item => ({
+            productName: item.productName || item.product_name || "Item",
+            quantity: String(item.quantity ?? ""),
+            status: item.status || null
+          }))
+        : []
+    });
+
+    const pendingAcceptance = pendingAcceptanceResult.rows.map(mapDelivery);
+    const activeDeliveries = activeResult.rows.map(mapDelivery);
+    const recentCompletions = completedResult.rows.map(mapDelivery);
+    const activeDelivery = activeDeliveries[0] || null;
+
+    const stats = statsResult.rows[0] || {};
     res.json({ 
       success: true, 
+      pendingAcceptance,
+      activeDelivery,
+      activeDeliveries,
+      upcomingAssignments: pendingAcceptance,
+      recentCompletions,
+      alerts: alertsResult.rows.map(row => ({
+        id: row.id,
+        productName: row.product_name,
+        alertType: row.alert_type,
+        riskLevel: row.risk_level,
+        daysLeft: row.days_left || 0,
+        location: row.location,
+        quantity: row.quantity ? `${row.quantity} kg` : null
+      })),
       summary: { 
         totalCompleted: parseInt(stats.total_completed) || 0, 
-        activeDeliveries: 0, 
+        activeDeliveries: parseInt(stats.active_deliveries) || 0, 
         totalKm: parseFloat(stats.total_km) || 0, 
         totalFuel: parseFloat(stats.total_fuel) || 0, 
         totalCarbon: parseFloat(stats.total_carbon) || 0 
@@ -1278,9 +1416,115 @@ app.post("/api/driver/respond-delivery", async (req, res) => {
 
 app.get("/api/driver/routes", async (req, res) => {
   try {
-    const result = await pool.query(`SELECT d.*, ra.route_type FROM deliveries d LEFT JOIN route_approvals ra ON d.route_id = ra.id WHERE d.driver_name IS NOT NULL LIMIT 50`);
-    res.json({ success: true, routes: result.rows });
+    const { driver_name } = req.query;
+    let query = `
+      SELECT d.*, ra.route_type
+      FROM deliveries d
+      LEFT JOIN route_approvals ra ON d.route_id = ra.id
+      WHERE d.driver_name IS NOT NULL
+    `;
+    const params = [];
+    if (driver_name) {
+      params.push(driver_name);
+      query += ` AND d.driver_name = $1`;
+    }
+    query += ` ORDER BY d.created_at DESC LIMIT 50`;
+    const result = await pool.query(query, params);
+    const routes = result.rows.map(row => ({
+      deliveryId: row.delivery_id,
+      routeId: row.route_id,
+      status: row.status,
+      driver: row.driver_name,
+      vehicle: row.vehicle_type,
+      departureTime: row.departure_time,
+      arrivalTime: row.arrival_time,
+      from: row.from_location,
+      to: row.to_location,
+      distance: parseFloat(row.distance_km) || 0,
+      estimatedFuel: parseFloat(row.estimated_fuel_consumption_liters) || 0,
+      actualFuel: parseFloat(row.fuel_consumption) || 0,
+      estimatedCO2: parseFloat(row.estimated_carbon_kg) || 0,
+      actualCO2: parseFloat(row.carbon_emissions) || 0
+    }));
+    res.json({ success: true, routes });
   } catch (err) { res.status(500).json({ success: false }); }
+});
+
+app.get("/api/driver/delivery/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(`
+      SELECT d.*, ra.route_type
+      FROM deliveries d
+      LEFT JOIN route_approvals ra ON d.route_id = ra.id
+      WHERE d.delivery_id = $1
+      LIMIT 1
+    `, [id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Delivery not found" });
+    }
+
+    const row = result.rows[0];
+
+    let stops = [];
+    const stopsResult = await pool.query(`
+      SELECT stop_sequence, location_name, address, latitude, longitude, status
+      FROM route_stops
+      WHERE route_id = $1
+      ORDER BY stop_sequence ASC
+    `, [row.route_id]);
+
+    if (stopsResult.rows.length > 0) {
+      stops = stopsResult.rows.map(stop => ({
+        stopId: stop.stop_sequence,
+        sequence: stop.stop_sequence,
+        stopName: stop.location_name || `Stop ${stop.stop_sequence}`,
+        address: stop.address || "",
+        latitude: stop.latitude !== null ? parseFloat(stop.latitude) : null,
+        longitude: stop.longitude !== null ? parseFloat(stop.longitude) : null,
+        status: stop.status || "pending"
+      }));
+    } else if (Array.isArray(row.stops_json)) {
+      stops = row.stops_json.map((stop, idx) => ({
+        stopId: idx + 1,
+        sequence: idx + 1,
+        stopName: stop.stopName || stop.location_name || stop.location || `Stop ${idx + 1}`,
+        address: stop.address || stop.location || "",
+        latitude: stop.latitude ?? null,
+        longitude: stop.longitude ?? null,
+        status: stop.status || "pending"
+      }));
+    } else {
+      stops = [
+        { stopId: 1, sequence: 1, stopName: row.from_location || "Warehouse", address: row.from_location || "", status: "completed" },
+        { stopId: 2, sequence: 2, stopName: row.to_location || "Destination", address: row.to_location || "", status: row.status === "completed" ? "completed" : "pending" }
+      ];
+    }
+
+    res.json({
+      success: true,
+      delivery: {
+        deliveryId: row.delivery_id,
+        routeId: row.route_id,
+        status: row.status,
+        driver: row.driver_name,
+        vehicle: row.vehicle_type,
+        departureTime: row.departure_time,
+        arrivalTime: row.arrival_time,
+        from: row.from_location,
+        to: row.to_location,
+        distance: parseFloat(row.distance_km) || 0,
+        estimatedFuel: parseFloat(row.estimated_fuel_consumption_liters) || 0,
+        actualFuel: parseFloat(row.fuel_consumption) || 0,
+        estimatedCO2: parseFloat(row.estimated_carbon_kg) || 0,
+        actualCO2: parseFloat(row.carbon_emissions) || 0,
+        stops
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Database error" });
+  }
 });
 
 app.post("/api/driver/start-delivery", async (req, res) => {
@@ -1297,6 +1541,44 @@ app.post("/api/driver/complete-delivery", async (req, res) => {
     await pool.query(`UPDATE deliveries SET status = 'completed', arrival_time = NOW(), completed_at = NOW(), fuel_consumption = $1, distance_km = $2, carbon_emissions = $3, delivery_notes = $4 WHERE delivery_id = $5`, [actualFuel, actualDistance, actualCO2, notes, deliveryId]);
     res.json({ success: true, message: "Completed" });
   } catch (err) { res.status(500).json({ success: false }); }
+});
+
+app.post("/api/driver/confirm-stop", async (req, res) => {
+  const { deliveryId, stopIndex, confirmationType } = req.body;
+  try {
+    const deliveryResult = await pool.query(`SELECT route_id, stops_json FROM deliveries WHERE delivery_id = $1`, [deliveryId]);
+    if (deliveryResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Delivery not found" });
+    }
+
+    const delivery = deliveryResult.rows[0];
+    const routeId = delivery.route_id;
+    const stopSequence = Number(stopIndex) + 1;
+    const isArrival = String(confirmationType || "").toLowerCase() === "arrival";
+
+    await pool.query(`
+      UPDATE route_stops
+      SET
+        actual_arrival_time = CASE WHEN $1 THEN NOW() ELSE actual_arrival_time END,
+        actual_departure_time = CASE WHEN $1 THEN actual_departure_time ELSE NOW() END,
+        status = CASE WHEN $1 THEN 'arrived' ELSE 'completed' END,
+        updated_at = NOW()
+      WHERE route_id = $2 AND stop_sequence = $3
+    `, [isArrival, routeId, stopSequence]);
+
+    if (Array.isArray(delivery.stops_json) && delivery.stops_json[stopIndex]) {
+      const updatedStops = [...delivery.stops_json];
+      updatedStops[stopIndex] = {
+        ...updatedStops[stopIndex],
+        status: isArrival ? "arrived" : "completed"
+      };
+      await pool.query(`UPDATE deliveries SET stops_json = $1 WHERE delivery_id = $2`, [JSON.stringify(updatedStops), deliveryId]);
+    }
+
+    res.json({ success: true, message: isArrival ? "Stop arrival confirmed" : "Stop departure confirmed" });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Database error" });
+  }
 });
 
 // ============================================================

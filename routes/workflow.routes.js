@@ -489,5 +489,3 @@ router.get("/history", authenticate, async (req, res) => {
 });
 
 module.exports = router;
-</parameter>
-</create_file>
