@@ -900,66 +900,34 @@ app.get("/api/logistics/dashboard", async (req, res) => {
     let statsResult;
 
     if (hasManagerApprovals) {
-      if (hasRouteApprovals) {
-        pendingResult = await pool.query(
-          `SELECT
-            ma.id as route_id,
-            COALESCE(ra.route_type, ma.request_data->>'route_type', 'STANDARD') as route_type,
-            COALESCE(ra.from_location, ma.request_data->>'from_location', 'Warehouse') as from_location,
-            COALESCE(ra.to_location, ma.request_data->>'to_location') as to_location,
-            COALESCE(ra.driver_name, ma.request_data->>'driver_name') as driver_name,
-            COALESCE(ra.vehicle_type, ma.request_data->>'vehicle_type') as vehicle_type,
-            ra.departure_time,
-            COALESCE(ra.original_distance, (ma.request_data->>'original_distance')::numeric, 0) as original_distance,
-            COALESCE(ra.optimized_distance, (ma.request_data->>'optimized_distance')::numeric, 0) as optimized_distance,
-            COALESCE(ra.original_fuel, (ma.request_data->>'original_fuel')::numeric, 0) as original_fuel,
-            COALESCE(ra.optimized_fuel, (ma.request_data->>'optimized_fuel')::numeric, 0) as optimized_fuel,
-            COALESCE(ra.original_co2, (ma.request_data->>'original_co2')::numeric, 0) as original_co2,
-            COALESCE(ra.optimized_co2, (ma.request_data->>'optimized_co2')::numeric, 0) as optimized_co2,
-            COALESCE(ra.savings_km, (ma.request_data->>'savings_km')::numeric, 0) as savings_km,
-            COALESCE(ra.savings_fuel, (ma.request_data->>'savings_fuel')::numeric, 0) as savings_fuel,
-            COALESCE(ra.savings_co2, (ma.request_data->>'savings_co2')::numeric, 0) as savings_co2,
-            COALESCE(ra.ai_suggestion, ma.request_notes, 'Optimize this route') as ai_suggestion,
-            UPPER(ma.status) as status,
-            ma.requested_by::text as submitted_by,
-            ma.created_at as submitted_at
-          FROM manager_approvals ma
-          LEFT JOIN route_approvals ra ON ra.id = COALESCE(ma.route_id, ma.delivery_id)
-          WHERE ma.approval_type = 'route_optimization'
-            AND LOWER(ma.status) IN ('pending', 'awaiting_approval')
-          ORDER BY ma.created_at DESC
-          LIMIT 20`
-        );
-      } else {
-        pendingResult = await pool.query(
-          `SELECT
-            ma.id as route_id,
-            COALESCE(ma.request_data->>'route_type', 'STANDARD') as route_type,
-            COALESCE(ma.request_data->>'from_location', 'Warehouse') as from_location,
-            ma.request_data->>'to_location' as to_location,
-            ma.request_data->>'driver_name' as driver_name,
-            ma.request_data->>'vehicle_type' as vehicle_type,
-            NULL::timestamp as departure_time,
-            COALESCE((ma.request_data->>'original_distance')::numeric, 0) as original_distance,
-            COALESCE((ma.request_data->>'optimized_distance')::numeric, 0) as optimized_distance,
-            COALESCE((ma.request_data->>'original_fuel')::numeric, 0) as original_fuel,
-            COALESCE((ma.request_data->>'optimized_fuel')::numeric, 0) as optimized_fuel,
-            COALESCE((ma.request_data->>'original_co2')::numeric, 0) as original_co2,
-            COALESCE((ma.request_data->>'optimized_co2')::numeric, 0) as optimized_co2,
-            COALESCE((ma.request_data->>'savings_km')::numeric, 0) as savings_km,
-            COALESCE((ma.request_data->>'savings_fuel')::numeric, 0) as savings_fuel,
-            COALESCE((ma.request_data->>'savings_co2')::numeric, 0) as savings_co2,
-            COALESCE(ma.request_notes, 'Optimize this route') as ai_suggestion,
-            UPPER(ma.status) as status,
-            ma.requested_by::text as submitted_by,
-            ma.created_at as submitted_at
-          FROM manager_approvals ma
-          WHERE ma.approval_type = 'route_optimization'
-            AND LOWER(ma.status) IN ('pending', 'awaiting_approval')
-          ORDER BY ma.created_at DESC
-          LIMIT 20`
-        );
-      }
+      pendingResult = await pool.query(
+        `SELECT
+          ma.id as route_id,
+          COALESCE(ma.request_data->>'route_type', 'STANDARD') as route_type,
+          COALESCE(ma.request_data->>'from_location', 'Warehouse') as from_location,
+          ma.request_data->>'to_location' as to_location,
+          ma.request_data->>'driver_name' as driver_name,
+          ma.request_data->>'vehicle_type' as vehicle_type,
+          NULL::timestamp as departure_time,
+          COALESCE((ma.request_data->>'original_distance')::numeric, 0) as original_distance,
+          COALESCE((ma.request_data->>'optimized_distance')::numeric, 0) as optimized_distance,
+          COALESCE((ma.request_data->>'original_fuel')::numeric, 0) as original_fuel,
+          COALESCE((ma.request_data->>'optimized_fuel')::numeric, 0) as optimized_fuel,
+          COALESCE((ma.request_data->>'original_co2')::numeric, 0) as original_co2,
+          COALESCE((ma.request_data->>'optimized_co2')::numeric, 0) as optimized_co2,
+          COALESCE((ma.request_data->>'savings_km')::numeric, 0) as savings_km,
+          COALESCE((ma.request_data->>'savings_fuel')::numeric, 0) as savings_fuel,
+          COALESCE((ma.request_data->>'savings_co2')::numeric, 0) as savings_co2,
+          COALESCE(ma.request_notes, 'Optimize this route') as ai_suggestion,
+          UPPER(ma.status) as status,
+          ma.requested_by::text as submitted_by,
+          ma.created_at as submitted_at
+        FROM manager_approvals ma
+        WHERE ma.approval_type = 'route_optimization'
+          AND LOWER(ma.status) IN ('pending', 'awaiting_approval')
+        ORDER BY ma.created_at DESC
+        LIMIT 20`
+      );
 
       statsResult = await pool.query(
         `SELECT 
@@ -1137,60 +1105,31 @@ app.get("/api/logistics/pending", async (req, res) => {
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
     let result;
     if (hasManagerApprovals) {
-      if (hasRouteApprovals) {
-        result = await pool.query(`
-          SELECT
-            ma.id,
-            COALESCE(ra.route_type, ma.request_data->>'route_type', 'STANDARD') as product_name,
-            COALESCE(ra.from_location, ma.request_data->>'from_location', 'Unknown') as location,
-            COALESCE(ra.driver_name, ma.request_data->>'driver_name') as driver_name,
-            COALESCE(ra.vehicle_type, ma.request_data->>'vehicle_type') as vehicle_type,
-            ra.departure_time,
-            COALESCE(ra.original_distance, (ma.request_data->>'original_distance')::numeric, 0) as total_distance_km,
-            COALESCE(ra.optimized_distance, (ma.request_data->>'optimized_distance')::numeric, 0) as optimized_distance,
-            COALESCE(ra.original_fuel, (ma.request_data->>'original_fuel')::numeric, 0) as estimated_fuel_consumption_liters,
-            COALESCE(ra.optimized_fuel, (ma.request_data->>'optimized_fuel')::numeric, 0) as optimized_fuel,
-            COALESCE(ra.original_co2, (ma.request_data->>'original_co2')::numeric, 0) as estimated_carbon_kg,
-            COALESCE(ra.optimized_co2, (ma.request_data->>'optimized_co2')::numeric, 0) as optimized_carbon_kg,
-            COALESCE(ra.savings_km, (ma.request_data->>'savings_km')::numeric, 0) as savings_km,
-            COALESCE(ra.savings_fuel, (ma.request_data->>'savings_fuel')::numeric, 0) as savings_fuel,
-            COALESCE(ra.savings_co2, (ma.request_data->>'savings_co2')::numeric, 0) as savings_co2,
-            COALESCE(ra.ai_suggestion, ma.request_notes, 'Optimize route') as ai_recommendation,
-            UPPER(ma.status) as status,
-            ma.requested_by::text as submitted_by,
-            ma.created_at as created_at
-          FROM manager_approvals ma
-          LEFT JOIN route_approvals ra ON ra.id = COALESCE(ma.route_id, ma.delivery_id)
-          WHERE ma.approval_type = 'route_optimization' AND LOWER(ma.status) IN ('pending', 'awaiting_approval')
-          ORDER BY ma.created_at DESC
-        `);
-      } else {
-        result = await pool.query(`
-          SELECT
-            ma.id,
-            COALESCE(ma.request_data->>'route_type', 'STANDARD') as product_name,
-            COALESCE(ma.request_data->>'from_location', 'Unknown') as location,
-            ma.request_data->>'driver_name' as driver_name,
-            ma.request_data->>'vehicle_type' as vehicle_type,
-            NULL::timestamp as departure_time,
-            COALESCE((ma.request_data->>'original_distance')::numeric, 0) as total_distance_km,
-            COALESCE((ma.request_data->>'optimized_distance')::numeric, 0) as optimized_distance,
-            COALESCE((ma.request_data->>'original_fuel')::numeric, 0) as estimated_fuel_consumption_liters,
-            COALESCE((ma.request_data->>'optimized_fuel')::numeric, 0) as optimized_fuel,
-            COALESCE((ma.request_data->>'original_co2')::numeric, 0) as estimated_carbon_kg,
-            COALESCE((ma.request_data->>'optimized_co2')::numeric, 0) as optimized_carbon_kg,
-            COALESCE((ma.request_data->>'savings_km')::numeric, 0) as savings_km,
-            COALESCE((ma.request_data->>'savings_fuel')::numeric, 0) as savings_fuel,
-            COALESCE((ma.request_data->>'savings_co2')::numeric, 0) as savings_co2,
-            COALESCE(ma.request_notes, 'Optimize route') as ai_recommendation,
-            UPPER(ma.status) as status,
-            ma.requested_by::text as submitted_by,
-            ma.created_at as created_at
-          FROM manager_approvals ma
-          WHERE ma.approval_type = 'route_optimization' AND LOWER(ma.status) IN ('pending', 'awaiting_approval')
-          ORDER BY ma.created_at DESC
-        `);
-      }
+      result = await pool.query(`
+        SELECT
+          ma.id,
+          COALESCE(ma.request_data->>'route_type', 'STANDARD') as product_name,
+          COALESCE(ma.request_data->>'from_location', 'Unknown') as location,
+          ma.request_data->>'driver_name' as driver_name,
+          ma.request_data->>'vehicle_type' as vehicle_type,
+          NULL::timestamp as departure_time,
+          COALESCE((ma.request_data->>'original_distance')::numeric, 0) as total_distance_km,
+          COALESCE((ma.request_data->>'optimized_distance')::numeric, 0) as optimized_distance,
+          COALESCE((ma.request_data->>'original_fuel')::numeric, 0) as estimated_fuel_consumption_liters,
+          COALESCE((ma.request_data->>'optimized_fuel')::numeric, 0) as optimized_fuel,
+          COALESCE((ma.request_data->>'original_co2')::numeric, 0) as estimated_carbon_kg,
+          COALESCE((ma.request_data->>'optimized_co2')::numeric, 0) as optimized_carbon_kg,
+          COALESCE((ma.request_data->>'savings_km')::numeric, 0) as savings_km,
+          COALESCE((ma.request_data->>'savings_fuel')::numeric, 0) as savings_fuel,
+          COALESCE((ma.request_data->>'savings_co2')::numeric, 0) as savings_co2,
+          COALESCE(ma.request_notes, 'Optimize route') as ai_recommendation,
+          UPPER(ma.status) as status,
+          ma.requested_by::text as submitted_by,
+          ma.created_at as created_at
+        FROM manager_approvals ma
+        WHERE ma.approval_type = 'route_optimization' AND LOWER(ma.status) IN ('pending', 'awaiting_approval')
+        ORDER BY ma.created_at DESC
+      `);
     } else if (hasRouteApprovals) {
       result = await pool.query(`
         SELECT id, route_type as product_name, from_location as location, driver_name, vehicle_type, departure_time, 
@@ -1292,7 +1231,7 @@ app.patch("/api/logistics/:id/approve", async (req, res) => {
         `UPDATE manager_approvals 
          SET status = 'approved', manager_comment = $1, decision_notes = $1, reviewed_at = NOW(), updated_at = NOW()
          WHERE id = $2 AND approval_type = 'route_optimization'
-         RETURNING route_id, delivery_id`,
+         RETURNING *`,
         [comment || '', id]
       );
       if (hasRouteApprovals) {
@@ -1396,7 +1335,7 @@ app.patch("/api/logistics/:id/decline", async (req, res) => {
         `UPDATE manager_approvals
          SET status = 'declined', manager_comment = $1, decision_notes = $1, reviewed_at = NOW(), updated_at = NOW()
          WHERE id = $2 AND approval_type = 'route_optimization'
-         RETURNING route_id, delivery_id`,
+         RETURNING *`,
         [reason || '', id]
       );
       if (hasRouteApprovals) {
@@ -1430,44 +1369,24 @@ app.get("/api/logistics/history", async (req, res) => {
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
     const result = hasManagerApprovals
-      ? hasRouteApprovals
-        ? await pool.query(`
-            SELECT
-              ma.id as approval_id,
-              ma.id as route_id,
-              COALESCE(ra.route_type, ma.request_data->>'route_type', 'STANDARD') as product_name,
-              COALESCE(ra.from_location, ma.request_data->>'from_location', 'Unknown') as location,
-              COALESCE(ra.driver_name, ma.request_data->>'driver_name') as driver_name,
-              UPPER(ma.status) as status,
-              COALESCE(ra.savings_km, (ma.request_data->>'savings_km')::numeric, 0) as savings_km,
-              COALESCE(ra.savings_co2, (ma.request_data->>'savings_co2')::numeric, 0) as savings_co2,
-              ma.reviewed_at as reviewed_at,
-              COALESCE(ma.manager_comment, ma.decision_notes) as review_notes
-            FROM manager_approvals ma
-            LEFT JOIN route_approvals ra ON ra.id = COALESCE(ma.route_id, ma.delivery_id)
-            WHERE ma.approval_type = 'route_optimization'
-              AND ma.status IN ('approved', 'declined', 'rejected')
-            ORDER BY ma.reviewed_at DESC NULLS LAST, ma.updated_at DESC
-            LIMIT 100
-          `)
-        : await pool.query(`
-            SELECT
-              ma.id as approval_id,
-              ma.id as route_id,
-              COALESCE(ma.request_data->>'route_type', 'STANDARD') as product_name,
-              COALESCE(ma.request_data->>'from_location', 'Unknown') as location,
-              ma.request_data->>'driver_name' as driver_name,
-              UPPER(ma.status) as status,
-              COALESCE((ma.request_data->>'savings_km')::numeric, 0) as savings_km,
-              COALESCE((ma.request_data->>'savings_co2')::numeric, 0) as savings_co2,
-              ma.reviewed_at as reviewed_at,
-              COALESCE(ma.manager_comment, ma.decision_notes) as review_notes
-            FROM manager_approvals ma
-            WHERE ma.approval_type = 'route_optimization'
-              AND ma.status IN ('approved', 'declined', 'rejected')
-            ORDER BY ma.reviewed_at DESC NULLS LAST, ma.updated_at DESC
-            LIMIT 100
-          `)
+      ? await pool.query(`
+          SELECT
+            ma.id as approval_id,
+            ma.id as route_id,
+            COALESCE(ma.request_data->>'route_type', 'STANDARD') as product_name,
+            COALESCE(ma.request_data->>'from_location', 'Unknown') as location,
+            ma.request_data->>'driver_name' as driver_name,
+            UPPER(ma.status) as status,
+            COALESCE((ma.request_data->>'savings_km')::numeric, 0) as savings_km,
+            COALESCE((ma.request_data->>'savings_co2')::numeric, 0) as savings_co2,
+            ma.reviewed_at as reviewed_at,
+            COALESCE(ma.manager_comment, ma.decision_notes) as review_notes
+          FROM manager_approvals ma
+          WHERE ma.approval_type = 'route_optimization'
+            AND LOWER(ma.status) IN ('approved', 'declined', 'rejected')
+          ORDER BY ma.reviewed_at DESC NULLS LAST, ma.updated_at DESC
+          LIMIT 100
+        `)
       : hasRouteApprovals
       ? await pool.query(`
           SELECT id as approval_id, id as route_id, route_type as product_name, from_location as location, driver_name, 
@@ -1511,7 +1430,7 @@ app.post("/api/logistics/approve", async (req, res) => {
         `UPDATE manager_approvals
          SET status = LOWER($1), manager_comment = $2, decision_notes = $2, reviewed_at = NOW(), updated_at = NOW()
          WHERE id = $3 AND approval_type = 'route_optimization'
-         RETURNING route_id, delivery_id`,
+         RETURNING *`,
         [status, comment || '', routeId]
       );
       if (hasRouteApprovals) {
