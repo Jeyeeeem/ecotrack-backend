@@ -881,6 +881,7 @@ app.get("/api/logistics/dashboard", async (req, res) => {
       LIMIT 20`
     );
 
+    // 2. Stats matching Web's count boxes - Fixed Syntax Error
     const statsResult = await pool.query(
       `SELECT 
         (SELECT COUNT(*) FROM route_approvals WHERE status = 'PENDING') as pending_count,
