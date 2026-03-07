@@ -1380,6 +1380,9 @@ app.use('/api/ai', aiRoutes);
 
 const trackingRoutes = require('./routes/tracking.routes');
 app.use('/api/tracking', trackingRoutes);
+const workflowRoutes = require('./routes/workflow.routes');
+app.use('/api/workflow', workflowRoutes);
+
 
 // ============================================================
 // GLOBAL ERROR HANDLER
