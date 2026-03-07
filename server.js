@@ -987,9 +987,58 @@ app.get("/api/logistics/driver-monitor", async (req, res) => {
 
 app.patch("/api/logistics/:id/approve", async (req, res) => {
   const { id } = req.params;
-  const { comment } = req.body;
+  const { comment, driver_id } = req.body;
   try {
-    await pool.query(`UPDATE route_approvals SET status = 'APPROVED', manager_comment = $1, approved_at = NOW() WHERE id = $2`, [comment || '', id]);
+    // First, get the route details to know the driver_name if driver_id is provided
+    let driverName = null;
+    if (driver_id) {
+      const driverResult = await pool.query(
+        `SELECT name FROM users WHERE user_id = $1 AND role = 'driver'`,
+        [driver_id]
+      );
+      if (driverResult.rows.length > 0) {
+        driverName = driverResult.rows[0].name;
+      }
+    }
+    
+    // Update route_approvals with driver assignment
+    await pool.query(
+      `UPDATE route_approvals 
+       SET status = 'APPROVED', 
+           manager_comment = $1, 
+           approved_at = NOW(),
+           driver_name = COALESCE($2, driver_name)
+       WHERE id = $3`, 
+      [comment || '', driverName, id]
+    );
+    
+    // Also create/update a delivery record with the assigned driver
+    if (driver_id && driverName) {
+      const routeResult = await pool.query(`SELECT * FROM route_approvals WHERE id = $1`, [id]);
+      if (routeResult.rows.length > 0) {
+        const route = routeResult.rows[0];
+        
+        // Check if delivery already exists for this route approval
+        const existingDelivery = await pool.query(
+          `SELECT delivery_id FROM deliveries WHERE route_id = $1 AND driver_name = $2`,
+          [id, driverName]
+        );
+        
+        if (existingDelivery.rows.length === 0) {
+          // Create a new delivery record
+          await pool.query(
+            `INSERT INTO deliveries 
+              (route_id, status, driver_name, vehicle_type, departure_time, from_location, to_location,
+               distance_km, estimated_fuel_consumption_liters, estimated_carbon_kg)
+             VALUES ($1, 'assigned', $2, $3, $4, $5, $6, $7, $8, $9)`,
+            [id, driverName, route.vehicle_type, route.departure_time, route.from_location, 
+             route.to_location, route.optimized_distance || route.original_distance,
+             route.optimized_fuel || route.original_fuel, route.optimized_co2 || route.original_co2]
+          );
+        }
+      }
+    }
+    
     res.json({ success: true, message: "Approved" });
   } catch (err) { res.status(500).json({ success: false }); }
 });
@@ -1247,6 +1296,78 @@ app.post("/api/driver/complete-delivery", async (req, res) => {
     await pool.query(`UPDATE deliveries SET status = 'completed', arrival_time = NOW(), completed_at = NOW(), fuel_consumption = $1, distance_km = $2, carbon_emissions = $3, delivery_notes = $4 WHERE delivery_id = $5`, [actualFuel, actualDistance, actualCO2, notes, deliveryId]);
     res.json({ success: true, message: "Completed" });
   } catch (err) { res.status(500).json({ success: false }); }
+});
+
+// ============================================================
+// NEW: DRIVER MANAGEMENT ENDPOINTS
+// ============================================================
+
+// Get all drivers (for logistics manager to select when approving routes)
+app.get("/api/drivers", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT user_id, name, email, role, business_id, full_name, phone, created_at
+      FROM users 
+      WHERE role = 'driver' 
+      ORDER BY name ASC
+    `);
+    res.json({ success: true, drivers: result.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: "Database error" });
+  }
+});
+
+// Get assigned routes for a driver (for driver's dashboard)
+app.get("/api/driver/assigned-routes", async (req, res) => {
+  try {
+    const { driver_name } = req.query;
+    if (!driver_name) {
+      return res.status(400).json({ success: false, message: "Driver name is required" });
+    }
+    
+    // Get deliveries assigned to this driver
+    const result = await pool.query(`
+      SELECT d.*, ra.route_type, ra.original_distance, ra.optimized_distance, 
+             ra.original_fuel, ra.optimized_fuel, ra.original_co2, ra.optimized_co2,
+             ra.savings_km, ra.savings_fuel, ra.savings_co2
+      FROM deliveries d
+      LEFT JOIN route_approvals ra ON d.route_id = ra.id
+      WHERE d.driver_name = $1 AND d.status IN ('assigned', 'accepted', 'in_progress')
+      ORDER BY d.departure_time ASC
+    `, [driver_name]);
+    
+    res.json({ success: true, routes: result.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: "Database error" });
+  }
+});
+
+// Get pending deliveries for a driver (new assignments)
+app.get("/api/driver/pending-deliveries", async (req, res) => {
+  try {
+    const { driver_name } = req.query;
+    if (!driver_name) {
+      return res.status(400).json({ success: false, message: "Driver name is required" });
+    }
+    
+    const result = await pool.query(`
+      SELECT d.*, ra.route_type, ra.from_location, ra.to_location, 
+             ra.original_distance, ra.optimized_distance, ra.original_fuel, ra.optimized_fuel,
+             ra.original_co2, ra.optimized_co2, ra.savings_km, ra.savings_fuel, ra.savings_co2,
+             ra.ai_suggestion
+      FROM deliveries d
+      LEFT JOIN route_approvals ra ON d.route_id = ra.id
+      WHERE d.driver_name = $1 AND d.status = 'assigned'
+      ORDER BY d.departure_time ASC
+    `, [driver_name]);
+    
+    res.json({ success: true, deliveries: result.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: "Database error" });
+  }
 });
 
 // ============================================================
