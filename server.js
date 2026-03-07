@@ -926,7 +926,7 @@ app.get("/api/logistics/dashboard", async (req, res) => {
           FROM manager_approvals ma
           LEFT JOIN route_approvals ra ON ra.id = COALESCE(ma.related_record_id, ma.route_id, ma.delivery_id)
           WHERE ma.approval_type = 'route_optimization'
-            AND ma.status = 'pending'
+            AND LOWER(ma.status) IN ('pending', 'awaiting_approval')
           ORDER BY COALESCE(ma.requested_at, ma.created_at) DESC
           LIMIT 20`
         );
@@ -955,7 +955,7 @@ app.get("/api/logistics/dashboard", async (req, res) => {
             COALESCE(ma.requested_at, ma.created_at) as submitted_at
           FROM manager_approvals ma
           WHERE ma.approval_type = 'route_optimization'
-            AND ma.status = 'pending'
+            AND LOWER(ma.status) IN ('pending', 'awaiting_approval')
           ORDER BY COALESCE(ma.requested_at, ma.created_at) DESC
           LIMIT 20`
         );
@@ -963,7 +963,7 @@ app.get("/api/logistics/dashboard", async (req, res) => {
 
       statsResult = await pool.query(
         `SELECT 
-          COUNT(*) FILTER (WHERE status = 'pending') as pending_count,
+          COUNT(*) FILTER (WHERE LOWER(status) IN ('pending', 'awaiting_approval')) as pending_count,
           COUNT(*) FILTER (WHERE status = 'approved') as approved_count,
           COUNT(*) FILTER (WHERE status IN ('declined', 'rejected')) as declined_count,
           0::numeric as avg_co2_saved,
@@ -996,14 +996,14 @@ app.get("/api/logistics/dashboard", async (req, res) => {
           ra.submitted_by, 
           ra.submitted_at
         FROM route_approvals ra 
-        WHERE status = 'PENDING' 
+        WHERE UPPER(status) IN ('PENDING', 'AWAITING_APPROVAL')
         ORDER BY submitted_at DESC 
         LIMIT 20`
       );
 
       statsResult = await pool.query(
         `SELECT 
-          (SELECT COUNT(*) FROM route_approvals WHERE status = 'PENDING') as pending_count,
+          (SELECT COUNT(*) FROM route_approvals WHERE UPPER(status) IN ('PENDING', 'AWAITING_APPROVAL')) as pending_count,
           (SELECT COUNT(*) FROM route_approvals WHERE status = 'APPROVED') as approved_count,
           (SELECT COUNT(*) FROM route_approvals WHERE status = 'DECLINED') as declined_count,
           COALESCE(AVG(savings_co2), 0) FILTER (WHERE status = 'APPROVED') as avg_co2_saved,
@@ -1161,7 +1161,7 @@ app.get("/api/logistics/pending", async (req, res) => {
             COALESCE(ma.requested_at, ma.created_at) as created_at
           FROM manager_approvals ma
           LEFT JOIN route_approvals ra ON ra.id = COALESCE(ma.related_record_id, ma.route_id, ma.delivery_id)
-          WHERE ma.approval_type = 'route_optimization' AND ma.status = 'pending'
+          WHERE ma.approval_type = 'route_optimization' AND LOWER(ma.status) IN ('pending', 'awaiting_approval')
           ORDER BY COALESCE(ma.requested_at, ma.created_at) DESC
         `);
       } else {
@@ -1187,7 +1187,7 @@ app.get("/api/logistics/pending", async (req, res) => {
             ma.requested_by::text as submitted_by,
             COALESCE(ma.requested_at, ma.created_at) as created_at
           FROM manager_approvals ma
-          WHERE ma.approval_type = 'route_optimization' AND ma.status = 'pending'
+          WHERE ma.approval_type = 'route_optimization' AND LOWER(ma.status) IN ('pending', 'awaiting_approval')
           ORDER BY COALESCE(ma.requested_at, ma.created_at) DESC
         `);
       }
@@ -1198,7 +1198,7 @@ app.get("/api/logistics/pending", async (req, res) => {
                optimized_fuel, original_co2 as estimated_carbon_kg, optimized_co2 as optimized_carbon_kg, 
                savings_km, savings_fuel, savings_co2, ai_suggestion as ai_recommendation, status, 
                submitted_by, submitted_at as created_at 
-        FROM route_approvals WHERE status = 'PENDING' ORDER BY submitted_at DESC
+        FROM route_approvals WHERE UPPER(status) IN ('PENDING', 'AWAITING_APPROVAL') ORDER BY submitted_at DESC
       `);
     } else {
       result = await pool.query(`
@@ -1239,19 +1239,19 @@ app.get("/api/logistics/stats", async (req, res) => {
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
     const result = hasManagerApprovals
       ? await pool.query(`
-          SELECT COUNT(*) FILTER (WHERE status = 'pending') as pending_count, 
-                 COUNT(*) FILTER (WHERE status = 'approved') as approved_count, 
-                 COUNT(*) FILTER (WHERE status IN ('declined', 'rejected')) as declined_count, 
+          SELECT COUNT(*) FILTER (WHERE LOWER(status) IN ('pending', 'awaiting_approval')) as pending_count, 
+                 COUNT(*) FILTER (WHERE LOWER(status) = 'approved') as approved_count, 
+                 COUNT(*) FILTER (WHERE LOWER(status) IN ('declined', 'rejected')) as declined_count, 
                  0::numeric as avg_co2_saved
           FROM manager_approvals
           WHERE approval_type = 'route_optimization'
         `)
       : hasRouteApprovals
       ? await pool.query(`
-          SELECT COUNT(*) FILTER (WHERE status = 'PENDING') as pending_count, 
-                 COUNT(*) FILTER (WHERE status = 'APPROVED') as approved_count, 
-                 COUNT(*) FILTER (WHERE status = 'DECLINED') as declined_count, 
-                 COALESCE(AVG(savings_co2), 0) FILTER (WHERE status = 'APPROVED') as avg_co2_saved 
+          SELECT COUNT(*) FILTER (WHERE UPPER(status) IN ('PENDING', 'AWAITING_APPROVAL')) as pending_count, 
+                 COUNT(*) FILTER (WHERE UPPER(status) = 'APPROVED') as approved_count, 
+                 COUNT(*) FILTER (WHERE UPPER(status) = 'DECLINED') as declined_count, 
+                 COALESCE(AVG(savings_co2), 0) FILTER (WHERE UPPER(status) = 'APPROVED') as avg_co2_saved 
           FROM route_approvals
         `)
       : await pool.query(`
@@ -1295,14 +1295,24 @@ app.patch("/api/logistics/:id/approve", async (req, res) => {
          RETURNING related_record_id, route_id, delivery_id`,
         [comment || '', id]
       );
-      if (maResult.rows.length > 0 && hasRouteApprovals) {
-        const routeRef = maResult.rows[0].related_record_id || maResult.rows[0].route_id || maResult.rows[0].delivery_id;
-        if (routeRef) {
+      if (hasRouteApprovals) {
+        if (maResult.rows.length > 0) {
+          const routeRef = maResult.rows[0].related_record_id || maResult.rows[0].route_id || maResult.rows[0].delivery_id;
+          if (routeRef) {
+            await pool.query(
+              `UPDATE route_approvals 
+               SET status = 'APPROVED', manager_comment = $1, approved_at = NOW()
+               WHERE id = $2`,
+              [comment || '', routeRef]
+            );
+          }
+        } else {
+          // Fallback when client passes a route_approvals id instead of manager_approvals id
           await pool.query(
             `UPDATE route_approvals 
              SET status = 'APPROVED', manager_comment = $1, approved_at = NOW()
              WHERE id = $2`,
-            [comment || '', routeRef]
+            [comment || '', id]
           );
         }
       }
@@ -1389,10 +1399,14 @@ app.patch("/api/logistics/:id/decline", async (req, res) => {
          RETURNING related_record_id, route_id, delivery_id`,
         [reason || '', id]
       );
-      if (maResult.rows.length > 0 && hasRouteApprovals) {
-        const routeRef = maResult.rows[0].related_record_id || maResult.rows[0].route_id || maResult.rows[0].delivery_id;
-        if (routeRef) {
-          await pool.query(`UPDATE route_approvals SET status = 'DECLINED', manager_comment = $1, approved_at = NOW() WHERE id = $2`, [reason || '', routeRef]);
+      if (hasRouteApprovals) {
+        if (maResult.rows.length > 0) {
+          const routeRef = maResult.rows[0].related_record_id || maResult.rows[0].route_id || maResult.rows[0].delivery_id;
+          if (routeRef) {
+            await pool.query(`UPDATE route_approvals SET status = 'DECLINED', manager_comment = $1, approved_at = NOW() WHERE id = $2`, [reason || '', routeRef]);
+          }
+        } else {
+          await pool.query(`UPDATE route_approvals SET status = 'DECLINED', manager_comment = $1, approved_at = NOW() WHERE id = $2`, [reason || '', id]);
         }
       }
     } else if (hasRouteApprovals) {
@@ -1500,10 +1514,14 @@ app.post("/api/logistics/approve", async (req, res) => {
          RETURNING related_record_id, route_id, delivery_id`,
         [status, comment || '', routeId]
       );
-      if (maResult.rows.length > 0 && hasRouteApprovals) {
-        const routeRef = maResult.rows[0].related_record_id || maResult.rows[0].route_id || maResult.rows[0].delivery_id;
-        if (routeRef) {
-          await pool.query(`UPDATE route_approvals SET status = $1, manager_comment = $2, approved_at = NOW() WHERE id = $3`, [status, comment || '', routeRef]);
+      if (hasRouteApprovals) {
+        if (maResult.rows.length > 0) {
+          const routeRef = maResult.rows[0].related_record_id || maResult.rows[0].route_id || maResult.rows[0].delivery_id;
+          if (routeRef) {
+            await pool.query(`UPDATE route_approvals SET status = $1, manager_comment = $2, approved_at = NOW() WHERE id = $3`, [status, comment || '', routeRef]);
+          }
+        } else {
+          await pool.query(`UPDATE route_approvals SET status = $1, manager_comment = $2, approved_at = NOW() WHERE id = $3`, [status, comment || '', routeId]);
         }
       }
     } else if (hasRouteApprovals) {
