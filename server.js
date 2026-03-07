@@ -922,12 +922,12 @@ app.get("/api/logistics/dashboard", async (req, res) => {
             COALESCE(ra.ai_suggestion, ma.request_notes, 'Optimize this route') as ai_suggestion,
             UPPER(ma.status) as status,
             ma.requested_by::text as submitted_by,
-            COALESCE(ma.requested_at, ma.created_at) as submitted_at
+            ma.created_at as submitted_at
           FROM manager_approvals ma
           LEFT JOIN route_approvals ra ON ra.id = COALESCE(ma.related_record_id, ma.route_id, ma.delivery_id)
           WHERE ma.approval_type = 'route_optimization'
             AND LOWER(ma.status) IN ('pending', 'awaiting_approval')
-          ORDER BY COALESCE(ma.requested_at, ma.created_at) DESC
+          ORDER BY ma.created_at DESC
           LIMIT 20`
         );
       } else {
@@ -952,11 +952,11 @@ app.get("/api/logistics/dashboard", async (req, res) => {
             COALESCE(ma.request_notes, 'Optimize this route') as ai_suggestion,
             UPPER(ma.status) as status,
             ma.requested_by::text as submitted_by,
-            COALESCE(ma.requested_at, ma.created_at) as submitted_at
+            ma.created_at as submitted_at
           FROM manager_approvals ma
           WHERE ma.approval_type = 'route_optimization'
             AND LOWER(ma.status) IN ('pending', 'awaiting_approval')
-          ORDER BY COALESCE(ma.requested_at, ma.created_at) DESC
+          ORDER BY ma.created_at DESC
           LIMIT 20`
         );
       }
@@ -1124,7 +1124,7 @@ app.get("/api/logistics/dashboard", async (req, res) => {
       },
       pendingRoutes: [],
       driverMonitor: [],
-      message: "Logistics data temporarily unavailable"
+      message: `Logistics data temporarily unavailable: ${err.message || 'unknown error'}`
     });
   }
 });
@@ -1158,11 +1158,11 @@ app.get("/api/logistics/pending", async (req, res) => {
             COALESCE(ra.ai_suggestion, ma.request_notes, 'Optimize route') as ai_recommendation,
             UPPER(ma.status) as status,
             ma.requested_by::text as submitted_by,
-            COALESCE(ma.requested_at, ma.created_at) as created_at
+            ma.created_at as created_at
           FROM manager_approvals ma
           LEFT JOIN route_approvals ra ON ra.id = COALESCE(ma.related_record_id, ma.route_id, ma.delivery_id)
           WHERE ma.approval_type = 'route_optimization' AND LOWER(ma.status) IN ('pending', 'awaiting_approval')
-          ORDER BY COALESCE(ma.requested_at, ma.created_at) DESC
+          ORDER BY ma.created_at DESC
         `);
       } else {
         result = await pool.query(`
@@ -1185,10 +1185,10 @@ app.get("/api/logistics/pending", async (req, res) => {
             COALESCE(ma.request_notes, 'Optimize route') as ai_recommendation,
             UPPER(ma.status) as status,
             ma.requested_by::text as submitted_by,
-            COALESCE(ma.requested_at, ma.created_at) as created_at
+            ma.created_at as created_at
           FROM manager_approvals ma
           WHERE ma.approval_type = 'route_optimization' AND LOWER(ma.status) IN ('pending', 'awaiting_approval')
-          ORDER BY COALESCE(ma.requested_at, ma.created_at) DESC
+          ORDER BY ma.created_at DESC
         `);
       }
     } else if (hasRouteApprovals) {
