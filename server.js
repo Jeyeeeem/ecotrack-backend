@@ -83,12 +83,13 @@ const normalizeBadge = (level, ecoLevel) => {
 };
 
 let managerApprovalsPkCache = { value: "id", loadedAt: 0 };
+let managerApprovalsColumnsCache = { value: new Set(), loadedAt: 0 };
 const MANAGER_PK_CACHE_TTL_MS = 5 * 60 * 1000;
 
-async function getManagerApprovalsPkColumn() {
+async function getManagerApprovalsColumns() {
   const now = Date.now();
-  if (now - managerApprovalsPkCache.loadedAt < MANAGER_PK_CACHE_TTL_MS) {
-    return managerApprovalsPkCache.value;
+  if (now - managerApprovalsColumnsCache.loadedAt < MANAGER_PK_CACHE_TTL_MS) {
+    return managerApprovalsColumnsCache.value;
   }
 
   try {
@@ -98,6 +99,20 @@ async function getManagerApprovalsPkColumn() {
        WHERE table_schema = 'public' AND table_name = 'manager_approvals'`
     );
     const columnSet = new Set(columnsResult.rows.map((row) => row.column_name));
+    managerApprovalsColumnsCache = { value: columnSet, loadedAt: now };
+    return columnSet;
+  } catch (error) {
+    return new Set();
+  }
+}
+
+async function getManagerApprovalsPkColumn() {
+  if (Date.now() - managerApprovalsPkCache.loadedAt < MANAGER_PK_CACHE_TTL_MS) {
+    return managerApprovalsPkCache.value;
+  }
+
+  try {
+    const columnSet = await getManagerApprovalsColumns();
     const resolved = columnSet.has("id")
       ? "id"
       : columnSet.has("approval_id")
@@ -923,12 +938,18 @@ app.get("/api/logistics/dashboard", async (req, res) => {
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
+    const managerColumns = hasManagerApprovals ? await getManagerApprovalsColumns() : new Set();
+    const canUseManagerRouteData =
+      hasManagerApprovals &&
+      managerColumns.has("request_data") &&
+      managerColumns.has("approval_type") &&
+      managerColumns.has("status");
     const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
 
     let pendingResult;
     let statsResult;
 
-    if (hasManagerApprovals) {
+    if (canUseManagerRouteData) {
       pendingResult = await pool.query(
         `SELECT
           ma.${managerPkCol} as route_id,
@@ -1051,46 +1072,19 @@ app.get("/api/logistics/dashboard", async (req, res) => {
         FROM route_approvals`
       );
     } else {
-      pendingResult = await pool.query(
-        `SELECT 
-          ma.${managerPkCol} as route_id,
-          COALESCE(ma.request_data->>'route_type', 'STANDARD') as route_type,
-          ma.request_data->>'from_location' as from_location,
-          ma.request_data->>'to_location' as to_location,
-          ma.request_data->>'driver_name' as driver_name,
-          ma.request_data->>'vehicle_type' as vehicle_type,
-          NULL::timestamp as departure_time,
-          COALESCE((ma.request_data->>'original_distance')::numeric, 0) as original_distance,
-          COALESCE((ma.request_data->>'optimized_distance')::numeric, 0) as optimized_distance,
-          COALESCE((ma.request_data->>'original_fuel')::numeric, 0) as original_fuel,
-          COALESCE((ma.request_data->>'optimized_fuel')::numeric, 0) as optimized_fuel,
-          COALESCE((ma.request_data->>'original_co2')::numeric, 0) as original_co2,
-          COALESCE((ma.request_data->>'optimized_co2')::numeric, 0) as optimized_co2,
-          COALESCE((ma.request_data->>'savings_km')::numeric, 0) as savings_km,
-          COALESCE((ma.request_data->>'savings_fuel')::numeric, 0) as savings_fuel,
-          COALESCE((ma.request_data->>'savings_co2')::numeric, 0) as savings_co2,
-          COALESCE(ma.request_notes, 'Optimize this route') as ai_suggestion,
-          UPPER(ma.status) as status,
-          ma.requested_by::text as submitted_by,
-          ma.created_at as submitted_at
-        FROM manager_approvals ma
-        WHERE ma.approval_type = 'route_optimization'
-          AND ma.status = 'pending'
-        ORDER BY ma.created_at DESC
-        LIMIT 20`
-      );
-
-      statsResult = await pool.query(
-        `SELECT 
-          COUNT(*) FILTER (WHERE status = 'pending') as pending_count,
-          COUNT(*) FILTER (WHERE status = 'approved') as approved_count,
-          COUNT(*) FILTER (WHERE status = 'declined') as declined_count,
-          0::numeric as avg_co2_saved,
-          0::numeric as total_co2_reduced,
-          0::numeric as total_km_saved
-        FROM manager_approvals
-        WHERE approval_type = 'route_optimization'`
-      );
+      pendingResult = { rows: [] };
+      statsResult = {
+        rows: [
+          {
+            pending_count: 0,
+            approved_count: 0,
+            declined_count: 0,
+            avg_co2_saved: 0,
+            total_co2_reduced: 0,
+            total_km_saved: 0
+          }
+        ]
+      };
     }
 
     let driversResult = { rows: [] };
@@ -1174,9 +1168,15 @@ app.get("/api/logistics/pending", async (req, res) => {
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
+    const managerColumns = hasManagerApprovals ? await getManagerApprovalsColumns() : new Set();
+    const canUseManagerRouteData =
+      hasManagerApprovals &&
+      managerColumns.has("request_data") &&
+      managerColumns.has("approval_type") &&
+      managerColumns.has("status");
     const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
     let result;
-    if (hasManagerApprovals) {
+    if (canUseManagerRouteData) {
       result = await pool.query(`
         SELECT
           ma.${managerPkCol} as id,
@@ -1224,31 +1224,7 @@ app.get("/api/logistics/pending", async (req, res) => {
         FROM route_approvals WHERE UPPER(status) IN ('PENDING', 'AWAITING_APPROVAL') ORDER BY submitted_at DESC
       `);
     } else {
-      result = await pool.query(`
-        SELECT
-          ma.${managerPkCol} as id,
-          COALESCE(ma.request_data->>'route_type', 'STANDARD') as product_name,
-          COALESCE(ma.request_data->>'from_location', 'Unknown') as location,
-          ma.request_data->>'driver_name' as driver_name,
-          ma.request_data->>'vehicle_type' as vehicle_type,
-          NULL::timestamp as departure_time,
-          COALESCE((ma.request_data->>'original_distance')::numeric, 0) as total_distance_km,
-          COALESCE((ma.request_data->>'optimized_distance')::numeric, 0) as optimized_distance,
-          COALESCE((ma.request_data->>'original_fuel')::numeric, 0) as estimated_fuel_consumption_liters,
-          COALESCE((ma.request_data->>'optimized_fuel')::numeric, 0) as optimized_fuel,
-          COALESCE((ma.request_data->>'original_co2')::numeric, 0) as estimated_carbon_kg,
-          COALESCE((ma.request_data->>'optimized_co2')::numeric, 0) as optimized_carbon_kg,
-          COALESCE((ma.request_data->>'savings_km')::numeric, 0) as savings_km,
-          COALESCE((ma.request_data->>'savings_fuel')::numeric, 0) as savings_fuel,
-          COALESCE((ma.request_data->>'savings_co2')::numeric, 0) as savings_co2,
-          COALESCE(ma.request_notes, 'Optimize route') as ai_recommendation,
-          UPPER(ma.status) as status,
-          ma.requested_by::text as submitted_by,
-          ma.created_at
-        FROM manager_approvals ma
-        WHERE ma.approval_type = 'route_optimization' AND ma.status = 'pending'
-        ORDER BY ma.created_at DESC
-      `);
+      result = { rows: [] };
     }
     res.json({ success: true, data: result.rows, message: null });
   } catch (err) { res.json({ success: true, data: [], message: "Logistics pending unavailable" }); }
@@ -1260,7 +1236,12 @@ app.get("/api/logistics/stats", async (req, res) => {
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
-    let result = hasManagerApprovals
+    const managerColumns = hasManagerApprovals ? await getManagerApprovalsColumns() : new Set();
+    const canUseManagerStats =
+      hasManagerApprovals &&
+      managerColumns.has("approval_type") &&
+      managerColumns.has("status");
+    let result = canUseManagerStats
       ? await pool.query(`
           SELECT COUNT(*) FILTER (WHERE LOWER(status) IN ('pending', 'awaiting_approval')) as pending_count, 
                  COUNT(*) FILTER (WHERE LOWER(status) = 'approved') as approved_count, 
@@ -1286,7 +1267,7 @@ app.get("/api/logistics/stats", async (req, res) => {
           WHERE approval_type = 'route_optimization'
         `);
 
-    if (hasManagerApprovals && hasRouteApprovals) {
+    if (canUseManagerStats && hasRouteApprovals) {
       const counts = result.rows[0] || {};
       const managerTotal =
         (parseInt(counts.pending_count, 10) || 0) +
@@ -1471,8 +1452,14 @@ app.get("/api/logistics/history", async (req, res) => {
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
+    const managerColumns = hasManagerApprovals ? await getManagerApprovalsColumns() : new Set();
+    const canUseManagerRouteData =
+      hasManagerApprovals &&
+      managerColumns.has("request_data") &&
+      managerColumns.has("approval_type") &&
+      managerColumns.has("status");
     const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
-    let result = hasManagerApprovals
+    let result = canUseManagerRouteData
       ? await pool.query(`
           SELECT
             ma.${managerPkCol} as approval_id,
@@ -1497,26 +1484,9 @@ app.get("/api/logistics/history", async (req, res) => {
                  status, savings_km, savings_co2, approved_at as reviewed_at, manager_comment as review_notes 
           FROM route_approvals WHERE status IN ('APPROVED', 'DECLINED', 'REJECTED') ORDER BY approved_at DESC LIMIT 100
         `)
-      : await pool.query(`
-          SELECT
-            ma.${managerPkCol} as approval_id,
-            ma.${managerPkCol} as route_id,
-            COALESCE(ma.request_data->>'route_type', 'STANDARD') as product_name,
-            COALESCE(ma.request_data->>'from_location', 'Unknown') as location,
-            ma.request_data->>'driver_name' as driver_name,
-            UPPER(ma.status) as status,
-            COALESCE((ma.request_data->>'savings_km')::numeric, 0) as savings_km,
-            COALESCE((ma.request_data->>'savings_co2')::numeric, 0) as savings_co2,
-            ma.reviewed_at as reviewed_at,
-            COALESCE(ma.manager_comment, ma.decision_notes) as review_notes
-          FROM manager_approvals ma
-          WHERE ma.approval_type = 'route_optimization'
-            AND ma.status IN ('approved', 'declined')
-          ORDER BY ma.reviewed_at DESC NULLS LAST, ma.updated_at DESC
-          LIMIT 100
-        `);
+      : { rows: [] };
 
-    if (hasManagerApprovals && hasRouteApprovals && result.rows.length === 0) {
+    if (hasRouteApprovals && result.rows.length === 0) {
       result = await pool.query(`
         SELECT id as approval_id, id as route_id, route_type as product_name, from_location as location, driver_name, 
                status, savings_km, savings_co2, approved_at as reviewed_at, manager_comment as review_notes 
