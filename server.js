@@ -1538,7 +1538,7 @@ app.get("/api/logistics/dashboard", async (req, res) => {
     res.json({
       success: true,
       summary: {
-        pendingApprovals: parseInt(stats.pending_count) || 0,
+        pendingApprovals: pendingRoutes.length,
         approvedToday: parseInt(stats.approved_count) || 0,
         declined: parseInt(stats.declined_count) || 0,
         avgCO2Saved: parseFloat(stats.avg_co2_saved) || 0,
