@@ -2270,10 +2270,16 @@ app.post("/api/logistics/approve", async (req, res) => {
     let routeRow = null;
 
     if (hasManagerApprovals) {
+      const managerMatchClauses = [`${managerPkCol}::text = $3`];
+      if (managerColumns.has("route_id")) managerMatchClauses.push(`COALESCE(route_id::text, '') = $3`);
+      if (managerColumns.has("related_record_id")) managerMatchClauses.push(`COALESCE(related_record_id::text, '') = $3`);
+      if (managerColumns.has("delivery_id")) managerMatchClauses.push(`COALESCE(delivery_id::text, '') = $3`);
+
       const maResult = await pool.query(
         `UPDATE manager_approvals
          SET status = LOWER($1), manager_comment = $2, decision_notes = $2, reviewed_at = NOW()${managerUpdatedAtClause}
-         WHERE ${managerPkCol} = $3 AND approval_type = 'route_optimization'
+         WHERE approval_type = 'route_optimization'
+           AND (${managerMatchClauses.join(" OR ")})
          RETURNING *`,
         [status, comment || '', routeId]
       );
@@ -2282,7 +2288,10 @@ app.post("/api/logistics/approve", async (req, res) => {
       }
       if (hasRouteApprovals) {
         if (maResult.rows.length > 0) {
-          const routeRef = maResult.rows[0].route_id || maResult.rows[0].delivery_id;
+          const routeRef =
+            maResult.rows[0].route_id ||
+            maResult.rows[0].related_record_id ||
+            maResult.rows[0].delivery_id;
           if (routeRef) {
             resolvedRouteId = routeRef;
             await pool.query(`UPDATE route_approvals SET status = $1, manager_comment = $2, approved_at = NOW() WHERE id = $3`, [status, comment || '', routeRef]);
@@ -2358,8 +2367,15 @@ app.post("/api/logistics/approve", async (req, res) => {
 
             const numericRouteId = Number(resolvedRouteId);
             if (!Number.isNaN(numericRouteId)) {
+              const businessId =
+                routeRow?.business_id ||
+                managerApprovalRow?.business_id ||
+                requestData.business_id ||
+                routeData.business_id ||
+                null;
               const deliveryPayload = {
                 route_id: numericRouteId,
+                business_id: businessId,
                 driver_name: assignedDriver,
                 status: 'assigned',
                 vehicle_type: routeRow?.vehicle_type || managerApprovalRow?.vehicle_type || requestData.vehicle_type || routeData.vehicle_type || "Van",
@@ -2391,6 +2407,7 @@ app.post("/api/logistics/approve", async (req, res) => {
                 };
 
                 pushUpdate("driver_name", deliveryPayload.driver_name);
+                pushUpdate("business_id", deliveryPayload.business_id);
                 pushUpdate("vehicle_type", deliveryPayload.vehicle_type);
                 pushUpdate("departure_time", deliveryPayload.departure_time);
                 pushUpdate("from_location", deliveryPayload.from_location);
@@ -2418,6 +2435,7 @@ app.post("/api/logistics/approve", async (req, res) => {
                 };
 
                 pushInsert("route_id", deliveryPayload.route_id);
+                pushInsert("business_id", deliveryPayload.business_id);
                 pushInsert("driver_name", deliveryPayload.driver_name);
                 pushInsert("status", deliveryPayload.status);
                 pushInsert("vehicle_type", deliveryPayload.vehicle_type);
