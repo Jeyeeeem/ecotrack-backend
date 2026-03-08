@@ -955,7 +955,6 @@ app.get("/api/logistics/dashboard", async (req, res) => {
     const managerColumns = hasManagerApprovals ? await getManagerApprovalsColumns() : new Set();
     const canUseManagerRouteData =
       hasManagerApprovals &&
-      managerColumns.has("request_data") &&
       managerColumns.has("approval_type") &&
       managerColumns.has("status");
     const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
@@ -965,32 +964,18 @@ app.get("/api/logistics/dashboard", async (req, res) => {
 
     if (canUseManagerRouteData) {
       pendingResult = await pool.query(
-        `SELECT
-          ma.${managerPkCol} as route_id,
-          COALESCE(ma.request_data->>'route_type', 'STANDARD') as route_type,
-          COALESCE(ma.request_data->>'from_location', 'Warehouse') as from_location,
-          ma.request_data->>'to_location' as to_location,
-          ma.request_data->>'driver_name' as driver_name,
-          ma.request_data->>'vehicle_type' as vehicle_type,
-          NULL::timestamp as departure_time,
-          COALESCE((ma.request_data->>'original_distance')::numeric, 0) as original_distance,
-          COALESCE((ma.request_data->>'optimized_distance')::numeric, 0) as optimized_distance,
-          COALESCE((ma.request_data->>'original_fuel')::numeric, 0) as original_fuel,
-          COALESCE((ma.request_data->>'optimized_fuel')::numeric, 0) as optimized_fuel,
-          COALESCE((ma.request_data->>'original_co2')::numeric, 0) as original_co2,
-          COALESCE((ma.request_data->>'optimized_co2')::numeric, 0) as optimized_co2,
-          COALESCE((ma.request_data->>'savings_km')::numeric, 0) as savings_km,
-          COALESCE((ma.request_data->>'savings_fuel')::numeric, 0) as savings_fuel,
-          COALESCE((ma.request_data->>'savings_co2')::numeric, 0) as savings_co2,
-          COALESCE(ma.request_notes, 'Optimize this route') as ai_suggestion,
-          UPPER(ma.status) as status,
-          ma.requested_by::text as submitted_by,
-          ma.created_at as submitted_at
-        FROM manager_approvals ma
-        WHERE ma.approval_type = 'route_optimization'
-          AND LOWER(ma.status) IN ('pending', 'awaiting_approval')
-        ORDER BY ma.created_at DESC
-        LIMIT 20`
+        `SELECT *
+         FROM manager_approvals ma
+         WHERE ma.approval_type = 'route_optimization'
+           AND (
+             LOWER(COALESCE(ma.status, '')) IN ('pending', 'awaiting_approval', 'submitted', 'in_review', 'for_approval')
+             OR LOWER(COALESCE(ma.status, '')) LIKE '%pending%'
+             OR LOWER(COALESCE(ma.status, '')) LIKE '%await%'
+             OR LOWER(COALESCE(ma.status, '')) LIKE '%review%'
+             OR LOWER(COALESCE(ma.status, '')) LIKE '%submit%'
+           )
+         ORDER BY ma.created_at DESC
+         LIMIT 20`
       );
 
       statsResult = await pool.query(
@@ -1120,28 +1105,48 @@ app.get("/api/logistics/dashboard", async (req, res) => {
     }
 
     const stats = statsResult.rows[0] || {};
-    const pendingRoutes = pendingResult.rows.map(row => ({
-      routeId: String(row.route_id),
-      routeType: row.route_type || 'STANDARD',
-      from: row.from_location || 'Warehouse',
-      to: row.to_location,
-      driver: row.driver_name || 'Unassigned',
-      vehicle: row.vehicle_type || 'Van',
-      departureTime: row.departure_time,
-      originalDistance: parseFloat(row.original_distance) || 0,
-      optimizedDistance: parseFloat(row.optimized_distance) || 0,
-      originalFuel: parseFloat(row.original_fuel) || 0,
-      optimizedFuel: parseFloat(row.optimized_fuel) || 0,
-      originalCO2: parseFloat(row.original_co2) || 0,
-      optimizedCO2: parseFloat(row.optimized_co2) || 0,
-      totalSavingsKm: parseFloat(row.savings_km) || 0,
-      totalSavingsFuel: parseFloat(row.savings_fuel) || 0,
-      totalSavingsCO2: parseFloat(row.savings_co2) || 0,
-      aiSuggestion: row.ai_suggestion || 'Optimize this route',
-      status: row.status || 'PENDING',
-      submittedBy: row.submitted_by || 'System',
-      submittedTime: row.submitted_at
-    }));
+    const getNum = (...vals) => {
+      for (const v of vals) {
+        const n = Number(v);
+        if (!Number.isNaN(n) && Number.isFinite(n)) return n;
+      }
+      return 0;
+    };
+
+    const pendingRoutes = pendingResult.rows.map(row => {
+      const requestData = row.request_data && typeof row.request_data === "object" ? row.request_data : {};
+      const extraData = row.extra_data && typeof row.extra_data === "object" ? row.extra_data : {};
+      const routeData = extraData.route && typeof extraData.route === "object" ? extraData.route : {};
+      const optimization = extraData.optimization && typeof extraData.optimization === "object" ? extraData.optimization : {};
+      const optimizationData = optimization.optimization_data && typeof optimization.optimization_data === "object"
+        ? optimization.optimization_data
+        : {};
+      const routeId = row.route_id || row.id || row.approval_id || row.delivery_id || routeData.route_id || null;
+      const submittedBy = row.submitted_by || row.requested_by || row.reviewed_by || null;
+
+      return {
+        routeId: String(routeId || ""),
+        routeType: row.route_type || requestData.route_type || routeData.route_type || row.product_name || "STANDARD",
+        from: row.from_location || requestData.from_location || routeData.origin_location?.address || row.location || "Warehouse",
+        to: row.to_location || requestData.to_location || routeData.destination_location?.address || null,
+        driver: row.driver_name || requestData.driver_name || routeData.driver_name || "Unassigned",
+        vehicle: row.vehicle_type || requestData.vehicle_type || routeData.vehicle_type || "Van",
+        departureTime: row.departure_time || routeData.created_at || row.created_at || null,
+        originalDistance: getNum(row.original_distance, row.total_distance_km, requestData.original_distance, optimization.original_distance, optimizationData.originalDistance),
+        optimizedDistance: getNum(row.optimized_distance, requestData.optimized_distance, optimization.optimized_distance, optimizationData.optimizedDistance),
+        originalFuel: getNum(row.original_fuel, row.estimated_fuel_consumption_liters, requestData.original_fuel, optimization.original_fuel, optimizationData.originalFuel),
+        optimizedFuel: getNum(row.optimized_fuel, requestData.optimized_fuel, optimization.optimized_fuel, optimizationData.optimizedFuel),
+        originalCO2: getNum(row.original_co2, row.estimated_carbon_kg, requestData.original_co2, optimization.original_carbon_kg, optimizationData.originalCarbon),
+        optimizedCO2: getNum(row.optimized_co2, row.optimized_carbon_kg, requestData.optimized_co2, optimization.optimized_carbon_kg, optimizationData.optimizedCarbon),
+        totalSavingsKm: getNum(row.savings_km, requestData.savings_km, optimization.savings_km, optimizationData.savingsKm),
+        totalSavingsFuel: getNum(row.savings_fuel, requestData.savings_fuel, optimization.savings_fuel, optimizationData.savingsFuel),
+        totalSavingsCO2: getNum(row.savings_co2, requestData.savings_co2, optimization.savings_co2, optimizationData.savingsCo2),
+        aiSuggestion: row.ai_suggestion || row.ai_recommendation || requestData.ai_suggestion || optimization.ai_recommendation || optimizationData.aiRecommendation || "Optimize this route",
+        status: row.status || "PENDING",
+        submittedBy: submittedBy ? String(submittedBy) : "System",
+        submittedTime: row.submitted_at || row.created_at || null
+      };
+    });
 
     res.json({
       success: true,
@@ -1199,37 +1204,26 @@ app.get("/api/logistics/pending", async (req, res) => {
     const managerColumns = hasManagerApprovals ? await getManagerApprovalsColumns() : new Set();
     const canUseManagerRouteData =
       hasManagerApprovals &&
-      managerColumns.has("request_data") &&
       managerColumns.has("approval_type") &&
       managerColumns.has("status");
     const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
     let result;
+    let usedManagerRows = false;
     if (canUseManagerRouteData) {
       result = await pool.query(`
-        SELECT
-          ma.${managerPkCol} as id,
-          COALESCE(ma.request_data->>'route_type', 'STANDARD') as product_name,
-          COALESCE(ma.request_data->>'from_location', 'Unknown') as location,
-          ma.request_data->>'driver_name' as driver_name,
-          ma.request_data->>'vehicle_type' as vehicle_type,
-          NULL::timestamp as departure_time,
-          COALESCE((ma.request_data->>'original_distance')::numeric, 0) as total_distance_km,
-          COALESCE((ma.request_data->>'optimized_distance')::numeric, 0) as optimized_distance,
-          COALESCE((ma.request_data->>'original_fuel')::numeric, 0) as estimated_fuel_consumption_liters,
-          COALESCE((ma.request_data->>'optimized_fuel')::numeric, 0) as optimized_fuel,
-          COALESCE((ma.request_data->>'original_co2')::numeric, 0) as estimated_carbon_kg,
-          COALESCE((ma.request_data->>'optimized_co2')::numeric, 0) as optimized_carbon_kg,
-          COALESCE((ma.request_data->>'savings_km')::numeric, 0) as savings_km,
-          COALESCE((ma.request_data->>'savings_fuel')::numeric, 0) as savings_fuel,
-          COALESCE((ma.request_data->>'savings_co2')::numeric, 0) as savings_co2,
-          COALESCE(ma.request_notes, 'Optimize route') as ai_recommendation,
-          UPPER(ma.status) as status,
-          ma.requested_by::text as submitted_by,
-          ma.created_at as created_at
+        SELECT *
         FROM manager_approvals ma
-        WHERE ma.approval_type = 'route_optimization' AND LOWER(ma.status) IN ('pending', 'awaiting_approval')
+        WHERE ma.approval_type = 'route_optimization'
+          AND (
+            LOWER(COALESCE(ma.status, '')) IN ('pending', 'awaiting_approval', 'submitted', 'in_review', 'for_approval')
+            OR LOWER(COALESCE(ma.status, '')) LIKE '%pending%'
+            OR LOWER(COALESCE(ma.status, '')) LIKE '%await%'
+            OR LOWER(COALESCE(ma.status, '')) LIKE '%review%'
+            OR LOWER(COALESCE(ma.status, '')) LIKE '%submit%'
+          )
         ORDER BY ma.created_at DESC
       `);
+      usedManagerRows = true;
 
       // Fallback to route_approvals when manager_approvals has no logistics records.
       if (result.rows.length === 0 && hasRouteApprovals) {
@@ -1243,6 +1237,7 @@ app.get("/api/logistics/pending", async (req, res) => {
           WHERE ${pendingRouteStatusPredicate}
           ORDER BY submitted_at DESC
         `);
+        usedManagerRows = false;
       }
     } else if (hasRouteApprovals) {
       result = await pool.query(`
@@ -1258,7 +1253,49 @@ app.get("/api/logistics/pending", async (req, res) => {
     } else {
       result = { rows: [] };
     }
-    res.json({ success: true, data: result.rows, message: null });
+    const getNum = (...vals) => {
+      for (const v of vals) {
+        const n = Number(v);
+        if (!Number.isNaN(n) && Number.isFinite(n)) return n;
+      }
+      return 0;
+    };
+
+    const data = usedManagerRows
+      ? result.rows.map((row) => {
+          const requestData = row.request_data && typeof row.request_data === "object" ? row.request_data : {};
+          const extraData = row.extra_data && typeof row.extra_data === "object" ? row.extra_data : {};
+          const routeData = extraData.route && typeof extraData.route === "object" ? extraData.route : {};
+          const optimization = extraData.optimization && typeof extraData.optimization === "object" ? extraData.optimization : {};
+          const optimizationData = optimization.optimization_data && typeof optimization.optimization_data === "object"
+            ? optimization.optimization_data
+            : {};
+
+          return {
+            id: row[managerPkCol] || row.approval_id || row.id || row.delivery_id || routeData.route_id || null,
+            product_name: row.product_name || requestData.route_type || routeData.route_type || "STANDARD",
+            location: row.location || requestData.from_location || routeData.origin_location?.address || "Unknown",
+            driver_name: row.driver_name || requestData.driver_name || routeData.driver_name || null,
+            vehicle_type: row.vehicle_type || requestData.vehicle_type || routeData.vehicle_type || null,
+            departure_time: row.departure_time || routeData.created_at || row.created_at || null,
+            total_distance_km: getNum(row.total_distance_km, requestData.original_distance, optimization.original_distance, optimizationData.originalDistance),
+            optimized_distance: getNum(row.optimized_distance, requestData.optimized_distance, optimization.optimized_distance, optimizationData.optimizedDistance),
+            estimated_fuel_consumption_liters: getNum(row.estimated_fuel_consumption_liters, requestData.original_fuel, optimization.original_fuel, optimizationData.originalFuel),
+            optimized_fuel: getNum(row.optimized_fuel, requestData.optimized_fuel, optimization.optimized_fuel, optimizationData.optimizedFuel),
+            estimated_carbon_kg: getNum(row.estimated_carbon_kg, requestData.original_co2, optimization.original_carbon_kg, optimizationData.originalCarbon),
+            optimized_carbon_kg: getNum(row.optimized_carbon_kg, requestData.optimized_co2, optimization.optimized_carbon_kg, optimizationData.optimizedCarbon),
+            savings_km: getNum(row.savings_km, requestData.savings_km, optimization.savings_km, optimizationData.savingsKm),
+            savings_fuel: getNum(row.savings_fuel, requestData.savings_fuel, optimization.savings_fuel, optimizationData.savingsFuel),
+            savings_co2: getNum(row.savings_co2, requestData.savings_co2, optimization.savings_co2, optimizationData.savingsCo2),
+            ai_recommendation: row.ai_recommendation || row.ai_suggestion || requestData.ai_suggestion || optimization.ai_recommendation || optimizationData.aiRecommendation || "Optimize route",
+            status: String(row.status || "pending").toUpperCase(),
+            submitted_by: row.submitted_by ? String(row.submitted_by) : row.requested_by ? String(row.requested_by) : "System",
+            created_at: row.created_at || null
+          };
+        })
+      : result.rows;
+
+    res.json({ success: true, data, message: null });
   } catch (err) { res.json({ success: true, data: [], message: "Logistics pending unavailable" }); }
 });
 
