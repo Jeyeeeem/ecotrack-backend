@@ -1722,7 +1722,9 @@ app.get("/api/logistics/dashboard", async (req, res) => {
       if (hasDeliveries) {
         const deliveriesColumns = await getTableColumns("deliveries");
         const deliveryStatusExpr = deliveriesColumns.has("status") ? "LOWER(COALESCE(status, ''))" : "''";
-        const routeIdExpr = deliveriesColumns.has("route_id") ? "route_id::text" : "delivery_id::text";
+        const routeIdExpr = deliveriesColumns.has("route_id")
+          ? "COALESCE(route_id::text, delivery_id::text)"
+          : "delivery_id::text";
         const deliveryStats = await pool.query(
           `SELECT
              COUNT(DISTINCT ${routeIdExpr}) FILTER (WHERE ${deliveryStatusExpr} IN ('assigned', 'accepted', 'in_progress', 'completed')) as approved_count,
@@ -2120,7 +2122,9 @@ app.get("/api/logistics/stats", async (req, res) => {
       if (hasDeliveries) {
         const deliveriesColumns = await getTableColumns("deliveries");
         const deliveryStatusExpr = deliveriesColumns.has("status") ? "LOWER(COALESCE(status, ''))" : "''";
-        const routeIdExpr = deliveriesColumns.has("route_id") ? "route_id::text" : "delivery_id::text";
+        const routeIdExpr = deliveriesColumns.has("route_id")
+          ? "COALESCE(route_id::text, delivery_id::text)"
+          : "delivery_id::text";
         const deliveryStats = await pool.query(
           `SELECT
              COUNT(DISTINCT ${routeIdExpr}) FILTER (WHERE ${deliveryStatusExpr} IN ('assigned', 'accepted', 'in_progress', 'completed')) as approved_count,
@@ -3058,15 +3062,50 @@ app.get("/api/driver/delivery/:id", async (req, res) => {
     const row = result.rows[0];
 
     let stops = [];
-    const stopsResult = await pool.query(`
-      SELECT stop_sequence, location_name, address, latitude, longitude, status
-      FROM route_stops
-      WHERE route_id = $1
-      ORDER BY stop_sequence ASC
-    `, [row.route_id]);
+    let stopsRows = [];
 
-    if (stopsResult.rows.length > 0) {
-      stops = stopsResult.rows.map(stop => ({
+    try {
+      const routeStopsTableCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
+      const hasRouteStops = !!routeStopsTableCheck.rows[0]?.tbl;
+      if (hasRouteStops && row.route_id !== null && row.route_id !== undefined) {
+        const stopsColumns = await getTableColumns("route_stops");
+        const seqExpr = stopsColumns.has("stop_sequence") ? "stop_sequence" : "ROW_NUMBER() OVER (ORDER BY 1)";
+        const nameExpr = stopsColumns.has("location_name")
+          ? "location_name"
+          : stopsColumns.has("stop_name")
+          ? "stop_name"
+          : "NULL";
+        const addressExpr = stopsColumns.has("address")
+          ? "address"
+          : stopsColumns.has("location")
+          ? "location"
+          : "NULL";
+        const latExpr = stopsColumns.has("latitude") ? "latitude" : "NULL";
+        const lngExpr = stopsColumns.has("longitude") ? "longitude" : "NULL";
+        const statusExpr = stopsColumns.has("status") ? "status" : "'pending'";
+        const whereRouteCol = stopsColumns.has("route_id");
+        if (whereRouteCol) {
+          const stopsResult = await pool.query(
+            `SELECT ${seqExpr} as stop_sequence,
+                    ${nameExpr} as location_name,
+                    ${addressExpr} as address,
+                    ${latExpr} as latitude,
+                    ${lngExpr} as longitude,
+                    ${statusExpr} as status
+             FROM route_stops
+             WHERE route_id = $1
+             ORDER BY stop_sequence ASC`,
+            [row.route_id]
+          );
+          stopsRows = stopsResult.rows || [];
+        }
+      }
+    } catch (stopsErr) {
+      console.warn("Driver delivery stops query fallback:", stopsErr.message);
+    }
+
+    if (stopsRows.length > 0) {
+      stops = stopsRows.map(stop => ({
         stopId: stop.stop_sequence,
         sequence: stop.stop_sequence,
         stopName: stop.location_name || `Stop ${stop.stop_sequence}`,
