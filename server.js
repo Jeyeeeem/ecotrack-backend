@@ -82,6 +82,34 @@ const normalizeBadge = (level, ecoLevel) => {
   return "Newcomer";
 };
 
+let managerApprovalsPkCache = { value: "id", loadedAt: 0 };
+const MANAGER_PK_CACHE_TTL_MS = 5 * 60 * 1000;
+
+async function getManagerApprovalsPkColumn() {
+  const now = Date.now();
+  if (now - managerApprovalsPkCache.loadedAt < MANAGER_PK_CACHE_TTL_MS) {
+    return managerApprovalsPkCache.value;
+  }
+
+  try {
+    const columnsResult = await pool.query(
+      `SELECT column_name
+       FROM information_schema.columns
+       WHERE table_schema = 'public' AND table_name = 'manager_approvals'`
+    );
+    const columnSet = new Set(columnsResult.rows.map((row) => row.column_name));
+    const resolved = columnSet.has("id")
+      ? "id"
+      : columnSet.has("approval_id")
+      ? "approval_id"
+      : "id";
+    managerApprovalsPkCache = { value: resolved, loadedAt: now };
+    return resolved;
+  } catch (error) {
+    return "id";
+  }
+}
+
 // ============================================================
 // AUTH ROUTES
 // ============================================================
@@ -895,6 +923,7 @@ app.get("/api/logistics/dashboard", async (req, res) => {
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
+    const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
 
     let pendingResult;
     let statsResult;
@@ -902,7 +931,7 @@ app.get("/api/logistics/dashboard", async (req, res) => {
     if (hasManagerApprovals) {
       pendingResult = await pool.query(
         `SELECT
-          ma.id as route_id,
+          ma.${managerPkCol} as route_id,
           COALESCE(ma.request_data->>'route_type', 'STANDARD') as route_type,
           COALESCE(ma.request_data->>'from_location', 'Warehouse') as from_location,
           ma.request_data->>'to_location' as to_location,
@@ -1024,7 +1053,7 @@ app.get("/api/logistics/dashboard", async (req, res) => {
     } else {
       pendingResult = await pool.query(
         `SELECT 
-          ma.id as route_id,
+          ma.${managerPkCol} as route_id,
           COALESCE(ma.request_data->>'route_type', 'STANDARD') as route_type,
           ma.request_data->>'from_location' as from_location,
           ma.request_data->>'to_location' as to_location,
@@ -1145,11 +1174,12 @@ app.get("/api/logistics/pending", async (req, res) => {
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
+    const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
     let result;
     if (hasManagerApprovals) {
       result = await pool.query(`
         SELECT
-          ma.id,
+          ma.${managerPkCol} as id,
           COALESCE(ma.request_data->>'route_type', 'STANDARD') as product_name,
           COALESCE(ma.request_data->>'from_location', 'Unknown') as location,
           ma.request_data->>'driver_name' as driver_name,
@@ -1196,7 +1226,7 @@ app.get("/api/logistics/pending", async (req, res) => {
     } else {
       result = await pool.query(`
         SELECT
-          ma.id,
+          ma.${managerPkCol} as id,
           COALESCE(ma.request_data->>'route_type', 'STANDARD') as product_name,
           COALESCE(ma.request_data->>'from_location', 'Unknown') as location,
           ma.request_data->>'driver_name' as driver_name,
@@ -1295,13 +1325,14 @@ app.patch("/api/logistics/:id/approve", async (req, res) => {
   try {
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
+    const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
     const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
     if (hasManagerApprovals) {
       const maResult = await pool.query(
         `UPDATE manager_approvals 
          SET status = 'approved', manager_comment = $1, decision_notes = $1, reviewed_at = NOW(), updated_at = NOW()
-         WHERE id = $2 AND approval_type = 'route_optimization'
+         WHERE ${managerPkCol} = $2 AND approval_type = 'route_optimization'
          RETURNING *`,
         [comment || '', id]
       );
@@ -1333,7 +1364,7 @@ app.patch("/api/logistics/:id/approve", async (req, res) => {
       await pool.query(
         `UPDATE manager_approvals 
          SET status = 'approved', manager_comment = $1, decision_notes = $1, reviewed_at = NOW(), updated_at = NOW()
-         WHERE id = $2`,
+         WHERE ${managerPkCol} = $2`,
         [comment || '', id]
       );
       return res.json({ success: true, message: "Approved" });
@@ -1399,13 +1430,14 @@ app.patch("/api/logistics/:id/decline", async (req, res) => {
   try {
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
+    const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
     const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
     if (hasManagerApprovals) {
       const maResult = await pool.query(
         `UPDATE manager_approvals
          SET status = 'declined', manager_comment = $1, decision_notes = $1, reviewed_at = NOW(), updated_at = NOW()
-         WHERE id = $2 AND approval_type = 'route_optimization'
+         WHERE ${managerPkCol} = $2 AND approval_type = 'route_optimization'
          RETURNING *`,
         [reason || '', id]
       );
@@ -1425,7 +1457,7 @@ app.patch("/api/logistics/:id/decline", async (req, res) => {
       await pool.query(
         `UPDATE manager_approvals
          SET status = 'declined', manager_comment = $1, decision_notes = $1, reviewed_at = NOW(), updated_at = NOW()
-         WHERE id = $2`,
+         WHERE ${managerPkCol} = $2`,
         [reason || '', id]
       );
     }
@@ -1439,11 +1471,12 @@ app.get("/api/logistics/history", async (req, res) => {
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
+    const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
     let result = hasManagerApprovals
       ? await pool.query(`
           SELECT
-            ma.id as approval_id,
-            ma.id as route_id,
+            ma.${managerPkCol} as approval_id,
+            ma.${managerPkCol} as route_id,
             COALESCE(ma.request_data->>'route_type', 'STANDARD') as product_name,
             COALESCE(ma.request_data->>'from_location', 'Unknown') as location,
             ma.request_data->>'driver_name' as driver_name,
@@ -1466,8 +1499,8 @@ app.get("/api/logistics/history", async (req, res) => {
         `)
       : await pool.query(`
           SELECT
-            ma.id as approval_id,
-            ma.id as route_id,
+            ma.${managerPkCol} as approval_id,
+            ma.${managerPkCol} as route_id,
             COALESCE(ma.request_data->>'route_type', 'STANDARD') as product_name,
             COALESCE(ma.request_data->>'from_location', 'Unknown') as location,
             ma.request_data->>'driver_name' as driver_name,
@@ -1501,6 +1534,7 @@ app.post("/api/logistics/approve", async (req, res) => {
     const status = statusNormalized === 'APPROVE' ? 'APPROVED' : statusNormalized === 'PENDING' ? 'PENDING' : 'DECLINED';
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
+    const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
     const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
 
@@ -1508,7 +1542,7 @@ app.post("/api/logistics/approve", async (req, res) => {
       const maResult = await pool.query(
         `UPDATE manager_approvals
          SET status = LOWER($1), manager_comment = $2, decision_notes = $2, reviewed_at = NOW(), updated_at = NOW()
-         WHERE id = $3 AND approval_type = 'route_optimization'
+         WHERE ${managerPkCol} = $3 AND approval_type = 'route_optimization'
          RETURNING *`,
         [status, comment || '', routeId]
       );
@@ -1528,7 +1562,7 @@ app.post("/api/logistics/approve", async (req, res) => {
       await pool.query(
         `UPDATE manager_approvals
          SET status = LOWER($1), manager_comment = $2, decision_notes = $2, reviewed_at = NOW(), updated_at = NOW()
-         WHERE id = $3`,
+         WHERE ${managerPkCol} = $3`,
         [status, comment || '', routeId]
       );
     }
