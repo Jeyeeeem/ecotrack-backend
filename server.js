@@ -2836,7 +2836,7 @@ app.get("/api/inventory/dashboard", async (req, res) => {
       `
       );
 
-      const pendingItems = pendingResult.rows.map((row) => {
+      let pendingItems = pendingResult.rows.map((row) => {
         const quantityValue = row.quantity ?? row.alert_quantity;
         const quantityLabel =
           quantityValue === null || quantityValue === undefined || quantityValue === ""
@@ -2856,6 +2856,46 @@ app.get("/api/inventory/dashboard", async (req, res) => {
         };
       });
 
+      // Include alert-backed pending items that do not yet have a pending manager_approvals row.
+      if (hasAlerts) {
+        const linkedAlertIds = new Set(
+          pendingResult.rows
+            .map((r) => r.alert_id)
+            .filter((v) => v !== null && v !== undefined)
+            .map((v) => String(v))
+        );
+        const activeAlertsResult = await pool.query(`
+          SELECT id, product_name, risk_level, location, quantity, details, days_left, submitted_by
+          FROM alerts
+          WHERE status = 'active'
+          ORDER BY created_at DESC
+          LIMIT 50
+        `);
+        const extraAlerts = activeAlertsResult.rows
+          .filter((row) => !linkedAlertIds.has(String(row.id)))
+          .map((row) => {
+            const quantityValue = row.quantity;
+            const quantityLabel =
+              quantityValue === null || quantityValue === undefined || quantityValue === ""
+                ? "0 kg"
+                : `${quantityValue}${String(quantityValue).toLowerCase().includes("kg") ? "" : " kg"}`;
+            return {
+              id: parseInt(row.id, 10) || 0,
+              itemNumber: `#${row.id}`,
+              priority: row.risk_level || "MEDIUM",
+              productName: row.product_name || "Unknown Product",
+              location: row.location || "Unknown",
+              quantity: quantityLabel,
+              daysLeft: parseInt(row.days_left, 10) || 0,
+              aiSuggestion: row.details || "Review this item",
+              submittedBy: row.submitted_by ? String(row.submitted_by) : "System"
+            };
+          });
+        if (extraAlerts.length > 0) {
+          pendingItems = [...pendingItems, ...extraAlerts];
+        }
+      }
+
       const riskStats = pendingItems.reduce(
         (acc, item) => {
           const level = String(item.priority || "").toUpperCase();
@@ -2868,12 +2908,24 @@ app.get("/api/inventory/dashboard", async (req, res) => {
       );
 
       const stats = statsResult.rows[0] || {};
+      let fallbackAlertSummary = { resolved_count: 0, declined_count: 0 };
+      if (hasAlerts) {
+        try {
+          const alertsSummaryResult = await pool.query(`
+            SELECT
+              COUNT(*) FILTER (WHERE LOWER(COALESCE(status, '')) = 'resolved') AS resolved_count,
+              COUNT(*) FILTER (WHERE LOWER(COALESCE(status, '')) IN ('declined', 'rejected')) AS declined_count
+            FROM alerts
+          `);
+          fallbackAlertSummary = alertsSummaryResult.rows[0] || fallbackAlertSummary;
+        } catch (_) {}
+      }
       return res.json({
         success: true,
         summary: {
-          pendingApprovals: parseInt(stats.pending_count, 10) || pendingItems.length,
-          approvedToday: parseInt(stats.approved_count, 10) || 0,
-          declined: parseInt(stats.declined_count, 10) || 0,
+          pendingApprovals: pendingItems.length,
+          approvedToday: Math.max(parseInt(stats.approved_count, 10) || 0, parseInt(fallbackAlertSummary.resolved_count, 10) || 0),
+          declined: Math.max(parseInt(stats.declined_count, 10) || 0, parseInt(fallbackAlertSummary.declined_count, 10) || 0),
           highRisk: riskStats.highRisk,
           mediumRisk: riskStats.mediumRisk,
           lowRisk: riskStats.lowRisk
@@ -3065,7 +3117,7 @@ app.get("/api/inventory/history", async (req, res) => {
       `
       );
 
-      const historyItems = historyResult.rows.map((row) => {
+      let historyItems = historyResult.rows.map((row) => {
         const quantityValue = row.quantity ?? row.alert_quantity;
         const quantityLabel =
           quantityValue === null || quantityValue === undefined || quantityValue === ""
@@ -3094,6 +3146,57 @@ app.get("/api/inventory/history", async (req, res) => {
           managerComment: row.manager_comment || null
         };
       });
+
+      // Include alert-only historical decisions that don't have matching manager_approvals records.
+      if (hasAlertsTable) {
+        const linkedAlertIds = new Set(
+          historyResult.rows
+            .map((r) => r.alert_id)
+            .filter((v) => v !== null && v !== undefined)
+            .map((v) => String(v))
+        );
+        const alertHistoryResult = await pool.query(`
+          SELECT id, product_name, risk_level, location, quantity, days_left, details, status, updated_at, created_at, submitted_by, temperature, humidity, alert_type
+          FROM alerts
+          WHERE LOWER(COALESCE(status, '')) IN ('resolved', 'declined', 'rejected')
+          ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+          LIMIT 100
+        `);
+        const extraHistory = alertHistoryResult.rows
+          .filter((row) => !linkedAlertIds.has(String(row.id)))
+          .map((row) => {
+            const quantityValue = row.quantity;
+            const quantityLabel =
+              quantityValue === null || quantityValue === undefined || quantityValue === ""
+                ? "0 kg"
+                : `${quantityValue}${String(quantityValue).toLowerCase().includes("kg") ? "" : " kg"}`;
+            const normalized = String(row.status || "").toLowerCase();
+            return {
+              id: parseInt(row.id, 10) || 0,
+              itemNumber: `#${row.id}`,
+              priority: row.risk_level || "MEDIUM",
+              productName: row.product_name || "Unknown Product",
+              location: row.location || "Unknown",
+              quantity: quantityLabel,
+              daysLeft: parseInt(row.days_left, 10) || 0,
+              aiSuggestion: row.details || "No details",
+              status: normalized === "resolved" || normalized === "approved" ? "APPROVED" : "DECLINED",
+              decidedBy: "Inventory Manager",
+              decidedAt: row.updated_at || row.created_at,
+              submittedBy: row.submitted_by ? String(row.submitted_by) : "System",
+              submittedAt: row.created_at,
+              temperature: row.temperature ?? null,
+              humidity: row.humidity ?? null,
+              alertType: row.alert_type ?? null,
+              managerComment: null
+            };
+          });
+        if (extraHistory.length > 0) {
+          historyItems = [...historyItems, ...extraHistory]
+            .sort((a, b) => new Date(b.decidedAt || b.submittedAt || 0).getTime() - new Date(a.decidedAt || a.submittedAt || 0).getTime())
+            .slice(0, 50);
+        }
+      }
 
       return res.json({ success: true, history: historyItems, message: null });
     }
