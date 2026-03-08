@@ -1766,7 +1766,26 @@ app.get("/api/logistics/dashboard", async (req, res) => {
       const currentTs = new Date(route.submittedTime || route.submitted_at || 0).getTime();
       if (currentTs >= existingTs) pendingRouteMap.set(key, route);
     }
-    let pendingRoutes = Array.from(pendingRouteMap.values());
+    // Second-pass dedupe by route fingerprint to eliminate duplicate pending rows
+    // that may have different IDs but represent the same route submission.
+    const pendingFingerprintMap = new Map();
+    for (const route of pendingRouteMap.values()) {
+      const fromKey = String(route.from || route.from_location || "").trim().toLowerCase();
+      const toKey = String(route.to || route.to_location || "").trim().toLowerCase();
+      const driverKey = String(route.driver || route.driver_name || "").trim().toLowerCase();
+      const depRaw = route.departureTime || route.departure_time || route.submittedTime || route.submitted_at || "";
+      const depKey = String(depRaw).trim().slice(0, 16); // keep up to minute granularity
+      const fingerprint = [fromKey, toKey, driverKey, depKey].join("|");
+      const existing = pendingFingerprintMap.get(fingerprint);
+      if (!existing) {
+        pendingFingerprintMap.set(fingerprint, route);
+        continue;
+      }
+      const existingTs = new Date(existing.submittedTime || existing.submitted_at || 0).getTime();
+      const currentTs = new Date(route.submittedTime || route.submitted_at || 0).getTime();
+      if (currentTs >= existingTs) pendingFingerprintMap.set(fingerprint, route);
+    }
+    let pendingRoutes = Array.from(pendingFingerprintMap.values());
     if (hasRouteApprovals && pendingRoutes.length > 0) {
       try {
         const resolvedRoutesResult = await pool.query(
@@ -2468,7 +2487,7 @@ app.get("/api/logistics/history", async (req, res) => {
     let result = hasRouteApprovals
       ? await pool.query(`
           SELECT id as approval_id, id as route_id, route_type as product_name, from_location, to_location, from_location as location, driver_name, 
-                 status, ${savingsKmExpr} as savings_km, ${savingsCo2Expr} as savings_co2, approved_at as reviewed_at, manager_comment as review_notes 
+                 status, ${savingsKmExpr} as savings_km, ${savingsCo2Expr} as savings_co2, ai_suggestion, approved_at as reviewed_at, manager_comment as review_notes 
           FROM route_approvals
           WHERE LOWER(COALESCE(status, '')) IN ('approved', 'declined', 'rejected')
           ORDER BY approved_at DESC NULLS LAST, submitted_at DESC NULLS LAST
@@ -2487,6 +2506,7 @@ app.get("/api/logistics/history", async (req, res) => {
             UPPER(ma.status) as status,
             COALESCE((ma.request_data->>'savings_km')::numeric, 0) as savings_km,
             COALESCE((ma.request_data->>'savings_co2')::numeric, 0) as savings_co2,
+            COALESCE(ma.request_data->>'ai_suggestion', ma.request_data->>'ai_recommendation', '') as ai_suggestion,
             ma.reviewed_at as reviewed_at,
             COALESCE(ma.manager_comment, ma.decision_notes) as review_notes
           FROM manager_approvals ma
@@ -2510,6 +2530,7 @@ app.get("/api/logistics/history", async (req, res) => {
           UPPER(ma.status) as status,
           COALESCE((ma.request_data->>'savings_km')::numeric, 0) as savings_km,
           COALESCE((ma.request_data->>'savings_co2')::numeric, 0) as savings_co2,
+          COALESCE(ma.request_data->>'ai_suggestion', ma.request_data->>'ai_recommendation', '') as ai_suggestion,
           ma.reviewed_at as reviewed_at,
           COALESCE(ma.manager_comment, ma.decision_notes) as review_notes
         FROM manager_approvals ma
@@ -2523,7 +2544,7 @@ app.get("/api/logistics/history", async (req, res) => {
     if (hasRouteApprovals && result.rows.length === 0) {
       result = await pool.query(`
         SELECT id as approval_id, id as route_id, route_type as product_name, from_location, to_location, from_location as location, driver_name, 
-               status, ${savingsKmExpr} as savings_km, ${savingsCo2Expr} as savings_co2, approved_at as reviewed_at, manager_comment as review_notes 
+               status, ${savingsKmExpr} as savings_km, ${savingsCo2Expr} as savings_co2, ai_suggestion, approved_at as reviewed_at, manager_comment as review_notes 
         FROM route_approvals
         WHERE LOWER(COALESCE(status, '')) IN ('approved', 'declined', 'rejected')
         ORDER BY approved_at DESC NULLS LAST, submitted_at DESC NULLS LAST
@@ -2586,6 +2607,7 @@ app.get("/api/logistics/history", async (req, res) => {
             END as status,
             0::numeric as savings_km,
             0::numeric as savings_co2,
+            ''::text as ai_suggestion,
             ${reviewedAtExpr} as reviewed_at,
             'Approved and assigned to driver'::text as review_notes
           FROM deliveries d
@@ -2595,7 +2617,18 @@ app.get("/api/logistics/history", async (req, res) => {
         `);
       }
     }
-    res.json({ success: true, data: result.rows, message: null });
+    const historyData = (result.rows || []).map((row) => {
+      const currentKm = toFiniteNumber(row.savings_km);
+      const currentCo2 = toFiniteNumber(row.savings_co2);
+      if (currentKm > 0 || currentCo2 > 0) return row;
+      const parsed = extractSavingsFromText(row.ai_suggestion || row.review_notes || "");
+      return {
+        ...row,
+        savings_km: currentKm > 0 ? currentKm : parsed.km,
+        savings_co2: currentCo2 > 0 ? currentCo2 : parsed.co2
+      };
+    });
+    res.json({ success: true, data: historyData, message: null });
   } catch (err) { res.json({ success: true, data: [], message: "History unavailable" }); }
 });
 
