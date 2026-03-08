@@ -2263,6 +2263,9 @@ app.post("/api/logistics/approve", async (req, res) => {
     const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
     const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
+    let managerApprovalRow = null;
+    let resolvedRouteId = routeId;
+    let routeRow = null;
 
     if (hasManagerApprovals) {
       const maResult = await pool.query(
@@ -2272,10 +2275,14 @@ app.post("/api/logistics/approve", async (req, res) => {
          RETURNING *`,
         [status, comment || '', routeId]
       );
+      if (maResult.rows.length > 0) {
+        managerApprovalRow = maResult.rows[0];
+      }
       if (hasRouteApprovals) {
         if (maResult.rows.length > 0) {
           const routeRef = maResult.rows[0].route_id || maResult.rows[0].delivery_id;
           if (routeRef) {
+            resolvedRouteId = routeRef;
             await pool.query(`UPDATE route_approvals SET status = $1, manager_comment = $2, approved_at = NOW() WHERE id = $3`, [status, comment || '', routeRef]);
           }
         } else {
@@ -2292,6 +2299,131 @@ app.post("/api/logistics/approve", async (req, res) => {
         [status, comment || '', routeId]
       );
     }
+
+    if (hasRouteApprovals) {
+      const routeResult = await pool.query(`SELECT * FROM route_approvals WHERE id = $1 LIMIT 1`, [resolvedRouteId]);
+      routeRow = routeResult.rows[0] || null;
+    }
+
+    if (status === 'APPROVED') {
+      const requestData = parseMaybeJsonObject(managerApprovalRow?.request_data);
+      const extraData = parseMaybeJsonObject(managerApprovalRow?.extra_data);
+      const routeData = parseMaybeJsonObject(extraData.route);
+      const optimization = parseMaybeJsonObject(extraData.optimization);
+      const optimizationData = parseMaybeJsonObject(optimization.optimization_data);
+
+      const assignedDriver =
+        routeRow?.driver_name ||
+        managerApprovalRow?.driver_name ||
+        requestData.driver_name ||
+        routeData.driver_name ||
+        null;
+
+      const deliveriesTableCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
+      const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
+
+      if (hasDeliveries && assignedDriver && resolvedRouteId) {
+        const deliveriesColumns = await getTableColumns("deliveries");
+        if (deliveriesColumns.has("route_id")) {
+          const routeDistance = toFiniteNumberPreferNonZero(
+            routeRow?.optimized_distance,
+            routeRow?.original_distance,
+            requestData.optimized_distance,
+            requestData.original_distance,
+            routeData.total_distance_km,
+            optimization.optimized_distance,
+            optimizationData.optimizedDistance
+          );
+          const routeFuel = toFiniteNumberPreferNonZero(
+            routeRow?.optimized_fuel,
+            routeRow?.original_fuel,
+            requestData.optimized_fuel,
+            requestData.original_fuel,
+            routeData.estimated_fuel_consumption_liters,
+            optimization.optimized_fuel,
+            optimizationData.optimizedFuel
+          );
+          const routeCO2 = toFiniteNumberPreferNonZero(
+            routeRow?.optimized_co2,
+            routeRow?.original_co2,
+            requestData.optimized_co2,
+            requestData.original_co2,
+            routeData.estimated_carbon_kg,
+            optimization.optimized_carbon_kg,
+            optimizationData.optimizedCarbon
+          );
+
+          const deliveryPayload = {
+            route_id: Number(resolvedRouteId),
+            driver_name: assignedDriver,
+            status: 'assigned',
+            vehicle_type: routeRow?.vehicle_type || managerApprovalRow?.vehicle_type || requestData.vehicle_type || routeData.vehicle_type || "Van",
+            departure_time: routeRow?.departure_time || managerApprovalRow?.departure_time || routeData.created_at || managerApprovalRow?.created_at || new Date().toISOString(),
+            from_location: routeRow?.from_location || managerApprovalRow?.from_location || requestData.from_location || routeData.origin_location?.address || managerApprovalRow?.location || "Warehouse",
+            to_location: routeRow?.to_location || managerApprovalRow?.to_location || requestData.to_location || routeData.destination_location?.address || null,
+            distance_km: routeDistance || 0,
+            estimated_fuel_consumption_liters: routeFuel || 0,
+            estimated_carbon_kg: routeCO2 || 0
+          };
+
+          const existingDelivery = await pool.query(
+            `SELECT delivery_id, status FROM deliveries WHERE route_id = $1 ORDER BY created_at DESC NULLS LAST, delivery_id DESC LIMIT 1`,
+            [deliveryPayload.route_id]
+          );
+
+          if (existingDelivery.rows.length > 0) {
+            const existing = existingDelivery.rows[0];
+            const nextStatus = ['completed', 'in_progress'].includes(String(existing.status || '').toLowerCase())
+              ? existing.status
+              : 'assigned';
+            await pool.query(
+              `UPDATE deliveries
+               SET driver_name = $1,
+                   vehicle_type = $2,
+                   departure_time = $3,
+                   from_location = $4,
+                   to_location = $5,
+                   distance_km = $6,
+                   estimated_fuel_consumption_liters = $7,
+                   estimated_carbon_kg = $8,
+                   status = $9
+               WHERE delivery_id = $10`,
+              [
+                deliveryPayload.driver_name,
+                deliveryPayload.vehicle_type,
+                deliveryPayload.departure_time,
+                deliveryPayload.from_location,
+                deliveryPayload.to_location,
+                deliveryPayload.distance_km,
+                deliveryPayload.estimated_fuel_consumption_liters,
+                deliveryPayload.estimated_carbon_kg,
+                nextStatus,
+                existing.delivery_id
+              ]
+            );
+          } else {
+            await pool.query(
+              `INSERT INTO deliveries
+               (route_id, driver_name, status, vehicle_type, departure_time, from_location, to_location, distance_km, estimated_fuel_consumption_liters, estimated_carbon_kg)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+              [
+                deliveryPayload.route_id,
+                deliveryPayload.driver_name,
+                deliveryPayload.status,
+                deliveryPayload.vehicle_type,
+                deliveryPayload.departure_time,
+                deliveryPayload.from_location,
+                deliveryPayload.to_location,
+                deliveryPayload.distance_km,
+                deliveryPayload.estimated_fuel_consumption_liters,
+                deliveryPayload.estimated_carbon_kg
+              ]
+            );
+          }
+        }
+      }
+    }
+
     res.json({ success: true, message: `Route ${status.toLowerCase()} successfully` });
   } catch (err) { res.json({ success: false, message: "Update failed" }); }
 });
