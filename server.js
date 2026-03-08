@@ -1712,6 +1712,31 @@ app.get("/api/logistics/dashboard", async (req, res) => {
     }
 
     const stats = statsResult.rows[0] || {};
+    let approvedCount = parseInt(stats.approved_count, 10) || 0;
+    let declinedCount = parseInt(stats.declined_count, 10) || 0;
+
+    // Fallback: if approval rows are missing but deliveries were assigned, count them as approved.
+    try {
+      const deliveriesTableCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
+      const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
+      if (hasDeliveries) {
+        const deliveriesColumns = await getTableColumns("deliveries");
+        const deliveryStatusExpr = deliveriesColumns.has("status") ? "LOWER(COALESCE(status, ''))" : "''";
+        const routeIdExpr = deliveriesColumns.has("route_id") ? "route_id::text" : "delivery_id::text";
+        const deliveryStats = await pool.query(
+          `SELECT
+             COUNT(DISTINCT ${routeIdExpr}) FILTER (WHERE ${deliveryStatusExpr} IN ('assigned', 'accepted', 'in_progress', 'completed')) as approved_count,
+             COUNT(DISTINCT ${routeIdExpr}) FILTER (WHERE ${deliveryStatusExpr} IN ('declined', 'rejected', 'cancelled')) as declined_count
+           FROM deliveries`
+        );
+        const deliveryApproved = parseInt(deliveryStats.rows[0]?.approved_count, 10) || 0;
+        const deliveryDeclined = parseInt(deliveryStats.rows[0]?.declined_count, 10) || 0;
+        approvedCount = Math.max(approvedCount, deliveryApproved);
+        declinedCount = Math.max(declinedCount, deliveryDeclined);
+      }
+    } catch (deliveryStatsErr) {
+      console.warn("Logistics dashboard delivery stats fallback failed:", deliveryStatsErr.message);
+    }
     const routeStopsTableCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
     const hasRouteStops = !!routeStopsTableCheck.rows[0]?.tbl;
     const mappedPendingRoutes = await Promise.all(
@@ -1735,8 +1760,8 @@ app.get("/api/logistics/dashboard", async (req, res) => {
       success: true,
       summary: {
         pendingApprovals: pendingRoutes.length,
-        approvedToday: parseInt(stats.approved_count) || 0,
-        declined: parseInt(stats.declined_count) || 0,
+        approvedToday: approvedCount,
+        declined: declinedCount,
         avgCO2Saved: parseFloat(stats.avg_co2_saved) || 0,
         totalCO2Reduced: parseFloat(stats.total_co2_reduced) || 0,
         totalKmSaved: parseFloat(stats.total_km_saved) || 0
@@ -2087,6 +2112,30 @@ app.get("/api/logistics/stats", async (req, res) => {
         `);
       }
     }
+
+    // Delivery fallback for deployments where approvals are represented by assignment records.
+    try {
+      const deliveriesTableCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
+      const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
+      if (hasDeliveries) {
+        const deliveriesColumns = await getTableColumns("deliveries");
+        const deliveryStatusExpr = deliveriesColumns.has("status") ? "LOWER(COALESCE(status, ''))" : "''";
+        const routeIdExpr = deliveriesColumns.has("route_id") ? "route_id::text" : "delivery_id::text";
+        const deliveryStats = await pool.query(
+          `SELECT
+             COUNT(DISTINCT ${routeIdExpr}) FILTER (WHERE ${deliveryStatusExpr} IN ('assigned', 'accepted', 'in_progress', 'completed')) as approved_count,
+             COUNT(DISTINCT ${routeIdExpr}) FILTER (WHERE ${deliveryStatusExpr} IN ('declined', 'rejected', 'cancelled')) as declined_count
+           FROM deliveries`
+        );
+        const row = result.rows[0] || {};
+        row.approved_count = Math.max(parseInt(row.approved_count, 10) || 0, parseInt(deliveryStats.rows[0]?.approved_count, 10) || 0);
+        row.declined_count = Math.max(parseInt(row.declined_count, 10) || 0, parseInt(deliveryStats.rows[0]?.declined_count, 10) || 0);
+        result.rows[0] = row;
+      }
+    } catch (deliveryStatsErr) {
+      console.warn("Logistics stats delivery fallback failed:", deliveryStatsErr.message);
+    }
+
     res.json({ success: true, data: result.rows[0], message: null });
   } catch (err) { res.json({ success: true, data: { pending_count: 0, approved_count: 0, declined_count: 0, avg_co2_saved: 0 }, message: "Logistics stats unavailable" }); }
 });
@@ -2333,6 +2382,42 @@ app.get("/api/logistics/history", async (req, res) => {
         ORDER BY approved_at DESC NULLS LAST, submitted_at DESC NULLS LAST
         LIMIT 100
       `);
+    }
+
+    // Final fallback: build history from deliveries when approval tables have no resolved rows.
+    if (result.rows.length === 0) {
+      const deliveriesTableCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
+      const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
+      if (hasDeliveries) {
+        const deliveriesColumns = await getTableColumns("deliveries");
+        const reviewedAtExpr = deliveriesColumns.has("updated_at")
+          ? "d.updated_at"
+          : deliveriesColumns.has("arrival_time")
+          ? "d.arrival_time"
+          : deliveriesColumns.has("departure_time")
+          ? "d.departure_time"
+          : "NULL";
+        result = await pool.query(`
+          SELECT
+            d.delivery_id as approval_id,
+            COALESCE(d.route_id::text, d.delivery_id::text) as route_id,
+            COALESCE(d.vehicle_type, 'DELIVERY') as product_name,
+            COALESCE(d.from_location, 'Unknown') as location,
+            d.driver_name as driver_name,
+            CASE
+              WHEN LOWER(COALESCE(d.status, '')) IN ('declined', 'rejected', 'cancelled') THEN 'DECLINED'
+              ELSE 'APPROVED'
+            END as status,
+            0::numeric as savings_km,
+            0::numeric as savings_co2,
+            ${reviewedAtExpr} as reviewed_at,
+            'Assigned to driver delivery queue'::text as review_notes
+          FROM deliveries d
+          WHERE LOWER(COALESCE(d.status, '')) IN ('assigned', 'accepted', 'in_progress', 'completed', 'declined', 'rejected', 'cancelled')
+          ORDER BY ${reviewedAtExpr} DESC NULLS LAST, d.delivery_id DESC
+          LIMIT 100
+        `);
+      }
     }
     res.json({ success: true, data: result.rows, message: null });
   } catch (err) { res.json({ success: true, data: [], message: "History unavailable" }); }
