@@ -1016,19 +1016,23 @@ app.get("/api/logistics/dashboard", async (req, res) => {
             ra.submitted_by, 
             ra.submitted_at
           FROM route_approvals ra 
-          WHERE UPPER(status) IN ('PENDING', 'AWAITING_APPROVAL')
+          WHERE COALESCE(NULLIF(UPPER(REPLACE(TRIM(status), ' ', '_')), ''), 'PENDING')
+                IN ('PENDING', 'AWAITING_APPROVAL', 'AWAITINGAPPROVAL', 'PENDING_APPROVAL', 'SUBMITTED', 'FOR_APPROVAL', 'IN_REVIEW')
           ORDER BY submitted_at DESC 
           LIMIT 20`
         );
 
         statsResult = await pool.query(
           `SELECT 
-            (SELECT COUNT(*) FROM route_approvals WHERE UPPER(status) IN ('PENDING', 'AWAITING_APPROVAL')) as pending_count,
-            (SELECT COUNT(*) FROM route_approvals WHERE status = 'APPROVED') as approved_count,
-            (SELECT COUNT(*) FROM route_approvals WHERE status = 'DECLINED') as declined_count,
-            COALESCE(AVG(savings_co2) FILTER (WHERE status = 'APPROVED'), 0) as avg_co2_saved,
-            COALESCE(SUM(savings_co2) FILTER (WHERE status = 'APPROVED'), 0) as total_co2_reduced,
-            COALESCE(SUM(savings_km) FILTER (WHERE status = 'APPROVED'), 0) as total_km_saved
+            (SELECT COUNT(*) FROM route_approvals
+              WHERE COALESCE(NULLIF(UPPER(REPLACE(TRIM(status), ' ', '_')), ''), 'PENDING')
+                    IN ('PENDING', 'AWAITING_APPROVAL', 'AWAITINGAPPROVAL', 'PENDING_APPROVAL', 'SUBMITTED', 'FOR_APPROVAL', 'IN_REVIEW')
+            ) as pending_count,
+            (SELECT COUNT(*) FROM route_approvals WHERE UPPER(COALESCE(status, '')) = 'APPROVED') as approved_count,
+            (SELECT COUNT(*) FROM route_approvals WHERE UPPER(COALESCE(status, '')) = 'DECLINED') as declined_count,
+            COALESCE(AVG(savings_co2) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as avg_co2_saved,
+            COALESCE(SUM(savings_co2) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as total_co2_reduced,
+            COALESCE(SUM(savings_km) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as total_km_saved
           FROM route_approvals`
         );
       }
@@ -1056,19 +1060,23 @@ app.get("/api/logistics/dashboard", async (req, res) => {
           ra.submitted_by, 
           ra.submitted_at
         FROM route_approvals ra 
-        WHERE UPPER(status) IN ('PENDING', 'AWAITING_APPROVAL')
+        WHERE COALESCE(NULLIF(UPPER(REPLACE(TRIM(status), ' ', '_')), ''), 'PENDING')
+              IN ('PENDING', 'AWAITING_APPROVAL', 'AWAITINGAPPROVAL', 'PENDING_APPROVAL', 'SUBMITTED', 'FOR_APPROVAL', 'IN_REVIEW')
         ORDER BY submitted_at DESC 
         LIMIT 20`
       );
 
       statsResult = await pool.query(
         `SELECT 
-          (SELECT COUNT(*) FROM route_approvals WHERE UPPER(status) IN ('PENDING', 'AWAITING_APPROVAL')) as pending_count,
-          (SELECT COUNT(*) FROM route_approvals WHERE status = 'APPROVED') as approved_count,
-          (SELECT COUNT(*) FROM route_approvals WHERE status = 'DECLINED') as declined_count,
-          COALESCE(AVG(savings_co2) FILTER (WHERE status = 'APPROVED'), 0) as avg_co2_saved,
-          COALESCE(SUM(savings_co2) FILTER (WHERE status = 'APPROVED'), 0) as total_co2_reduced,
-          COALESCE(SUM(savings_km) FILTER (WHERE status = 'APPROVED'), 0) as total_km_saved
+          (SELECT COUNT(*) FROM route_approvals
+            WHERE COALESCE(NULLIF(UPPER(REPLACE(TRIM(status), ' ', '_')), ''), 'PENDING')
+                  IN ('PENDING', 'AWAITING_APPROVAL', 'AWAITINGAPPROVAL', 'PENDING_APPROVAL', 'SUBMITTED', 'FOR_APPROVAL', 'IN_REVIEW')
+          ) as pending_count,
+          (SELECT COUNT(*) FROM route_approvals WHERE UPPER(COALESCE(status, '')) = 'APPROVED') as approved_count,
+          (SELECT COUNT(*) FROM route_approvals WHERE UPPER(COALESCE(status, '')) = 'DECLINED') as declined_count,
+          COALESCE(AVG(savings_co2) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as avg_co2_saved,
+          COALESCE(SUM(savings_co2) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as total_co2_reduced,
+          COALESCE(SUM(savings_km) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as total_km_saved
         FROM route_approvals`
       );
     } else {
@@ -1211,7 +1219,10 @@ app.get("/api/logistics/pending", async (req, res) => {
                  optimized_fuel, original_co2 as estimated_carbon_kg, optimized_co2 as optimized_carbon_kg, 
                  savings_km, savings_fuel, savings_co2, ai_suggestion as ai_recommendation, status, 
                  submitted_by, submitted_at as created_at 
-          FROM route_approvals WHERE UPPER(status) IN ('PENDING', 'AWAITING_APPROVAL') ORDER BY submitted_at DESC
+          FROM route_approvals
+          WHERE COALESCE(NULLIF(UPPER(REPLACE(TRIM(status), ' ', '_')), ''), 'PENDING')
+                IN ('PENDING', 'AWAITING_APPROVAL', 'AWAITINGAPPROVAL', 'PENDING_APPROVAL', 'SUBMITTED', 'FOR_APPROVAL', 'IN_REVIEW')
+          ORDER BY submitted_at DESC
         `);
       }
     } else if (hasRouteApprovals) {
@@ -1221,7 +1232,10 @@ app.get("/api/logistics/pending", async (req, res) => {
                optimized_fuel, original_co2 as estimated_carbon_kg, optimized_co2 as optimized_carbon_kg, 
                savings_km, savings_fuel, savings_co2, ai_suggestion as ai_recommendation, status, 
                submitted_by, submitted_at as created_at 
-        FROM route_approvals WHERE UPPER(status) IN ('PENDING', 'AWAITING_APPROVAL') ORDER BY submitted_at DESC
+        FROM route_approvals
+        WHERE COALESCE(NULLIF(UPPER(REPLACE(TRIM(status), ' ', '_')), ''), 'PENDING')
+              IN ('PENDING', 'AWAITING_APPROVAL', 'AWAITINGAPPROVAL', 'PENDING_APPROVAL', 'SUBMITTED', 'FOR_APPROVAL', 'IN_REVIEW')
+        ORDER BY submitted_at DESC
       `);
     } else {
       result = { rows: [] };
@@ -1252,10 +1266,13 @@ app.get("/api/logistics/stats", async (req, res) => {
         `)
       : hasRouteApprovals
       ? await pool.query(`
-          SELECT COUNT(*) FILTER (WHERE UPPER(status) IN ('PENDING', 'AWAITING_APPROVAL')) as pending_count, 
-                 COUNT(*) FILTER (WHERE UPPER(status) = 'APPROVED') as approved_count, 
-                 COUNT(*) FILTER (WHERE UPPER(status) = 'DECLINED') as declined_count, 
-                 COALESCE(AVG(savings_co2) FILTER (WHERE UPPER(status) = 'APPROVED'), 0) as avg_co2_saved 
+          SELECT COUNT(*) FILTER (
+                   WHERE COALESCE(NULLIF(UPPER(REPLACE(TRIM(status), ' ', '_')), ''), 'PENDING')
+                         IN ('PENDING', 'AWAITING_APPROVAL', 'AWAITINGAPPROVAL', 'PENDING_APPROVAL', 'SUBMITTED', 'FOR_APPROVAL', 'IN_REVIEW')
+                 ) as pending_count, 
+                 COUNT(*) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED') as approved_count, 
+                 COUNT(*) FILTER (WHERE UPPER(COALESCE(status, '')) = 'DECLINED') as declined_count, 
+                 COALESCE(AVG(savings_co2) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as avg_co2_saved 
           FROM route_approvals
         `)
       : await pool.query(`
@@ -1275,10 +1292,13 @@ app.get("/api/logistics/stats", async (req, res) => {
         (parseInt(counts.declined_count, 10) || 0);
       if (managerTotal === 0) {
         result = await pool.query(`
-          SELECT COUNT(*) FILTER (WHERE UPPER(status) IN ('PENDING', 'AWAITING_APPROVAL')) as pending_count, 
-                 COUNT(*) FILTER (WHERE UPPER(status) = 'APPROVED') as approved_count, 
-                 COUNT(*) FILTER (WHERE UPPER(status) = 'DECLINED') as declined_count, 
-                 COALESCE(AVG(savings_co2) FILTER (WHERE UPPER(status) = 'APPROVED'), 0) as avg_co2_saved 
+          SELECT COUNT(*) FILTER (
+                   WHERE COALESCE(NULLIF(UPPER(REPLACE(TRIM(status), ' ', '_')), ''), 'PENDING')
+                         IN ('PENDING', 'AWAITING_APPROVAL', 'AWAITINGAPPROVAL', 'PENDING_APPROVAL', 'SUBMITTED', 'FOR_APPROVAL', 'IN_REVIEW')
+                 ) as pending_count, 
+                 COUNT(*) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED') as approved_count, 
+                 COUNT(*) FILTER (WHERE UPPER(COALESCE(status, '')) = 'DECLINED') as declined_count, 
+                 COALESCE(AVG(savings_co2) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as avg_co2_saved 
           FROM route_approvals
         `);
       }
