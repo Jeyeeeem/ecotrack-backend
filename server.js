@@ -438,6 +438,702 @@ app.get("/api/business/directory", async (req, res) => {
 // INVENTORY ITEMS ROUTES
 // ============================================================
 
+// ============================================================
+// ECOTRACKAI PARITY: PRODUCTS / INVENTORY / ALERTS / CATALOG
+// ============================================================
+
+function numOrNull(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+app.get("/api/products", authenticate, async (req, res) => {
+  try {
+    const businessId = req.user?.businessId || null;
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM products
+      WHERE business_id = $1 OR business_id IS NULL
+      ORDER BY business_id NULLS FIRST, product_name ASC
+    `,
+      [businessId]
+    );
+    res.json({ success: true, count: result.rows.length, products: result.rows, data: { products: result.rows } });
+  } catch (err) {
+    console.error("GET /api/products error:", err);
+    res.status(500).json({ success: false, message: "Database error" });
+  }
+});
+
+app.get("/api/products/:productId(\\d+)", authenticate, async (req, res) => {
+  try {
+    const productId = parseInt(req.params.productId, 10);
+    const businessId = req.user?.businessId || null;
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM products
+      WHERE product_id = $1
+        AND (business_id = $2 OR business_id IS NULL)
+      LIMIT 1
+    `,
+      [productId, businessId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Product not found" });
+    }
+    res.json({ success: true, product: result.rows[0], data: { product: result.rows[0] } });
+  } catch (err) {
+    console.error("GET /api/products/:productId error:", err);
+    res.status(500).json({ success: false, message: "Database error" });
+  }
+});
+
+app.post("/api/products", authenticate, async (req, res) => {
+  try {
+    const businessId = req.user?.businessId || null;
+    const body = req.body || {};
+    const productName = String(body.productName || body.product_name || "").trim();
+    const productType = String(body.productType || body.product_type || "fruit").trim() || "fruit";
+    const storageCategory = String(body.storageCategory || body.storage_category || "ambient").trim() || "ambient";
+    const shelfLifeDays = parseInt(body.shelfLifeDays ?? body.shelf_life_days, 10);
+    const unitOfMeasure = String(body.unitOfMeasure || body.unit_of_measure || "kg").trim() || "kg";
+
+    if (!productName || !Number.isFinite(shelfLifeDays) || shelfLifeDays < 1) {
+      return res.status(400).json({ success: false, message: "productName and valid shelfLifeDays are required" });
+    }
+
+    const insertProduct = await pool.query(
+      `
+      INSERT INTO products (
+        business_id, product_name, product_type, storage_category,
+        shelf_life_days, unit_of_measure, image_url
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      RETURNING *
+    `,
+      [businessId, productName, productType, storageCategory, shelfLifeDays, unitOfMeasure, body.imageUrl || body.image_url || null]
+    );
+    const product = insertProduct.rows[0];
+
+    let batch = null;
+    const quantity = numOrNull(body.quantity);
+    if (quantity !== null && quantity > 0) {
+      const entryDate = body.entryDate || body.entry_date || new Date().toISOString();
+      const expiryDate =
+        body.expectedExpiryDate ||
+        body.expected_expiry_date ||
+        new Date(Date.now() + shelfLifeDays * 24 * 60 * 60 * 1000).toISOString();
+      const batchNumber = body.batchNumber || body.batch_number || `${productName.toUpperCase().replace(/\s+/g, "")}-${Date.now()}`;
+      const inventoryInsert = await pool.query(
+        `
+        INSERT INTO inventory (
+          business_id, product_id, quantity, entry_date, expected_expiry_date,
+          batch_number, current_condition, unit_of_measure
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        RETURNING *
+      `,
+        [
+          businessId,
+          product.product_id,
+          quantity,
+          entryDate,
+          expiryDate,
+          batchNumber,
+          body.currentCondition || body.current_condition || "Good",
+          unitOfMeasure
+        ]
+      );
+      batch = inventoryInsert.rows[0];
+    }
+
+    res.status(201).json({ success: true, product, batch, data: { product, batch } });
+  } catch (err) {
+    console.error("POST /api/products error:", err);
+    res.status(500).json({ success: false, message: "Database error" });
+  }
+});
+
+app.put("/api/products/:productId(\\d+)", authenticate, async (req, res) => {
+  try {
+    const productId = parseInt(req.params.productId, 10);
+    const businessId = req.user?.businessId || null;
+    const body = req.body || {};
+    const result = await pool.query(
+      `
+      UPDATE products
+      SET product_name = COALESCE($1, product_name),
+          product_type = COALESCE($2, product_type),
+          storage_category = COALESCE($3, storage_category),
+          shelf_life_days = COALESCE($4, shelf_life_days),
+          unit_of_measure = COALESCE($5, unit_of_measure),
+          image_url = COALESCE($6, image_url)
+      WHERE product_id = $7
+        AND (business_id = $8 OR business_id IS NULL)
+      RETURNING *
+    `,
+      [
+        body.productName || body.product_name || null,
+        body.productType || body.product_type || null,
+        body.storageCategory || body.storage_category || null,
+        numOrNull(body.shelfLifeDays ?? body.shelf_life_days),
+        body.unitOfMeasure || body.unit_of_measure || null,
+        body.imageUrl || body.image_url || null,
+        productId,
+        businessId
+      ]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Product not found" });
+    }
+    res.json({ success: true, product: result.rows[0], data: { product: result.rows[0] } });
+  } catch (err) {
+    console.error("PUT /api/products/:productId error:", err);
+    res.status(500).json({ success: false, message: "Database error" });
+  }
+});
+
+app.delete("/api/products/:productId(\\d+)", authenticate, async (req, res) => {
+  try {
+    const productId = parseInt(req.params.productId, 10);
+    const businessId = req.user?.businessId || null;
+    await pool.query(`DELETE FROM inventory WHERE product_id = $1 AND business_id = $2`, [productId, businessId]);
+    const result = await pool.query(
+      `DELETE FROM products WHERE product_id = $1 AND business_id = $2 RETURNING product_id`,
+      [productId, businessId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Product not found or not owned by business" });
+    }
+    res.json({ success: true, message: "Product deleted successfully" });
+  } catch (err) {
+    console.error("DELETE /api/products/:productId error:", err);
+    res.status(500).json({ success: false, message: "Database error" });
+  }
+});
+
+app.get("/api/catalog/details", authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM products WHERE business_id IS NULL ORDER BY product_name ASC`
+    );
+    res.json({ success: true, data: result.rows, catalog: result.rows, message: null });
+  } catch (err) {
+    console.error("GET /api/catalog/details error:", err);
+    res.status(500).json({ success: false, message: "Database error" });
+  }
+});
+
+app.get("/api/catalog", authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT product_id AS fruit_id, product_name AS name, storage_category AS default_storage_type, shelf_life_days AS default_shelf_life_days
+       FROM products
+       WHERE business_id IS NULL
+       ORDER BY product_name ASC`
+    );
+    res.json({ success: true, data: result.rows, catalog: result.rows, message: null });
+  } catch (err) {
+    console.error("GET /api/catalog error:", err);
+    res.status(500).json({ success: false, message: "Database error" });
+  }
+});
+
+app.get("/api/catalog/:fruitId(\\d+)", authenticate, async (req, res) => {
+  try {
+    const fruitId = parseInt(req.params.fruitId, 10);
+    const result = await pool.query(`SELECT * FROM products WHERE product_id = $1 AND business_id IS NULL LIMIT 1`, [fruitId]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Catalog fruit not found" });
+    }
+    res.json({ success: true, data: result.rows[0], fruit: result.rows[0], message: null });
+  } catch (err) {
+    console.error("GET /api/catalog/:fruitId error:", err);
+    res.status(500).json({ success: false, message: "Database error" });
+  }
+});
+
+app.post("/api/catalog", authenticate, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const name = String(body.name || "").trim();
+    const storageType = String(body.default_storage_type || "ambient").trim();
+    const shelf = parseInt(body.default_shelf_life_days, 10);
+    if (!name || !Number.isFinite(shelf) || shelf < 1) {
+      return res.status(400).json({ success: false, message: "name and default_shelf_life_days are required" });
+    }
+    const created = await pool.query(
+      `
+      INSERT INTO products (business_id, product_name, product_type, storage_category, shelf_life_days, unit_of_measure, ripeness_stages, compatible_with, avoid_with)
+      VALUES (NULL, $1, 'fruit', $2, $3, 'kg', $4::jsonb, $5::jsonb, $6::jsonb)
+      RETURNING *
+    `,
+      [
+        name,
+        storageType,
+        shelf,
+        JSON.stringify(body.ripeness_stages || {}),
+        JSON.stringify(body.compatible_with || []),
+        JSON.stringify(body.avoid_with || [])
+      ]
+    );
+    res.status(201).json({ success: true, data: created.rows[0], message: "Global fruit catalog item created successfully" });
+  } catch (err) {
+    console.error("POST /api/catalog error:", err);
+    res.status(500).json({ success: false, message: "Database error" });
+  }
+});
+
+app.put("/api/catalog/:fruitId(\\d+)", authenticate, async (req, res) => {
+  try {
+    const fruitId = parseInt(req.params.fruitId, 10);
+    const body = req.body || {};
+    const updated = await pool.query(
+      `
+      UPDATE products
+      SET product_name = COALESCE($1, product_name),
+          storage_category = COALESCE($2, storage_category),
+          shelf_life_days = COALESCE($3, shelf_life_days),
+          ripeness_stages = COALESCE($4::jsonb, ripeness_stages),
+          compatible_with = COALESCE($5::jsonb, compatible_with),
+          avoid_with = COALESCE($6::jsonb, avoid_with)
+      WHERE product_id = $7 AND business_id IS NULL
+      RETURNING *
+    `,
+      [
+        body.name || null,
+        body.default_storage_type || null,
+        numOrNull(body.default_shelf_life_days),
+        body.ripeness_stages ? JSON.stringify(body.ripeness_stages) : null,
+        body.compatible_with ? JSON.stringify(body.compatible_with) : null,
+        body.avoid_with ? JSON.stringify(body.avoid_with) : null,
+        fruitId
+      ]
+    );
+    if (updated.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Catalog fruit not found" });
+    }
+    res.json({ success: true, data: updated.rows[0], message: "Global fruit catalog item updated successfully" });
+  } catch (err) {
+    console.error("PUT /api/catalog/:fruitId error:", err);
+    res.status(500).json({ success: false, message: "Database error" });
+  }
+});
+
+app.delete("/api/catalog/:fruitId(\\d+)", authenticate, async (req, res) => {
+  try {
+    const fruitId = parseInt(req.params.fruitId, 10);
+    const inUse = await pool.query(`SELECT inventory_id FROM inventory WHERE product_id = $1 LIMIT 1`, [fruitId]);
+    if (inUse.rows.length > 0) {
+      return res.status(409).json({ success: false, message: "Cannot delete fruit because it is already used in inventory/products" });
+    }
+    const deleted = await pool.query(`DELETE FROM products WHERE product_id = $1 AND business_id IS NULL RETURNING product_id`, [fruitId]);
+    if (deleted.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Catalog fruit not found" });
+    }
+    res.json({ success: true, message: "Global fruit catalog item deleted successfully" });
+  } catch (err) {
+    console.error("DELETE /api/catalog/:fruitId error:", err);
+    res.status(500).json({ success: false, message: "Database error" });
+  }
+});
+
+app.get("/api/inventory", authenticate, async (req, res) => {
+  try {
+    const businessId = req.user?.businessId || null;
+    const result = await pool.query(
+      `
+      SELECT
+        i.*,
+        p.product_name,
+        p.product_type,
+        p.storage_category,
+        p.shelf_life_days
+      FROM inventory i
+      LEFT JOIN products p ON p.product_id = i.product_id
+      WHERE i.business_id = $1
+      ORDER BY i.created_at DESC NULLS LAST
+    `,
+      [businessId]
+    );
+    res.json({ success: true, data: result.rows, inventory: result.rows, count: result.rows.length });
+  } catch (err) {
+    console.error("GET /api/inventory error:", err);
+    res.status(500).json({ success: false, message: "Database error" });
+  }
+});
+
+app.get("/api/inventory/:id(\\d+)", authenticate, async (req, res) => {
+  try {
+    const businessId = req.user?.businessId || null;
+    const inventoryId = parseInt(req.params.id, 10);
+    const result = await pool.query(
+      `
+      SELECT i.*, p.product_name, p.product_type, p.storage_category, p.shelf_life_days
+      FROM inventory i
+      LEFT JOIN products p ON p.product_id = i.product_id
+      WHERE i.inventory_id = $1 AND i.business_id = $2
+      LIMIT 1
+    `,
+      [inventoryId, businessId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Inventory record not found" });
+    }
+    res.json({ success: true, data: result.rows[0], inventory: result.rows[0] });
+  } catch (err) {
+    console.error("GET /api/inventory/:id error:", err);
+    res.status(500).json({ success: false, message: "Database error" });
+  }
+});
+
+app.post("/api/inventory", authenticate, async (req, res) => {
+  try {
+    const businessId = req.user?.businessId || null;
+    const body = req.body || {};
+    const productId = parseInt(body.product_id ?? body.fruit_id ?? body.id, 10);
+    const quantity = numOrNull(body.quantity);
+    if (!Number.isFinite(productId) || quantity === null) {
+      return res.status(400).json({ success: false, message: "product_id and quantity are required" });
+    }
+    const productCheck = await pool.query(`SELECT product_id, shelf_life_days FROM products WHERE product_id = $1 LIMIT 1`, [productId]);
+    if (productCheck.rows.length === 0) {
+      return res.status(400).json({ success: false, message: "Selected fruit not found in catalog" });
+    }
+    const shelfLife = parseInt(body.shelf_life_days ?? productCheck.rows[0].shelf_life_days, 10) || 7;
+    const entryDate = body.entry_date || body.entryDate || new Date().toISOString();
+    const expectedExpiry = body.expected_expiry_date || body.expectedExpiryDate || new Date(Date.now() + shelfLife * 24 * 60 * 60 * 1000).toISOString();
+    const batchNumber = body.batch_number || body.batchNumber || `BATCH-${productId}-${Date.now()}`;
+    const inserted = await pool.query(
+      `
+      INSERT INTO inventory (
+        business_id, product_id, quantity, entry_date, expected_expiry_date, batch_number,
+        simulated_storage_temp, simulated_storage_humidity, current_condition, unit_of_measure, ripeness_stage
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      RETURNING *
+    `,
+      [
+        businessId,
+        productId,
+        quantity,
+        entryDate,
+        expectedExpiry,
+        batchNumber,
+        numOrNull(body.simulated_storage_temp),
+        numOrNull(body.simulated_storage_humidity),
+        body.current_condition || body.currentCondition || "Good",
+        body.unit_of_measure || body.unitOfMeasure || "kg",
+        body.ripeness_stage || body.ripenessStage || null
+      ]
+    );
+    res.status(201).json({ success: true, data: inserted.rows[0], inventory: inserted.rows[0] });
+  } catch (err) {
+    console.error("POST /api/inventory error:", err);
+    res.status(500).json({ success: false, message: "Database error" });
+  }
+});
+
+app.post("/api/inventory/check-compatibility", authenticate, async (req, res) => {
+  try {
+    const { productA, productB } = req.body || {};
+    if (!productA || !productB) {
+      return res.status(400).json({ success: false, message: "productA and productB are required" });
+    }
+    const result = await pool.query(
+      `
+      SELECT product_id, product_name, compatible_with, avoid_with
+      FROM products
+      WHERE LOWER(product_name) IN (LOWER($1), LOWER($2))
+    `,
+      [productA, productB]
+    );
+    const rows = result.rows || [];
+    if (rows.length < 2) {
+      return res.json({ success: true, compatible: true, reason: "No explicit compatibility rules found" });
+    }
+    const a = rows.find((r) => String(r.product_name).toLowerCase() === String(productA).toLowerCase()) || rows[0];
+    const bName = String(productB).toLowerCase();
+    const avoid = Array.isArray(a.avoid_with) ? a.avoid_with.map((x) => String(x).toLowerCase()) : [];
+    const comp = Array.isArray(a.compatible_with) ? a.compatible_with.map((x) => String(x).toLowerCase()) : [];
+    if (avoid.includes(bName)) {
+      return res.json({ success: true, compatible: false, reason: `${productA} should not be stored with ${productB}` });
+    }
+    if (comp.length > 0 && !comp.includes(bName)) {
+      return res.json({ success: true, compatible: true, reason: "No direct conflict found" });
+    }
+    return res.json({ success: true, compatible: true, reason: "Compatible" });
+  } catch (err) {
+    console.error("POST /api/inventory/check-compatibility error:", err);
+    res.status(500).json({ success: false, message: "Database error" });
+  }
+});
+
+app.delete("/api/inventory/:id(\\d+)", authenticate, async (req, res) => {
+  try {
+    const businessId = req.user?.businessId || null;
+    const inventoryId = parseInt(req.params.id, 10);
+    const deleted = await pool.query(
+      `DELETE FROM inventory WHERE inventory_id = $1 AND business_id = $2 RETURNING inventory_id`,
+      [inventoryId, businessId]
+    );
+    if (deleted.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Inventory record not found" });
+    }
+    res.json({ success: true, message: "Inventory deleted successfully" });
+  } catch (err) {
+    console.error("DELETE /api/inventory/:id error:", err);
+    res.status(500).json({ success: false, message: "Database error" });
+  }
+});
+
+app.post("/api/alerts/sync", authenticate, async (req, res) => {
+  try {
+    const businessId = req.user?.businessId || null;
+    const rows = await pool.query(
+      `
+      SELECT
+        i.inventory_id,
+        i.product_id,
+        i.quantity,
+        i.expected_expiry_date,
+        i.current_condition,
+        p.product_name
+      FROM inventory i
+      LEFT JOIN products p ON p.product_id = i.product_id
+      WHERE i.business_id = $1
+    `,
+      [businessId]
+    );
+    let synced = 0;
+    for (const r of rows.rows) {
+      const daysLeft = r.expected_expiry_date
+        ? Math.max(0, Math.ceil((new Date(r.expected_expiry_date).getTime() - Date.now()) / (24 * 60 * 60 * 1000)))
+        : 999;
+      let risk = "LOW";
+      if (daysLeft <= 2) risk = "HIGH";
+      else if (daysLeft <= 5) risk = "MEDIUM";
+      if (daysLeft > 14) continue;
+      const details = `Potential spoilage risk for ${r.product_name || "product"} in ${daysLeft} day(s).`;
+      await pool.query(
+        `
+        INSERT INTO alerts (business_id, product_id, product_name, alert_type, risk_level, details, days_left, quantity, location, status, created_at, updated_at)
+        VALUES ($1,$2,$3,'spoilage_risk',$4,$5,$6,$7,$8,'active',NOW(),NOW())
+      `,
+        [businessId, r.product_id, r.product_name, risk, details, daysLeft, r.quantity, "Inventory Facility"]
+      );
+      synced++;
+    }
+    res.json({ success: true, syncedCount: synced, message: `Successfully synced ${synced} alerts from products` });
+  } catch (err) {
+    console.error("POST /api/alerts/sync error:", err);
+    res.status(500).json({ success: false, message: "Failed to sync alerts" });
+  }
+});
+
+app.post("/api/alerts/generate", authenticate, async (req, res) => {
+  try {
+    const businessId = req.user?.businessId || null;
+    const rows = await pool.query(
+      `
+      SELECT
+        i.inventory_id,
+        i.product_id,
+        i.quantity,
+        i.expected_expiry_date,
+        p.product_name
+      FROM inventory i
+      LEFT JOIN products p ON p.product_id = i.product_id
+      WHERE i.business_id = $1
+    `,
+      [businessId]
+    );
+    let generated = 0;
+    for (const r of rows.rows) {
+      const daysLeft = r.expected_expiry_date
+        ? Math.max(0, Math.ceil((new Date(r.expected_expiry_date).getTime() - Date.now()) / (24 * 60 * 60 * 1000)))
+        : 999;
+      if (daysLeft > 14) continue;
+      let risk = "LOW";
+      if (daysLeft <= 2) risk = "HIGH";
+      else if (daysLeft <= 5) risk = "MEDIUM";
+      const details = `Potential spoilage risk for ${r.product_name || "product"} in ${daysLeft} day(s).`;
+      await pool.query(
+        `
+        INSERT INTO alerts (business_id, product_id, product_name, alert_type, risk_level, details, days_left, quantity, location, status, created_at, updated_at)
+        VALUES ($1,$2,$3,'spoilage_risk',$4,$5,$6,$7,$8,'active',NOW(),NOW())
+      `,
+        [businessId, r.product_id, r.product_name, risk, details, daysLeft, r.quantity, "Inventory Facility"]
+      );
+      generated++;
+    }
+    res.json({ success: true, generatedCount: generated, message: `Generated ${generated} alerts` });
+  } catch (err) {
+    console.error("POST /api/alerts/generate error:", err);
+    res.status(500).json({ success: false, message: "Failed to generate alerts" });
+  }
+});
+
+app.get("/api/alerts", authenticate, async (req, res) => {
+  try {
+    const businessId = req.user?.businessId || null;
+    const hasBusinessIdColumn = (await getTableColumns("alerts")).has("business_id");
+    const query = hasBusinessIdColumn
+      ? `SELECT * FROM alerts WHERE business_id = $1 ORDER BY created_at DESC`
+      : `SELECT * FROM alerts ORDER BY created_at DESC`;
+    const params = hasBusinessIdColumn ? [businessId] : [];
+    const result = await pool.query(query, params);
+    res.json({ success: true, alerts: result.rows, data: result.rows });
+  } catch (err) {
+    console.error("GET /api/alerts error:", err);
+    res.status(500).json({ success: false, message: "Failed to retrieve alerts" });
+  }
+});
+
+app.get("/api/alerts/stats", authenticate, async (req, res) => {
+  try {
+    const businessId = req.user?.businessId || null;
+    const hasBusinessIdColumn = (await getTableColumns("alerts")).has("business_id");
+    const where = hasBusinessIdColumn ? "WHERE business_id = $1" : "";
+    const params = hasBusinessIdColumn ? [businessId] : [];
+    const result = await pool.query(
+      `
+      SELECT
+        COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE LOWER(COALESCE(status,'')) = 'active')::int AS active,
+        COUNT(*) FILTER (WHERE LOWER(COALESCE(risk_level,'')) = 'high')::int AS high,
+        COUNT(*) FILTER (WHERE LOWER(COALESCE(risk_level,'')) = 'medium')::int AS medium,
+        COUNT(*) FILTER (WHERE LOWER(COALESCE(risk_level,'')) = 'low')::int AS low
+      FROM alerts
+      ${where}
+    `,
+      params
+    );
+    res.json({ success: true, stats: result.rows[0] || { total: 0, active: 0, high: 0, medium: 0, low: 0 } });
+  } catch (err) {
+    console.error("GET /api/alerts/stats error:", err);
+    res.status(500).json({ success: false, message: "Failed to retrieve alert stats" });
+  }
+});
+
+app.post("/api/alerts/:id(\\d+)/submit", authenticate, async (req, res) => {
+  try {
+    const alertId = parseInt(req.params.id, 10);
+    const businessId = req.user?.businessId || null;
+    const alertResult = await pool.query(`SELECT * FROM alerts WHERE id = $1 LIMIT 1`, [alertId]);
+    if (alertResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Alert not found" });
+    }
+    const alert = alertResult.rows[0];
+    const managerCols = await getManagerApprovalsColumns();
+    const managerPk = await getManagerApprovalsPkColumn();
+    const maExistsCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
+    const hasMA = !!maExistsCheck.rows[0]?.tbl;
+    if (!hasMA) {
+      return res.status(500).json({ success: false, message: "manager_approvals table not found" });
+    }
+    const dup = await pool.query(
+      `SELECT ${managerPk} FROM manager_approvals
+       WHERE approval_type = 'spoilage_action'
+         AND COALESCE(alert_id::text,'') = $1
+         AND LOWER(COALESCE(status,'')) LIKE '%pending%'
+       LIMIT 1`,
+      [String(alertId)]
+    );
+    if (dup.rows.length > 0) {
+      return res.json({ success: true, message: "Alert already submitted for approval", approvalId: dup.rows[0][managerPk] });
+    }
+    const insertCols = [];
+    const insertVals = [];
+    const params = [];
+    let n = 1;
+    const push = (col, val) => { insertCols.push(col); insertVals.push(`$${n++}`); params.push(val); };
+    if (managerCols.has("business_id")) push("business_id", businessId);
+    if (managerCols.has("product_name")) push("product_name", alert.product_name || "Unknown Product");
+    if (managerCols.has("quantity")) push("quantity", alert.quantity || null);
+    if (managerCols.has("location")) push("location", alert.location || "Unknown");
+    if (managerCols.has("days_left")) push("days_left", alert.days_left || 0);
+    if (managerCols.has("risk_level")) push("risk_level", alert.risk_level || "MEDIUM");
+    if (managerCols.has("required_role")) push("required_role", "inventory_manager");
+    if (managerCols.has("priority")) push("priority", alert.risk_level === "HIGH" ? "HIGH" : "MEDIUM");
+    if (managerCols.has("status")) push("status", "pending");
+    if (managerCols.has("approval_type")) push("approval_type", "spoilage_action");
+    if (managerCols.has("submitted_by")) push("submitted_by", req.user?.userId || null);
+    if (managerCols.has("ai_suggestion")) push("ai_suggestion", alert.details || null);
+    if (managerCols.has("alert_id")) push("alert_id", alertId);
+    if (managerCols.has("created_at")) { insertCols.push("created_at"); insertVals.push("NOW()"); }
+
+    const inserted = await pool.query(
+      `INSERT INTO manager_approvals (${insertCols.join(", ")}) VALUES (${insertVals.join(", ")}) RETURNING ${managerPk} AS approval_id`,
+      params
+    );
+    await pool.query(`UPDATE alerts SET status = 'pending_review', updated_at = NOW() WHERE id = $1`, [alertId]);
+    res.json({ success: true, message: "Alert submitted for approval", approvalId: inserted.rows[0]?.approval_id || null });
+  } catch (err) {
+    console.error("POST /api/alerts/:id/submit error:", err);
+    res.status(500).json({ success: false, message: "Failed to submit alert for approval" });
+  }
+});
+
+app.get("/api/alerts/:id(\\d+)/insights", authenticate, async (req, res) => {
+  try {
+    const alertId = parseInt(req.params.id, 10);
+    const result = await pool.query(`SELECT * FROM alerts WHERE id = $1 LIMIT 1`, [alertId]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Alert not found" });
+    }
+    const a = result.rows[0];
+    const insight = {
+      product: a.product_name,
+      riskLevel: a.risk_level,
+      recommendation:
+        a.risk_level === "HIGH"
+          ? "Immediate action recommended: prioritize dispatch or cold-chain correction."
+          : a.risk_level === "MEDIUM"
+          ? "Monitor closely and schedule movement within 24-48 hours."
+          : "Low risk. Continue monitoring and follow FIFO."
+    };
+    res.json({ success: true, insight, data: insight });
+  } catch (err) {
+    console.error("GET /api/alerts/:id/insights error:", err);
+    res.status(500).json({ success: false, message: "Failed to generate insights" });
+  }
+});
+
+app.put("/api/alerts/:id(\\d+)/status", authenticate, async (req, res) => {
+  try {
+    const alertId = parseInt(req.params.id, 10);
+    const status = String(req.body?.status || "").trim().toLowerCase();
+    if (!status) {
+      return res.status(400).json({ success: false, message: "status is required" });
+    }
+    const result = await pool.query(`UPDATE alerts SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *`, [status, alertId]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Alert not found" });
+    }
+    res.json({ success: true, alert: result.rows[0], data: result.rows[0] });
+  } catch (err) {
+    console.error("PUT /api/alerts/:id/status error:", err);
+    res.status(500).json({ success: false, message: "Failed to update alert status" });
+  }
+});
+
+app.delete("/api/alerts/:id(\\d+)", authenticate, async (req, res) => {
+  try {
+    const alertId = parseInt(req.params.id, 10);
+    const result = await pool.query(`DELETE FROM alerts WHERE id = $1 RETURNING id`, [alertId]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Alert not found" });
+    }
+    res.json({ success: true, message: "Alert deleted successfully" });
+  } catch (err) {
+    console.error("DELETE /api/alerts/:id error:", err);
+    res.status(500).json({ success: false, message: "Failed to delete alert" });
+  }
+});
+
 // Get all inventory items
 app.get("/api/inventory/items", authenticate, async (req, res) => {
   try {
