@@ -976,6 +976,19 @@ const parseMaybeJsonObject = (value) => {
   }
 };
 
+const extractSavingsFromText = (text) => {
+  const source = String(text || "");
+  if (!source) return { km: 0, fuel: 0, co2: 0 };
+  const kmMatch = source.match(/saves?\s+([0-9]+(?:\.[0-9]+)?)\s*km/i);
+  const fuelMatch = source.match(/([0-9]+(?:\.[0-9]+)?)\s*(?:l|liters?)\b/i);
+  const co2Match = source.match(/([0-9]+(?:\.[0-9]+)?)\s*kg\s*co[2₂]/i);
+  return {
+    km: kmMatch ? Number(kmMatch[1]) : 0,
+    fuel: fuelMatch ? Number(fuelMatch[1]) : 0,
+    co2: co2Match ? Number(co2Match[1]) : 0
+  };
+};
+
 async function buildLogisticsRoutePayload(row, options = {}) {
   const routeIdFromParams = options.routeIdFromParams ? String(options.routeIdFromParams) : null;
   const hasRouteStops = !!options.hasRouteStops;
@@ -984,6 +997,9 @@ async function buildLogisticsRoutePayload(row, options = {}) {
   const routeData = parseMaybeJsonObject(extraData.route);
   const optimization = parseMaybeJsonObject(extraData.optimization);
   const optimizationData = parseMaybeJsonObject(optimization.optimization_data);
+  const requestOptimization = parseMaybeJsonObject(requestData.optimization);
+  const requestOptimizationData = parseMaybeJsonObject(requestOptimization.optimization_data);
+  const extraOptimizationData = parseMaybeJsonObject(extraData.optimization_data);
   const routeIdRaw =
     routeIdFromParams ||
     row.route_id ||
@@ -1039,71 +1055,223 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     row.original_distance,
     row.total_distance_km,
     requestData.original_distance,
+    requestData.original_distance_km,
     routeData.total_distance_km,
+    routeData.original_distance,
+    routeData.original_distance_km,
     optimization.original_distance,
-    optimizationData.originalDistance
+    optimization.original_distance_km,
+    optimizationData.originalDistance,
+    optimizationData.original_distance,
+    optimizationData.original_distance_km,
+    requestOptimization.original_distance,
+    requestOptimization.original_distance_km,
+    requestOptimizationData.originalDistance,
+    requestOptimizationData.original_distance,
+    requestOptimizationData.original_distance_km,
+    extraOptimizationData.originalDistance,
+    extraOptimizationData.original_distance,
+    extraOptimizationData.original_distance_km
   );
   const optimizedDistance = toFiniteNumber(
     row.optimized_distance,
     requestData.optimized_distance,
+    requestData.optimized_distance_km,
+    routeData.optimized_distance,
+    routeData.optimized_distance_km,
     optimization.optimized_distance,
-    optimizationData.optimizedDistance
+    optimization.optimized_distance_km,
+    optimizationData.optimizedDistance,
+    optimizationData.optimized_distance,
+    optimizationData.optimized_distance_km,
+    requestOptimization.optimized_distance,
+    requestOptimization.optimized_distance_km,
+    requestOptimizationData.optimizedDistance,
+    requestOptimizationData.optimized_distance,
+    requestOptimizationData.optimized_distance_km,
+    extraOptimizationData.optimizedDistance,
+    extraOptimizationData.optimized_distance,
+    extraOptimizationData.optimized_distance_km
   );
   const originalFuel = toFiniteNumber(
     row.original_fuel,
     row.estimated_fuel_consumption_liters,
     requestData.original_fuel,
+    requestData.original_fuel_liters,
     routeData.estimated_fuel_consumption_liters,
+    routeData.original_fuel,
+    routeData.original_fuel_liters,
     optimization.original_fuel,
-    optimizationData.originalFuel
+    optimization.original_fuel_liters,
+    optimizationData.originalFuel,
+    optimizationData.original_fuel,
+    optimizationData.original_fuel_liters,
+    requestOptimization.original_fuel,
+    requestOptimization.original_fuel_liters,
+    requestOptimizationData.originalFuel,
+    requestOptimizationData.original_fuel,
+    requestOptimizationData.original_fuel_liters,
+    extraOptimizationData.originalFuel,
+    extraOptimizationData.original_fuel,
+    extraOptimizationData.original_fuel_liters
   );
   const optimizedFuel = toFiniteNumber(
     row.optimized_fuel,
     requestData.optimized_fuel,
+    requestData.optimized_fuel_liters,
+    routeData.optimized_fuel,
+    routeData.optimized_fuel_liters,
     optimization.optimized_fuel,
-    optimizationData.optimizedFuel
+    optimization.optimized_fuel_liters,
+    optimizationData.optimizedFuel,
+    optimizationData.optimized_fuel,
+    optimizationData.optimized_fuel_liters,
+    requestOptimization.optimized_fuel,
+    requestOptimization.optimized_fuel_liters,
+    requestOptimizationData.optimizedFuel,
+    requestOptimizationData.optimized_fuel,
+    requestOptimizationData.optimized_fuel_liters,
+    extraOptimizationData.optimizedFuel,
+    extraOptimizationData.optimized_fuel,
+    extraOptimizationData.optimized_fuel_liters
   );
   const originalCO2 = toFiniteNumber(
     row.original_co2,
     row.estimated_carbon_kg,
     requestData.original_co2,
+    requestData.original_co2_kg,
     routeData.estimated_carbon_kg,
+    routeData.original_co2,
+    routeData.original_co2_kg,
     optimization.original_carbon_kg,
-    optimizationData.originalCarbon
+    optimization.original_co2,
+    optimization.original_co2_kg,
+    optimizationData.originalCarbon,
+    optimizationData.original_co2,
+    optimizationData.original_co2_kg,
+    requestOptimization.original_co2,
+    requestOptimization.original_co2_kg,
+    requestOptimizationData.originalCarbon,
+    requestOptimizationData.original_co2,
+    requestOptimizationData.original_co2_kg,
+    extraOptimizationData.originalCarbon,
+    extraOptimizationData.original_co2,
+    extraOptimizationData.original_co2_kg
   );
   const optimizedCO2 = toFiniteNumber(
     row.optimized_co2,
     row.optimized_carbon_kg,
     requestData.optimized_co2,
+    requestData.optimized_co2_kg,
+    routeData.optimized_co2,
+    routeData.optimized_co2_kg,
     optimization.optimized_carbon_kg,
-    optimizationData.optimizedCarbon
+    optimization.optimized_co2,
+    optimization.optimized_co2_kg,
+    optimizationData.optimizedCarbon,
+    optimizationData.optimized_co2,
+    optimizationData.optimized_co2_kg,
+    requestOptimization.optimized_co2,
+    requestOptimization.optimized_co2_kg,
+    requestOptimizationData.optimizedCarbon,
+    requestOptimizationData.optimized_co2,
+    requestOptimizationData.optimized_co2_kg,
+    extraOptimizationData.optimizedCarbon,
+    extraOptimizationData.optimized_co2,
+    extraOptimizationData.optimized_co2_kg
   );
-  const totalSavingsKm = toFiniteNumber(
-    row.savings_km,
-    requestData.savings_km,
-    optimization.savings_km,
-    optimizationData.savingsKm
-  );
-  const totalSavingsFuel = toFiniteNumber(
-    row.savings_fuel,
-    requestData.savings_fuel,
-    optimization.savings_fuel,
-    optimizationData.savingsFuel
-  );
-  const totalSavingsCO2 = toFiniteNumber(
-    row.savings_co2,
-    requestData.savings_co2,
-    optimization.savings_co2,
-    optimizationData.savingsCo2
-  );
-
   const aiSuggestion =
     row.ai_suggestion ||
     row.ai_recommendation ||
     requestData.ai_suggestion ||
+    requestOptimization.ai_recommendation ||
     optimization.ai_recommendation ||
+    requestOptimizationData.aiRecommendation ||
     optimizationData.aiRecommendation ||
     "Optimize this route";
+  const textSavings = extractSavingsFromText(aiSuggestion);
+  const totalSavingsKm = toFiniteNumber(
+    row.savings_km,
+    row.distance_saved_km,
+    requestData.savings_km,
+    requestData.distance_saved_km,
+    routeData.savings_km,
+    routeData.distance_saved_km,
+    optimization.savings_km,
+    optimization.distance_saved_km,
+    optimizationData.savingsKm,
+    optimizationData.savings_km,
+    optimizationData.distance_saved_km,
+    requestOptimization.savings_km,
+    requestOptimization.distance_saved_km,
+    requestOptimizationData.savingsKm,
+    requestOptimizationData.savings_km,
+    requestOptimizationData.distance_saved_km,
+    extraOptimizationData.savingsKm,
+    extraOptimizationData.savings_km,
+    extraOptimizationData.distance_saved_km,
+    textSavings.km
+  );
+  const totalSavingsFuel = toFiniteNumber(
+    row.savings_fuel,
+    row.fuel_saved,
+    row.fuel_saved_liters,
+    requestData.savings_fuel,
+    requestData.fuel_saved,
+    requestData.fuel_saved_liters,
+    routeData.savings_fuel,
+    routeData.fuel_saved,
+    routeData.fuel_saved_liters,
+    optimization.savings_fuel,
+    optimization.fuel_saved,
+    optimization.fuel_saved_liters,
+    optimizationData.savingsFuel,
+    optimizationData.savings_fuel,
+    optimizationData.fuel_saved,
+    optimizationData.fuel_saved_liters,
+    requestOptimization.savings_fuel,
+    requestOptimization.fuel_saved,
+    requestOptimization.fuel_saved_liters,
+    requestOptimizationData.savingsFuel,
+    requestOptimizationData.savings_fuel,
+    requestOptimizationData.fuel_saved,
+    requestOptimizationData.fuel_saved_liters,
+    extraOptimizationData.savingsFuel,
+    extraOptimizationData.savings_fuel,
+    extraOptimizationData.fuel_saved,
+    extraOptimizationData.fuel_saved_liters,
+    textSavings.fuel
+  );
+  const totalSavingsCO2 = toFiniteNumber(
+    row.savings_co2,
+    row.co2_saved,
+    row.co2_saved_kg,
+    requestData.savings_co2,
+    requestData.co2_saved,
+    requestData.co2_saved_kg,
+    routeData.savings_co2,
+    routeData.co2_saved,
+    routeData.co2_saved_kg,
+    optimization.savings_co2,
+    optimization.co2_saved,
+    optimization.co2_saved_kg,
+    optimizationData.savingsCo2,
+    optimizationData.savings_co2,
+    optimizationData.co2_saved,
+    optimizationData.co2_saved_kg,
+    requestOptimization.savings_co2,
+    requestOptimization.co2_saved,
+    requestOptimization.co2_saved_kg,
+    requestOptimizationData.savingsCo2,
+    requestOptimizationData.savings_co2,
+    requestOptimizationData.co2_saved,
+    requestOptimizationData.co2_saved_kg,
+    extraOptimizationData.savingsCo2,
+    extraOptimizationData.savings_co2,
+    extraOptimizationData.co2_saved,
+    extraOptimizationData.co2_saved_kg,
+    textSavings.co2
+  );
 
   const submittedBy = row.submitted_by || row.requested_by || row.reviewed_by || "System";
   const payload = {
@@ -1339,9 +1507,22 @@ app.get("/api/logistics/dashboard", async (req, res) => {
     const stats = statsResult.rows[0] || {};
     const routeStopsTableCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
     const hasRouteStops = !!routeStopsTableCheck.rows[0]?.tbl;
-    const pendingRoutes = await Promise.all(
+    const mappedPendingRoutes = await Promise.all(
       pendingResult.rows.map((row) => buildLogisticsRoutePayload(row, { hasRouteStops }))
     );
+    const pendingRouteMap = new Map();
+    for (const route of mappedPendingRoutes) {
+      const key = `${route.routeId || route.route_id}`;
+      const existing = pendingRouteMap.get(key);
+      if (!existing) {
+        pendingRouteMap.set(key, route);
+        continue;
+      }
+      const existingTs = new Date(existing.submittedTime || existing.submitted_at || 0).getTime();
+      const currentTs = new Date(route.submittedTime || route.submitted_at || 0).getTime();
+      if (currentTs >= existingTs) pendingRouteMap.set(key, route);
+    }
+    const pendingRoutes = Array.from(pendingRouteMap.values());
 
     res.json({
       success: true,
