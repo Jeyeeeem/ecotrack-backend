@@ -1715,11 +1715,11 @@ app.get("/api/logistics/dashboard", async (req, res) => {
     let approvedCount = parseInt(stats.approved_count, 10) || 0;
     let declinedCount = parseInt(stats.declined_count, 10) || 0;
 
-    // Fallback: count deliveries only when linked route approval is explicitly resolved.
+    // Fallback: count delivery assignments as approved progress for logistics dashboard.
     try {
       const deliveriesTableCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
       const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
-      if (hasDeliveries && hasRouteApprovals) {
+      if (hasDeliveries) {
         const deliveriesColumns = await getTableColumns("deliveries");
         const deliveryStatusExpr = deliveriesColumns.has("status") ? "LOWER(COALESCE(status, ''))" : "''";
         const routeIdExpr = deliveriesColumns.has("route_id") ? "route_id::text" : "delivery_id::text";
@@ -1727,13 +1727,7 @@ app.get("/api/logistics/dashboard", async (req, res) => {
           `SELECT
              COUNT(DISTINCT ${routeIdExpr}) FILTER (WHERE ${deliveryStatusExpr} IN ('assigned', 'accepted', 'in_progress', 'completed')) as approved_count,
              COUNT(DISTINCT ${routeIdExpr}) FILTER (WHERE ${deliveryStatusExpr} IN ('declined', 'rejected', 'cancelled')) as declined_count
-           FROM deliveries d
-           WHERE EXISTS (
-             SELECT 1
-             FROM route_approvals ra
-             WHERE ra.id::text = ${routeIdExpr}
-               AND LOWER(COALESCE(ra.status, '')) IN ('approved', 'declined', 'rejected')
-           )`
+           FROM deliveries`
         );
         const deliveryApproved = parseInt(deliveryStats.rows[0]?.approved_count, 10) || 0;
         const deliveryDeclined = parseInt(deliveryStats.rows[0]?.declined_count, 10) || 0;
@@ -2119,11 +2113,11 @@ app.get("/api/logistics/stats", async (req, res) => {
       }
     }
 
-    // Delivery fallback only for deliveries linked to explicitly resolved route approvals.
+    // Delivery fallback: assignment flow is approval completion in this app.
     try {
       const deliveriesTableCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
       const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
-      if (hasDeliveries && hasRouteApprovals) {
+      if (hasDeliveries) {
         const deliveriesColumns = await getTableColumns("deliveries");
         const deliveryStatusExpr = deliveriesColumns.has("status") ? "LOWER(COALESCE(status, ''))" : "''";
         const routeIdExpr = deliveriesColumns.has("route_id") ? "route_id::text" : "delivery_id::text";
@@ -2131,13 +2125,7 @@ app.get("/api/logistics/stats", async (req, res) => {
           `SELECT
              COUNT(DISTINCT ${routeIdExpr}) FILTER (WHERE ${deliveryStatusExpr} IN ('assigned', 'accepted', 'in_progress', 'completed')) as approved_count,
              COUNT(DISTINCT ${routeIdExpr}) FILTER (WHERE ${deliveryStatusExpr} IN ('declined', 'rejected', 'cancelled')) as declined_count
-           FROM deliveries d
-           WHERE EXISTS (
-             SELECT 1
-             FROM route_approvals ra
-             WHERE ra.id::text = ${routeIdExpr}
-               AND LOWER(COALESCE(ra.status, '')) IN ('approved', 'declined', 'rejected')
-           )`
+           FROM deliveries`
         );
         const row = result.rows[0] || {};
         row.approved_count = Math.max(parseInt(row.approved_count, 10) || 0, parseInt(deliveryStats.rows[0]?.approved_count, 10) || 0);
@@ -2336,7 +2324,7 @@ app.get("/api/logistics/history", async (req, res) => {
       : "ma.reviewed_at DESC NULLS LAST, ma.created_at DESC NULLS LAST";
     let result = hasRouteApprovals
       ? await pool.query(`
-          SELECT id as approval_id, id as route_id, route_type as product_name, from_location as location, driver_name, 
+          SELECT id as approval_id, id as route_id, route_type as product_name, from_location, to_location, from_location as location, driver_name, 
                  status, savings_km, savings_co2, approved_at as reviewed_at, manager_comment as review_notes 
           FROM route_approvals
           WHERE LOWER(COALESCE(status, '')) IN ('approved', 'declined', 'rejected')
@@ -2349,6 +2337,8 @@ app.get("/api/logistics/history", async (req, res) => {
             ma.${managerPkCol} as approval_id,
             ${managerRouteRefExpr} as route_id,
             COALESCE(ma.request_data->>'route_type', 'STANDARD') as product_name,
+            COALESCE(ma.request_data->>'from_location', 'Unknown') as from_location,
+            COALESCE(ma.request_data->>'to_location', null) as to_location,
             COALESCE(ma.request_data->>'from_location', 'Unknown') as location,
             ma.request_data->>'driver_name' as driver_name,
             UPPER(ma.status) as status,
@@ -2370,6 +2360,8 @@ app.get("/api/logistics/history", async (req, res) => {
           ma.${managerPkCol} as approval_id,
           ${managerRouteRefExpr} as route_id,
           COALESCE(ma.request_data->>'route_type', 'STANDARD') as product_name,
+          COALESCE(ma.request_data->>'from_location', 'Unknown') as from_location,
+          COALESCE(ma.request_data->>'to_location', null) as to_location,
           COALESCE(ma.request_data->>'from_location', 'Unknown') as location,
           ma.request_data->>'driver_name' as driver_name,
           UPPER(ma.status) as status,
@@ -2387,7 +2379,7 @@ app.get("/api/logistics/history", async (req, res) => {
 
     if (hasRouteApprovals && result.rows.length === 0) {
       result = await pool.query(`
-        SELECT id as approval_id, id as route_id, route_type as product_name, from_location as location, driver_name, 
+        SELECT id as approval_id, id as route_id, route_type as product_name, from_location, to_location, from_location as location, driver_name, 
                status, savings_km, savings_co2, approved_at as reviewed_at, manager_comment as review_notes 
         FROM route_approvals
         WHERE LOWER(COALESCE(status, '')) IN ('approved', 'declined', 'rejected')
@@ -2396,11 +2388,11 @@ app.get("/api/logistics/history", async (req, res) => {
       `);
     }
 
-    // Final fallback: build history from deliveries only when linked route approval is resolved.
+    // Final fallback: build history directly from deliveries so approved assignments are visible.
     if (result.rows.length === 0) {
       const deliveriesTableCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
       const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
-      if (hasDeliveries && hasRouteApprovals) {
+      if (hasDeliveries) {
         const deliveriesColumns = await getTableColumns("deliveries");
         const reviewedAtExpr = deliveriesColumns.has("updated_at")
           ? "d.updated_at"
@@ -2413,21 +2405,22 @@ app.get("/api/logistics/history", async (req, res) => {
           SELECT
             d.delivery_id as approval_id,
             COALESCE(d.route_id::text, d.delivery_id::text) as route_id,
-            COALESCE(ra.route_type, d.vehicle_type, 'DELIVERY') as product_name,
+            COALESCE(d.vehicle_type, 'DELIVERY') as product_name,
+            COALESCE(d.from_location, 'Unknown') as from_location,
+            COALESCE(d.to_location, null) as to_location,
             COALESCE(d.from_location, 'Unknown') as location,
             d.driver_name as driver_name,
             CASE
-              WHEN LOWER(COALESCE(ra.status, '')) IN ('declined', 'rejected') THEN 'DECLINED'
+              WHEN LOWER(COALESCE(d.status, '')) IN ('declined', 'rejected', 'cancelled') THEN 'DECLINED'
               ELSE 'APPROVED'
             END as status,
-            COALESCE(ra.savings_km, 0)::numeric as savings_km,
-            COALESCE(ra.savings_co2, 0)::numeric as savings_co2,
-            COALESCE(ra.approved_at, ${reviewedAtExpr}) as reviewed_at,
-            COALESCE(ra.manager_comment, 'Approved and assigned to driver')::text as review_notes
+            0::numeric as savings_km,
+            0::numeric as savings_co2,
+            ${reviewedAtExpr} as reviewed_at,
+            'Approved and assigned to driver'::text as review_notes
           FROM deliveries d
-          JOIN route_approvals ra ON ra.id::text = COALESCE(d.route_id::text, d.delivery_id::text)
-          WHERE LOWER(COALESCE(ra.status, '')) IN ('approved', 'declined', 'rejected')
-          ORDER BY COALESCE(ra.approved_at, ${reviewedAtExpr}) DESC NULLS LAST, d.delivery_id DESC
+          WHERE LOWER(COALESCE(d.status, '')) IN ('assigned', 'accepted', 'in_progress', 'completed', 'declined', 'rejected', 'cancelled')
+          ORDER BY ${reviewedAtExpr} DESC NULLS LAST, d.delivery_id DESC
           LIMIT 100
         `);
       }
