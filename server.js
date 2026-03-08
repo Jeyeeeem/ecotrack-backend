@@ -1541,8 +1541,8 @@ app.get("/api/logistics/dashboard", async (req, res) => {
       statsResult = await pool.query(
         `SELECT 
           COUNT(*) FILTER (WHERE LOWER(status) IN ('pending', 'awaiting_approval')) as pending_count,
-          COUNT(*) FILTER (WHERE status = 'approved') as approved_count,
-          COUNT(*) FILTER (WHERE status IN ('declined', 'rejected')) as declined_count,
+          COUNT(*) FILTER (WHERE LOWER(COALESCE(status, '')) = 'approved') as approved_count,
+          COUNT(*) FILTER (WHERE LOWER(COALESCE(status, '')) IN ('declined', 'rejected')) as declined_count,
           0::numeric as avg_co2_saved,
           0::numeric as total_co2_reduced,
           0::numeric as total_km_saved
@@ -2215,11 +2215,21 @@ app.get("/api/logistics/history", async (req, res) => {
       managerColumns.has("approval_type") &&
       managerColumns.has("status");
     const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
+    const managerRouteRefExpr = managerColumns.has("route_id")
+      ? "ma.route_id"
+      : managerColumns.has("related_record_id")
+      ? "ma.related_record_id"
+      : managerColumns.has("delivery_id")
+      ? "ma.delivery_id"
+      : `ma.${managerPkCol}`;
+    const managerHistoryOrderBy = managerColumns.has("updated_at")
+      ? "ma.reviewed_at DESC NULLS LAST, ma.updated_at DESC"
+      : "ma.reviewed_at DESC NULLS LAST, ma.created_at DESC NULLS LAST";
     let result = canUseManagerRouteData
       ? await pool.query(`
           SELECT
             ma.${managerPkCol} as approval_id,
-            ma.${managerPkCol} as route_id,
+            ${managerRouteRefExpr} as route_id,
             COALESCE(ma.request_data->>'route_type', 'STANDARD') as product_name,
             COALESCE(ma.request_data->>'from_location', 'Unknown') as location,
             ma.request_data->>'driver_name' as driver_name,
@@ -2231,7 +2241,7 @@ app.get("/api/logistics/history", async (req, res) => {
           FROM manager_approvals ma
           WHERE ma.approval_type = 'route_optimization'
             AND LOWER(ma.status) IN ('approved', 'declined', 'rejected')
-          ORDER BY ma.reviewed_at DESC NULLS LAST, ma.updated_at DESC
+          ORDER BY ${managerHistoryOrderBy}
           LIMIT 100
         `)
       : hasRouteApprovals
@@ -2648,44 +2658,54 @@ app.get("/api/driver/dashboard", async (req, res) => {
     const hasDriverFilter = !!driver_name;
     const args = hasDriverFilter ? [driver_name] : [];
     const clause = hasDriverFilter ? `AND d.driver_name = $1` : ``;
+    const deliveriesColumns = await getTableColumns("deliveries");
+    const col = (name, fallbackSql) => deliveriesColumns.has(name) ? `d.${name}` : `${fallbackSql} as ${name}`;
+    const orderByCreated = deliveriesColumns.has("created_at")
+      ? "d.created_at DESC"
+      : "COALESCE(d.departure_time, d.arrival_time) DESC NULLS LAST";
+    const orderByCompleted = deliveriesColumns.has("completed_at")
+      ? "d.completed_at DESC NULLS LAST, " + orderByCreated
+      : orderByCreated;
+    const stopsJsonSelect = deliveriesColumns.has("stops_json") ? "d.stops_json" : "NULL::jsonb as stops_json";
+    const itemsJsonSelect = deliveriesColumns.has("delivery_items_json") ? "d.delivery_items_json" : "NULL::jsonb as delivery_items_json";
 
     const statsResult = await pool.query(`
-      SELECT COUNT(*) FILTER (WHERE d.status = 'completed') as total_completed, 
-             COALESCE(SUM(d.distance_km) FILTER (WHERE d.status = 'completed'), 0) as total_km, 
-             COALESCE(SUM(d.fuel_consumption) FILTER (WHERE d.status = 'completed'), 0) as total_fuel, 
-             COALESCE(SUM(d.carbon_emissions) FILTER (WHERE d.status = 'completed'), 0) as total_carbon,
+      SELECT COUNT(*) FILTER (WHERE LOWER(COALESCE(d.status, '')) = 'completed') as total_completed, 
+             COALESCE(SUM(${deliveriesColumns.has("distance_km") ? "d.distance_km" : "0"}) FILTER (WHERE LOWER(COALESCE(d.status, '')) = 'completed'), 0) as total_km, 
+             COALESCE(SUM(${deliveriesColumns.has("fuel_consumption") ? "d.fuel_consumption" : deliveriesColumns.has("estimated_fuel_consumption_liters") ? "d.estimated_fuel_consumption_liters" : "0"}) FILTER (WHERE LOWER(COALESCE(d.status, '')) = 'completed'), 0) as total_fuel, 
+             COALESCE(SUM(${deliveriesColumns.has("carbon_emissions") ? "d.carbon_emissions" : deliveriesColumns.has("estimated_carbon_kg") ? "d.estimated_carbon_kg" : "0"}) FILTER (WHERE LOWER(COALESCE(d.status, '')) = 'completed'), 0) as total_carbon,
              COUNT(*) FILTER (WHERE d.status IN ('assigned', 'accepted', 'in_progress')) as active_deliveries
       FROM deliveries d
       WHERE d.driver_name IS NOT NULL ${clause}
     `, args);
 
     const pendingAcceptanceResult = await pool.query(`
-      SELECT d.delivery_id, d.route_id, d.status, d.driver_name, d.vehicle_type, d.departure_time, d.arrival_time,
-             d.from_location, d.to_location, d.distance_km, d.estimated_fuel_consumption_liters, d.fuel_consumption,
-             d.estimated_carbon_kg, d.carbon_emissions, d.stops_json, d.delivery_items_json
+      SELECT ${col("delivery_id", "NULL")}, ${col("route_id", "NULL")}, ${col("status", "NULL")}, ${col("driver_name", "NULL")}, ${col("vehicle_type", "NULL")}, ${col("departure_time", "NULL")}, ${col("arrival_time", "NULL")},
+             ${col("from_location", "NULL")}, ${col("to_location", "NULL")}, ${col("distance_km", "0")}, ${col("estimated_fuel_consumption_liters", "0")}, ${col("fuel_consumption", "0")},
+             ${col("estimated_carbon_kg", "0")}, ${col("carbon_emissions", "0")}, ${stopsJsonSelect}, ${itemsJsonSelect}
       FROM deliveries d
       WHERE d.status = 'assigned' ${clause}
-      ORDER BY d.created_at DESC
+      ORDER BY ${orderByCreated}
       LIMIT 20
     `, args);
 
     const activeResult = await pool.query(`
-      SELECT d.delivery_id, d.route_id, d.status, d.driver_name, d.vehicle_type, d.departure_time, d.arrival_time,
-             d.from_location, d.to_location, d.distance_km, d.estimated_fuel_consumption_liters, d.fuel_consumption,
-             d.estimated_carbon_kg, d.carbon_emissions, d.stops_json, d.delivery_items_json
+      SELECT ${col("delivery_id", "NULL")}, ${col("route_id", "NULL")}, ${col("status", "NULL")}, ${col("driver_name", "NULL")}, ${col("vehicle_type", "NULL")}, ${col("departure_time", "NULL")}, ${col("arrival_time", "NULL")},
+             ${col("from_location", "NULL")}, ${col("to_location", "NULL")}, ${col("distance_km", "0")}, ${col("estimated_fuel_consumption_liters", "0")}, ${col("fuel_consumption", "0")},
+             ${col("estimated_carbon_kg", "0")}, ${col("carbon_emissions", "0")}, ${stopsJsonSelect}, ${itemsJsonSelect}
       FROM deliveries d
       WHERE d.status IN ('accepted', 'in_progress') ${clause}
-      ORDER BY d.created_at DESC
+      ORDER BY ${orderByCreated}
       LIMIT 20
     `, args);
 
     const completedResult = await pool.query(`
-      SELECT d.delivery_id, d.route_id, d.status, d.driver_name, d.vehicle_type, d.departure_time, d.arrival_time,
-             d.from_location, d.to_location, d.distance_km, d.estimated_fuel_consumption_liters, d.fuel_consumption,
-             d.estimated_carbon_kg, d.carbon_emissions, d.stops_json, d.delivery_items_json, d.completed_at
+      SELECT ${col("delivery_id", "NULL")}, ${col("route_id", "NULL")}, ${col("status", "NULL")}, ${col("driver_name", "NULL")}, ${col("vehicle_type", "NULL")}, ${col("departure_time", "NULL")}, ${col("arrival_time", "NULL")},
+             ${col("from_location", "NULL")}, ${col("to_location", "NULL")}, ${col("distance_km", "0")}, ${col("estimated_fuel_consumption_liters", "0")}, ${col("fuel_consumption", "0")},
+             ${col("estimated_carbon_kg", "0")}, ${col("carbon_emissions", "0")}, ${stopsJsonSelect}, ${itemsJsonSelect}, ${col("completed_at", "NULL")}
       FROM deliveries d
       WHERE d.status = 'completed' ${clause}
-      ORDER BY d.completed_at DESC NULLS LAST, d.created_at DESC
+      ORDER BY ${orderByCompleted}
       LIMIT 20
     `, args);
 
@@ -2760,6 +2780,10 @@ app.post("/api/driver/respond-delivery", async (req, res) => {
 app.get("/api/driver/routes", async (req, res) => {
   try {
     const { driver_name } = req.query;
+    const deliveriesColumns = await getTableColumns("deliveries");
+    const driverRoutesOrderBy = deliveriesColumns.has("created_at")
+      ? "d.created_at DESC"
+      : "COALESCE(d.departure_time, d.arrival_time) DESC NULLS LAST";
     let query = `
       SELECT d.*, ra.route_type
       FROM deliveries d
@@ -2771,7 +2795,7 @@ app.get("/api/driver/routes", async (req, res) => {
       params.push(driver_name);
       query += ` AND d.driver_name = $1`;
     }
-    query += ` ORDER BY d.created_at DESC LIMIT 50`;
+    query += ` ORDER BY ${driverRoutesOrderBy} LIMIT 50`;
     let result = await pool.query(query, params);
     let routes = result.rows.map(row => ({
       deliveryId: row.delivery_id,
