@@ -1756,12 +1756,69 @@ app.get("/api/logistics/dashboard", async (req, res) => {
       const currentTs = new Date(route.submittedTime || route.submitted_at || 0).getTime();
       if (currentTs >= existingTs) pendingRouteMap.set(key, route);
     }
-    const pendingRoutes = Array.from(pendingRouteMap.values());
+    let pendingRoutes = Array.from(pendingRouteMap.values());
+
+    // If no pending approvals, surface recent assigned/active/completed delivery routes
+    // so "All Routes" screen still has visible route items.
+    if (pendingRoutes.length === 0) {
+      try {
+        const deliveriesTableCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
+        const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
+        if (hasDeliveries) {
+          const deliveriesColumns = await getTableColumns("deliveries");
+          const updatedExpr = deliveriesColumns.has("updated_at")
+            ? "updated_at"
+            : deliveriesColumns.has("departure_time")
+            ? "departure_time"
+            : deliveriesColumns.has("arrival_time")
+            ? "arrival_time"
+            : "NOW()";
+          const routeIdExpr = deliveriesColumns.has("route_id")
+            ? "COALESCE(route_id::text, delivery_id::text)"
+            : "delivery_id::text";
+          const recentRoutesResult = await pool.query(
+            `SELECT
+               ${routeIdExpr} as route_id,
+               'delivery' as route_type,
+               from_location,
+               to_location,
+               driver_name,
+               vehicle_type,
+               departure_time,
+               COALESCE(distance_km, 0) as original_distance,
+               COALESCE(distance_km, 0) as optimized_distance,
+               COALESCE(estimated_fuel_consumption_liters, 0) as original_fuel,
+               COALESCE(fuel_consumption, estimated_fuel_consumption_liters, 0) as optimized_fuel,
+               COALESCE(estimated_carbon_kg, 0) as original_co2,
+               COALESCE(carbon_emissions, estimated_carbon_kg, 0) as optimized_co2,
+               0::numeric as savings_km,
+               0::numeric as savings_fuel,
+               0::numeric as savings_co2,
+               NULL::text as ai_suggestion,
+               UPPER(COALESCE(status, 'ASSIGNED')) as status,
+               driver_name as submitted_by,
+               ${updatedExpr} as submitted_at
+             FROM deliveries
+             WHERE LOWER(COALESCE(status, '')) IN ('assigned', 'accepted', 'in_progress', 'completed')
+             ORDER BY ${updatedExpr} DESC NULLS LAST
+             LIMIT 20`
+          );
+
+          if (recentRoutesResult.rows.length > 0) {
+            pendingRoutes = await Promise.all(
+              recentRoutesResult.rows.map((row) => buildLogisticsRoutePayload(row, { hasRouteStops }))
+            );
+          }
+        }
+      } catch (recentRoutesErr) {
+        console.warn("Logistics recent routes fallback failed:", recentRoutesErr.message);
+      }
+    }
 
     res.json({
       success: true,
       summary: {
-        pendingApprovals: pendingRoutes.length,
+        pendingApprovals: parseInt(stats.pending_count, 10) || pendingRoutes.length,
         approvedToday: approvedCount,
         declined: declinedCount,
         avgCO2Saved: parseFloat(stats.avg_co2_saved) || 0,
