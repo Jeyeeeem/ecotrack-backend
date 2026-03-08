@@ -3589,19 +3589,22 @@ app.get("/api/driver/pending-deliveries", async (req, res) => {
 app.get("/api/driver/history", async (req, res) => {
   try {
     const { driver_name } = req.query;
-    if (!driver_name) {
-      return res.status(400).json({ success: false, message: "Driver name is required" });
-    }
+    const hasDriverFilter = !!driver_name;
+    const historyParams = hasDriverFilter ? [driver_name] : [];
+    const historyDriverClause = hasDriverFilter
+      ? `AND LOWER(COALESCE(d.driver_name, '')) = LOWER($1)`
+      : ``;
 
     const deliveriesHistory = await pool.query(`
       SELECT d.*, ra.route_type
       FROM deliveries d
       LEFT JOIN route_approvals ra ON d.route_id = ra.id
-      WHERE LOWER(COALESCE(d.driver_name, '')) = LOWER($1)
+      WHERE 1=1
+        ${historyDriverClause}
         AND d.status IN ('completed', 'declined', 'cancelled')
       ORDER BY d.completed_at DESC NULLS LAST, d.arrival_time DESC NULLS LAST, d.created_at DESC
       LIMIT 100
-    `, [driver_name]);
+    `, historyParams);
 
     let history = deliveriesHistory.rows.map(row => ({
       deliveryId: row.delivery_id,
@@ -3627,15 +3630,19 @@ app.get("/api/driver/history", async (req, res) => {
       const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
       const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
       if (hasManagerApprovals) {
+        const managerParams = hasDriverFilter ? [driver_name] : [];
+        const managerDriverClause = hasDriverFilter
+          ? `AND LOWER(COALESCE(ma.driver_name, ma.extra_data->'route'->>'driver_name', '')) = LOWER($1)`
+          : ``;
         const managerHistory = await pool.query(`
           SELECT *
           FROM manager_approvals ma
           WHERE ma.approval_type = 'route_optimization'
-            AND LOWER(COALESCE(ma.driver_name, ma.extra_data->'route'->>'driver_name', '')) = LOWER($1)
+            ${managerDriverClause}
             AND LOWER(COALESCE(ma.status, '')) IN ('approved', 'rejected', 'declined')
           ORDER BY ma.reviewed_at DESC NULLS LAST, ma.decision_date DESC NULLS LAST, ma.created_at DESC
           LIMIT 100
-        `, [driver_name]);
+        `, managerParams);
 
         const num = (...vals) => {
           for (const v of vals) {
