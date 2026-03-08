@@ -1029,6 +1029,40 @@ const normalizeRoutePoint = (point) => {
   return { latitude, longitude };
 };
 
+const buildRoadRoutePath = async (points) => {
+  try {
+    const normalized = (points || [])
+      .map(normalizeRoutePoint)
+      .filter(Boolean)
+      .filter((p, idx, arr) => idx === 0 || p.latitude !== arr[idx - 1].latitude || p.longitude !== arr[idx - 1].longitude);
+
+    if (normalized.length < 2) return normalized;
+    const coordStr = normalized.map((p) => `${p.longitude},${p.latitude}`).join(";");
+    const url = `https://router.project-osrm.org/route/v1/driving/${coordStr}?overview=full&geometries=geojson`;
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3500);
+    const response = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeout);
+    if (!response.ok) return normalized;
+
+    const body = await response.json();
+    const coordinates = body?.routes?.[0]?.geometry?.coordinates;
+    if (!Array.isArray(coordinates) || coordinates.length < 2) return normalized;
+
+    const routed = coordinates
+      .map((coord) => ({
+        latitude: toFiniteNumber(coord?.[1]),
+        longitude: toFiniteNumber(coord?.[0])
+      }))
+      .filter((p) => p.latitude !== 0 || p.longitude !== 0);
+
+    return routed.length >= 2 ? routed : normalized;
+  } catch (error) {
+    return (points || []).map(normalizeRoutePoint).filter(Boolean);
+  }
+};
+
 async function buildLogisticsRoutePayload(row, options = {}) {
   const routeIdFromParams = options.routeIdFromParams ? String(options.routeIdFromParams) : null;
   const hasRouteStops = !!options.hasRouteStops;
@@ -1148,6 +1182,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     routeData.route_path ||
     routeData.routePath;
 
+  const hasDetailedStoredPath = Array.isArray(rawPath) && rawPath.length > 2;
   let routePath = [];
   if (Array.isArray(rawPath)) {
     routePath = rawPath.map(normalizeRoutePoint).filter(Boolean);
@@ -1161,6 +1196,9 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     });
     if (destinationPoint) derivedPath.push(destinationPoint);
     routePath = derivedPath;
+  }
+  if (!hasDetailedStoredPath && routePath.length >= 2) {
+    routePath = await buildRoadRoutePath(routePath);
   }
 
   const originalDistance = toFiniteNumberPreferNonZero(
