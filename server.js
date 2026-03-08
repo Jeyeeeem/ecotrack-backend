@@ -2777,6 +2777,238 @@ app.post("/api/logistics/approve", async (req, res) => {
 // INVENTORY ALERTS ROUTES (Existing)
 // ============================================================
 
+const inventoryPendingStatusPredicate = `
+  (
+    LOWER(COALESCE(ma.status, '')) IN ('pending', 'pending_review', 'pending_admin', 'awaiting_approval', 'submitted', 'in_review')
+    OR LOWER(COALESCE(ma.status, '')) LIKE '%pending%'
+    OR LOWER(COALESCE(ma.status, '')) LIKE '%review%'
+    OR LOWER(COALESCE(ma.status, '')) LIKE '%await%'
+  )
+`;
+
+function normalizeInventoryApprovalStatus(status) {
+  const s = String(status || "").trim().toLowerCase();
+  if (!s) return "pending";
+  if (s.includes("declin") || s.includes("reject")) return "declined";
+  if (s.includes("approv") || s === "resolved" || s === "completed") return "approved";
+  if (s.includes("pending") || s.includes("review") || s.includes("await") || s.includes("submit")) return "pending";
+  return s;
+}
+
+function withKg(quantityValue) {
+  if (quantityValue === null || quantityValue === undefined || quantityValue === "") return "0 kg";
+  const raw = String(quantityValue);
+  return raw.toLowerCase().includes("kg") ? raw : `${raw} kg`;
+}
+
+async function fetchInventoryApprovalsForWeb({ includeHistory = false, limit = 50 } = {}) {
+  const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
+  const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
+  const managerColumns = hasManagerApprovals ? await getManagerApprovalsColumns() : new Set();
+  const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "approval_id";
+  const canUseManagerApprovals =
+    hasManagerApprovals &&
+    managerColumns.has("approval_type") &&
+    managerColumns.has("status");
+
+  const alertTableCheck = await pool.query(`SELECT to_regclass('public.alerts') AS tbl`);
+  const hasAlerts = !!alertTableCheck.rows[0]?.tbl;
+
+  let managerRows = [];
+  if (canUseManagerApprovals) {
+    const hasAlertId = managerColumns.has("alert_id");
+    const statusWhere = includeHistory
+      ? `LOWER(COALESCE(ma.status, '')) IN ('approved', 'resolved', 'declined', 'rejected')`
+      : inventoryPendingStatusPredicate;
+    const decidedAtExpr = managerColumns.has("reviewed_at")
+      ? "ma.reviewed_at"
+      : managerColumns.has("decision_date")
+      ? "ma.decision_date"
+      : "ma.created_at";
+
+    const query = `
+      SELECT
+        ma.${managerPkCol} AS approval_id,
+        ma.status,
+        ma.priority,
+        ma.risk_level,
+        ma.product_name,
+        ma.location,
+        ma.quantity,
+        ma.ai_suggestion,
+        ma.review_notes,
+        ma.manager_comment,
+        ma.submitted_by,
+        ma.created_at,
+        ma.days_left,
+        ${decidedAtExpr} AS decided_at
+        ${hasAlertId && hasAlerts ? ", ma.alert_id, a.alert_type, a.temperature, a.humidity, a.product_name AS alert_product_name, a.risk_level AS alert_risk_level, a.location AS alert_location, a.quantity AS alert_quantity, a.details AS alert_details, a.days_left AS alert_days_left, a.created_at AS alert_created_at, a.updated_at AS alert_updated_at" : ""}
+      FROM manager_approvals ma
+      ${hasAlertId && hasAlerts ? "LEFT JOIN alerts a ON a.id = ma.alert_id" : ""}
+      WHERE ma.approval_type = 'spoilage_action'
+        AND ${statusWhere}
+      ORDER BY COALESCE(${decidedAtExpr}, ma.created_at) DESC NULLS LAST
+      LIMIT $1
+    `;
+    const result = await pool.query(query, [limit]);
+    managerRows = result.rows;
+  }
+
+  let approvals = managerRows.map((row) => ({
+    approval_id: parseInt(row.approval_id, 10) || 0,
+    id: parseInt(row.approval_id, 10) || 0,
+    approval_type: "spoilage_action",
+    status: normalizeInventoryApprovalStatus(row.status),
+    raw_status: row.status,
+    priority: row.priority || row.risk_level || row.alert_risk_level || "MEDIUM",
+    risk_level: row.risk_level || row.alert_risk_level || "MEDIUM",
+    product_name: row.product_name || row.alert_product_name || "Unknown Product",
+    location: row.location || row.alert_location || "Unknown",
+    quantity: withKg(row.quantity ?? row.alert_quantity),
+    days_left: parseInt(row.days_left ?? row.alert_days_left, 10) || 0,
+    ai_suggestion: row.ai_suggestion || row.alert_details || null,
+    review_notes: row.review_notes || row.manager_comment || null,
+    manager_comment: row.manager_comment || row.review_notes || null,
+    submitted_by: row.submitted_by ? String(row.submitted_by) : "System",
+    submitted_at: row.created_at || row.alert_created_at || null,
+    decided_at: row.decided_at || row.alert_updated_at || row.created_at || null,
+    alert_id: row.alert_id || null,
+    alert_type: row.alert_type || null,
+    temperature: row.temperature ?? null,
+    humidity: row.humidity ?? null
+  }));
+
+  if (hasAlerts) {
+    const linkedAlertIds = new Set(
+      managerRows
+        .map((r) => r.alert_id)
+        .filter((v) => v !== null && v !== undefined)
+        .map((v) => String(v))
+    );
+    const alertStatusWhere = includeHistory
+      ? `LOWER(COALESCE(status, '')) IN ('resolved', 'declined', 'rejected')`
+      : `LOWER(COALESCE(status, '')) = 'active'`;
+    const alertsResult = await pool.query(
+      `
+      SELECT id, product_name, risk_level, location, quantity, details, days_left, status, submitted_by, created_at, updated_at, temperature, humidity, alert_type
+      FROM alerts
+      WHERE ${alertStatusWhere}
+      ORDER BY COALESCE(updated_at, created_at) DESC NULLS LAST
+      LIMIT $1
+    `,
+      [limit]
+    );
+    const alertApprovals = alertsResult.rows
+      .filter((row) => !linkedAlertIds.has(String(row.id)))
+      .map((row) => ({
+        approval_id: parseInt(row.id, 10) || 0,
+        id: parseInt(row.id, 10) || 0,
+        approval_type: "spoilage_action",
+        status: includeHistory ? normalizeInventoryApprovalStatus(row.status) : "pending",
+        raw_status: row.status,
+        priority: row.risk_level || "MEDIUM",
+        risk_level: row.risk_level || "MEDIUM",
+        product_name: row.product_name || "Unknown Product",
+        location: row.location || "Unknown",
+        quantity: withKg(row.quantity),
+        days_left: parseInt(row.days_left, 10) || 0,
+        ai_suggestion: row.details || null,
+        review_notes: null,
+        manager_comment: null,
+        submitted_by: row.submitted_by ? String(row.submitted_by) : "System",
+        submitted_at: row.created_at || null,
+        decided_at: row.updated_at || row.created_at || null,
+        alert_id: row.id,
+        alert_type: row.alert_type || null,
+        temperature: row.temperature ?? null,
+        humidity: row.humidity ?? null
+      }));
+    approvals = [...approvals, ...alertApprovals];
+  }
+
+  approvals = approvals
+    .sort((a, b) => {
+      const bt = new Date((includeHistory ? b.decided_at : b.submitted_at) || 0).getTime();
+      const at = new Date((includeHistory ? a.decided_at : a.submitted_at) || 0).getTime();
+      return bt - at;
+    })
+    .slice(0, limit);
+
+  return approvals;
+}
+
+async function applyInventoryDecisionByApprovalId(approvalId, decision, reviewNotes = "") {
+  const normalizedDecision = String(decision || "").trim().toLowerCase();
+  const isApprove = normalizedDecision === "approve" || normalizedDecision === "approved";
+  const managerStatus = isApprove ? "approved" : "rejected";
+  const alertStatus = isApprove ? "resolved" : "declined";
+
+  const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
+  const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
+  const managerColumns = hasManagerApprovals ? await getManagerApprovalsColumns() : new Set();
+  const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "approval_id";
+  const canUseManagerApprovals =
+    hasManagerApprovals &&
+    managerColumns.has("approval_type") &&
+    managerColumns.has("status");
+
+  let matchedAlertId = null;
+  let managerUpdated = false;
+
+  if (canUseManagerApprovals) {
+    const setClauses = ["status = $1"];
+    const params = [managerStatus];
+    let idx = 2;
+
+    if (managerColumns.has("reviewed_at")) setClauses.push("reviewed_at = NOW()");
+    if (managerColumns.has("decision_date")) setClauses.push("decision_date = NOW()");
+    if (managerColumns.has("review_notes")) {
+      setClauses.push(`review_notes = $${idx}`);
+      params.push(reviewNotes || null);
+      idx++;
+    }
+    if (managerColumns.has("manager_comment")) {
+      setClauses.push(`manager_comment = $${idx}`);
+      params.push(reviewNotes || null);
+      idx++;
+    }
+    if (managerColumns.has("decision_notes")) {
+      setClauses.push(`decision_notes = $${idx}`);
+      params.push(reviewNotes || null);
+      idx++;
+    }
+    if (managerColumns.has("decision")) {
+      setClauses.push(`decision = $${idx}`);
+      params.push(managerStatus);
+      idx++;
+    }
+
+    params.push(String(approvalId));
+    const returningCols = [`${managerPkCol} AS approval_id`];
+    if (managerColumns.has("alert_id")) returningCols.push("alert_id");
+    const result = await pool.query(
+      `
+      UPDATE manager_approvals
+      SET ${setClauses.join(", ")}
+      WHERE approval_type = 'spoilage_action'
+        AND ${managerPkCol}::text = $${idx}
+      RETURNING ${returningCols.join(", ")}
+    `,
+      params
+    );
+
+    if (result.rowCount > 0) {
+      managerUpdated = true;
+      matchedAlertId = result.rows[0]?.alert_id || null;
+    }
+  }
+
+  const alertId = matchedAlertId || approvalId;
+  await pool.query(`UPDATE alerts SET status = $1, updated_at = NOW() WHERE id::text = $2`, [alertStatus, String(alertId)]);
+
+  return { managerUpdated, managerStatus, alertStatus };
+}
+
 app.get("/api/inventory/dashboard", async (req, res) => {
   try {
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
@@ -3225,6 +3457,64 @@ app.get("/api/inventory/history", async (req, res) => {
       alertType: row.alert_type
     }));
     res.json({ success: true, history: historyItems, message: null });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Database error" });
+  }
+});
+
+// Web parity endpoints used by ecotrackai frontend approvalService/useApprovals
+app.get("/api/approvals/inventory", async (req, res) => {
+  try {
+    const approvals = await fetchInventoryApprovalsForWeb({ includeHistory: false, limit: 100 });
+    res.json({ success: true, approvals, data: { approvals }, message: null });
+  } catch (err) {
+    res.status(500).json({ success: false, approvals: [], message: "Database error" });
+  }
+});
+
+app.get("/api/approvals/history", async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const role = String(req.query.role || "").toLowerCase();
+    let history = [];
+    if (!role || role === "inventory_manager") {
+      history = await fetchInventoryApprovalsForWeb({ includeHistory: true, limit });
+    }
+    res.json({ success: true, history, data: { history }, message: null });
+  } catch (err) {
+    res.status(500).json({ success: false, history: [], message: "Database error" });
+  }
+});
+
+app.get("/api/approvals/pending-count", async (req, res) => {
+  try {
+    const role = String(req.query.role || "inventory_manager").toLowerCase();
+    if (role !== "inventory_manager") {
+      return res.json({ success: true, pending_count: 0, data: { pending_count: 0 }, message: null });
+    }
+    const approvals = await fetchInventoryApprovalsForWeb({ includeHistory: false, limit: 500 });
+    const pending_count = approvals.filter((a) => a.status === "pending").length;
+    res.json({ success: true, pending_count, data: { pending_count }, message: null });
+  } catch (err) {
+    res.status(500).json({ success: false, pending_count: 0, message: "Database error" });
+  }
+});
+
+app.patch("/api/approvals/:id/decision", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const decisionRaw = String(req.body?.decision || "").trim().toLowerCase();
+    const reviewNotes = req.body?.review_notes || req.body?.comment || "";
+    if (!["approved", "declined", "approve", "decline", "rejected"].includes(decisionRaw)) {
+      return res.status(400).json({ success: false, message: "Invalid decision" });
+    }
+    const decision = decisionRaw === "rejected" ? "declined" : decisionRaw;
+    const result = await applyInventoryDecisionByApprovalId(id, decision, reviewNotes);
+    res.json({
+      success: true,
+      message: `Decision ${decision} recorded`,
+      data: { approval_id: id, status: result.managerUpdated ? result.managerStatus : result.alertStatus }
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: "Database error" });
   }
