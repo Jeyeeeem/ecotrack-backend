@@ -940,6 +940,48 @@ app.get("/api/logistics/dashboard", async (req, res) => {
         FROM manager_approvals
         WHERE approval_type = 'route_optimization'`
       );
+
+      // Fallback: some deployments have manager_approvals table but logistics rows only exist in route_approvals.
+      if (pendingResult.rows.length === 0 && hasRouteApprovals) {
+        pendingResult = await pool.query(
+          `SELECT 
+            ra.id as route_id, 
+            ra.route_type, 
+            ra.from_location, 
+            ra.to_location, 
+            ra.driver_name, 
+            ra.vehicle_type,
+            ra.departure_time, 
+            ra.original_distance, 
+            ra.optimized_distance, 
+            ra.original_fuel, 
+            ra.optimized_fuel, 
+            ra.original_co2, 
+            ra.optimized_co2, 
+            ra.savings_km, 
+            ra.savings_fuel, 
+            ra.savings_co2,
+            ra.ai_suggestion, 
+            ra.status, 
+            ra.submitted_by, 
+            ra.submitted_at
+          FROM route_approvals ra 
+          WHERE UPPER(status) IN ('PENDING', 'AWAITING_APPROVAL')
+          ORDER BY submitted_at DESC 
+          LIMIT 20`
+        );
+
+        statsResult = await pool.query(
+          `SELECT 
+            (SELECT COUNT(*) FROM route_approvals WHERE UPPER(status) IN ('PENDING', 'AWAITING_APPROVAL')) as pending_count,
+            (SELECT COUNT(*) FROM route_approvals WHERE status = 'APPROVED') as approved_count,
+            (SELECT COUNT(*) FROM route_approvals WHERE status = 'DECLINED') as declined_count,
+            COALESCE(AVG(savings_co2), 0) FILTER (WHERE status = 'APPROVED') as avg_co2_saved,
+            COALESCE(SUM(savings_co2), 0) FILTER (WHERE status = 'APPROVED') as total_co2_reduced,
+            COALESCE(SUM(savings_km), 0) FILTER (WHERE status = 'APPROVED') as total_km_saved
+          FROM route_approvals`
+        );
+      }
     } else if (hasRouteApprovals) {
       pendingResult = await pool.query(
         `SELECT 
@@ -1130,6 +1172,18 @@ app.get("/api/logistics/pending", async (req, res) => {
         WHERE ma.approval_type = 'route_optimization' AND LOWER(ma.status) IN ('pending', 'awaiting_approval')
         ORDER BY ma.created_at DESC
       `);
+
+      // Fallback to route_approvals when manager_approvals has no logistics records.
+      if (result.rows.length === 0 && hasRouteApprovals) {
+        result = await pool.query(`
+          SELECT id, route_type as product_name, from_location as location, driver_name, vehicle_type, departure_time, 
+                 original_distance as total_distance_km, optimized_distance, original_fuel as estimated_fuel_consumption_liters, 
+                 optimized_fuel, original_co2 as estimated_carbon_kg, optimized_co2 as optimized_carbon_kg, 
+                 savings_km, savings_fuel, savings_co2, ai_suggestion as ai_recommendation, status, 
+                 submitted_by, submitted_at as created_at 
+          FROM route_approvals WHERE UPPER(status) IN ('PENDING', 'AWAITING_APPROVAL') ORDER BY submitted_at DESC
+        `);
+      }
     } else if (hasRouteApprovals) {
       result = await pool.query(`
         SELECT id, route_type as product_name, from_location as location, driver_name, vehicle_type, departure_time, 
@@ -1176,7 +1230,7 @@ app.get("/api/logistics/stats", async (req, res) => {
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
-    const result = hasManagerApprovals
+    let result = hasManagerApprovals
       ? await pool.query(`
           SELECT COUNT(*) FILTER (WHERE LOWER(status) IN ('pending', 'awaiting_approval')) as pending_count, 
                  COUNT(*) FILTER (WHERE LOWER(status) = 'approved') as approved_count, 
@@ -1201,6 +1255,23 @@ app.get("/api/logistics/stats", async (req, res) => {
           FROM manager_approvals
           WHERE approval_type = 'route_optimization'
         `);
+
+    if (hasManagerApprovals && hasRouteApprovals) {
+      const counts = result.rows[0] || {};
+      const managerTotal =
+        (parseInt(counts.pending_count, 10) || 0) +
+        (parseInt(counts.approved_count, 10) || 0) +
+        (parseInt(counts.declined_count, 10) || 0);
+      if (managerTotal === 0) {
+        result = await pool.query(`
+          SELECT COUNT(*) FILTER (WHERE UPPER(status) IN ('PENDING', 'AWAITING_APPROVAL')) as pending_count, 
+                 COUNT(*) FILTER (WHERE UPPER(status) = 'APPROVED') as approved_count, 
+                 COUNT(*) FILTER (WHERE UPPER(status) = 'DECLINED') as declined_count, 
+                 COALESCE(AVG(savings_co2), 0) FILTER (WHERE UPPER(status) = 'APPROVED') as avg_co2_saved 
+          FROM route_approvals
+        `);
+      }
+    }
     res.json({ success: true, data: result.rows[0], message: null });
   } catch (err) { res.json({ success: true, data: { pending_count: 0, approved_count: 0, declined_count: 0, avg_co2_saved: 0 }, message: "Logistics stats unavailable" }); }
 });
@@ -1368,7 +1439,7 @@ app.get("/api/logistics/history", async (req, res) => {
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
-    const result = hasManagerApprovals
+    let result = hasManagerApprovals
       ? await pool.query(`
           SELECT
             ma.id as approval_id,
@@ -1411,6 +1482,14 @@ app.get("/api/logistics/history", async (req, res) => {
           ORDER BY ma.reviewed_at DESC NULLS LAST, ma.updated_at DESC
           LIMIT 100
         `);
+
+    if (hasManagerApprovals && hasRouteApprovals && result.rows.length === 0) {
+      result = await pool.query(`
+        SELECT id as approval_id, id as route_id, route_type as product_name, from_location as location, driver_name, 
+               status, savings_km, savings_co2, approved_at as reviewed_at, manager_comment as review_notes 
+        FROM route_approvals WHERE status IN ('APPROVED', 'DECLINED', 'REJECTED') ORDER BY approved_at DESC LIMIT 100
+      `);
+    }
     res.json({ success: true, data: result.rows, message: null });
   } catch (err) { res.json({ success: true, data: [], message: "History unavailable" }); }
 });
