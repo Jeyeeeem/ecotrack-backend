@@ -1000,6 +1000,35 @@ const extractSavingsFromText = (text) => {
   };
 };
 
+const extractLatLng = (...values) => {
+  for (const value of values) {
+    if (value == null) continue;
+    if (typeof value === "object") {
+      const lat = toFiniteNumber(
+        value.latitude,
+        value.lat,
+        value.y
+      );
+      const lng = toFiniteNumber(
+        value.longitude,
+        value.lng,
+        value.lon,
+        value.x
+      );
+      if (lat !== 0 || lng !== 0) return { latitude: lat, longitude: lng };
+    }
+  }
+  return null;
+};
+
+const normalizeRoutePoint = (point) => {
+  if (!point || typeof point !== "object") return null;
+  const latitude = toFiniteNumber(point.latitude, point.lat, point.y);
+  const longitude = toFiniteNumber(point.longitude, point.lng, point.lon, point.x);
+  if (latitude === 0 && longitude === 0) return null;
+  return { latitude, longitude };
+};
+
 async function buildLogisticsRoutePayload(row, options = {}) {
   const routeIdFromParams = options.routeIdFromParams ? String(options.routeIdFromParams) : null;
   const hasRouteStops = !!options.hasRouteStops;
@@ -1033,24 +1062,55 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     routeData.destination_location?.address ||
     null;
 
+  const originPoint = extractLatLng(
+    row.origin_location,
+    requestData.origin_location,
+    routeData.origin_location,
+    requestData.origin,
+    routeData.origin
+  );
+  const destinationPoint = extractLatLng(
+    row.destination_location,
+    requestData.destination_location,
+    routeData.destination_location,
+    requestData.destination,
+    routeData.destination
+  );
+
   let stops = [];
   if (Array.isArray(row.stops_json) && row.stops_json.length > 0) {
-    stops = row.stops_json.map(normalizeLogisticsStop);
+    stops = row.stops_json.map((stop, index) => {
+      const base = normalizeLogisticsStop(stop, index);
+      const point = extractLatLng(stop);
+      return point ? { ...base, latitude: point.latitude, longitude: point.longitude } : base;
+    });
   } else if (Array.isArray(requestData.stops) && requestData.stops.length > 0) {
-    stops = requestData.stops.map(normalizeLogisticsStop);
+    stops = requestData.stops.map((stop, index) => {
+      const base = normalizeLogisticsStop(stop, index);
+      const point = extractLatLng(stop);
+      return point ? { ...base, latitude: point.latitude, longitude: point.longitude } : base;
+    });
   } else if (Array.isArray(routeData.stops) && routeData.stops.length > 0) {
-    stops = routeData.stops.map(normalizeLogisticsStop);
+    stops = routeData.stops.map((stop, index) => {
+      const base = normalizeLogisticsStop(stop, index);
+      const point = extractLatLng(stop);
+      return point ? { ...base, latitude: point.latitude, longitude: point.longitude } : base;
+    });
   } else if (hasRouteStops && routeId) {
     try {
       const stopsResult = await pool.query(
-        `SELECT stop_sequence, location_name, address
+        `SELECT stop_sequence, location_name, address, latitude, longitude
          FROM route_stops
          WHERE route_id::text = $1
          ORDER BY stop_sequence ASC`,
         [routeId]
       );
       if (stopsResult.rows.length > 0) {
-        stops = stopsResult.rows.map(normalizeLogisticsStop);
+        stops = stopsResult.rows.map((stop, index) => {
+          const base = normalizeLogisticsStop(stop, index);
+          const point = extractLatLng(stop);
+          return point ? { ...base, latitude: point.latitude, longitude: point.longitude } : base;
+        });
       }
     } catch (e) {
       // Ignore route stop lookup failures and keep fallback stops below.
@@ -1058,8 +1118,49 @@ async function buildLogisticsRoutePayload(row, options = {}) {
   }
 
   if (stops.length === 0) {
-    stops = [normalizeLogisticsStop({ stop_name: fromLocation, address: fromLocation }, 0)];
-    if (toLocation) stops.push(normalizeLogisticsStop({ stop_name: toLocation, address: toLocation }, 1));
+    const originFallback = normalizeLogisticsStop({ stop_name: fromLocation, address: fromLocation }, 0);
+    stops = [
+      originPoint
+        ? { ...originFallback, latitude: originPoint.latitude, longitude: originPoint.longitude }
+        : originFallback
+    ];
+    if (toLocation) {
+      const destinationFallback = normalizeLogisticsStop({ stop_name: toLocation, address: toLocation }, 1);
+      stops.push(
+        destinationPoint
+          ? { ...destinationFallback, latitude: destinationPoint.latitude, longitude: destinationPoint.longitude }
+          : destinationFallback
+      );
+    }
+  }
+
+  const rawPath =
+    optimizationData.routePath ||
+    optimizationData.route_path ||
+    optimization.route_path ||
+    optimization.routePath ||
+    requestOptimizationData.routePath ||
+    requestOptimizationData.route_path ||
+    requestOptimization.route_path ||
+    requestOptimization.routePath ||
+    requestData.route_path ||
+    requestData.routePath ||
+    routeData.route_path ||
+    routeData.routePath;
+
+  let routePath = [];
+  if (Array.isArray(rawPath)) {
+    routePath = rawPath.map(normalizeRoutePoint).filter(Boolean);
+  }
+  if (routePath.length === 0) {
+    const derivedPath = [];
+    if (originPoint) derivedPath.push(originPoint);
+    stops.forEach((stop) => {
+      const p = extractLatLng(stop);
+      if (p) derivedPath.push(p);
+    });
+    if (destinationPoint) derivedPath.push(destinationPoint);
+    routePath = derivedPath;
   }
 
   const originalDistance = toFiniteNumberPreferNonZero(
@@ -1292,9 +1393,19 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     routeType: row.route_type || requestData.route_type || routeData.route_type || row.product_name || "STANDARD",
     from_location: fromLocation,
     from: fromLocation,
+    origin_latitude: originPoint?.latitude ?? null,
+    origin_longitude: originPoint?.longitude ?? null,
+    originLatitude: originPoint?.latitude ?? null,
+    originLongitude: originPoint?.longitude ?? null,
     to_location: toLocation,
     to: toLocation,
+    destination_latitude: destinationPoint?.latitude ?? null,
+    destination_longitude: destinationPoint?.longitude ?? null,
+    destinationLatitude: destinationPoint?.latitude ?? null,
+    destinationLongitude: destinationPoint?.longitude ?? null,
     stops,
+    route_path: routePath,
+    routePath: routePath,
     driver_name: row.driver_name || requestData.driver_name || routeData.driver_name || "Unassigned",
     driver: row.driver_name || requestData.driver_name || routeData.driver_name || "Unassigned",
     vehicle_type: row.vehicle_type || requestData.vehicle_type || routeData.vehicle_type || "Van",
