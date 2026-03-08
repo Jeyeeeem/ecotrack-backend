@@ -955,6 +955,17 @@ const toFiniteNumber = (...values) => {
   return 0;
 };
 
+const toFiniteNumberPreferNonZero = (...values) => {
+  let fallback = null;
+  for (const value of values) {
+    const n = Number(value);
+    if (Number.isNaN(n) || !Number.isFinite(n)) continue;
+    if (n !== 0) return n;
+    if (fallback === null) fallback = n;
+  }
+  return fallback === null ? 0 : fallback;
+};
+
 const normalizeLogisticsStop = (stop, index) => {
   const name = stop?.stop_name || stop?.stopName || stop?.location_name || stop?.location || stop?.name || `Stop ${index + 1}`;
   const address = stop?.address || stop?.location || stop?.full_address || "";
@@ -1051,7 +1062,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     if (toLocation) stops.push(normalizeLogisticsStop({ stop_name: toLocation, address: toLocation }, 1));
   }
 
-  const originalDistance = toFiniteNumber(
+  const originalDistance = toFiniteNumberPreferNonZero(
     row.original_distance,
     row.total_distance_km,
     requestData.original_distance,
@@ -1073,7 +1084,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     extraOptimizationData.original_distance,
     extraOptimizationData.original_distance_km
   );
-  const optimizedDistance = toFiniteNumber(
+  const optimizedDistance = toFiniteNumberPreferNonZero(
     row.optimized_distance,
     requestData.optimized_distance,
     requestData.optimized_distance_km,
@@ -1093,7 +1104,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     extraOptimizationData.optimized_distance,
     extraOptimizationData.optimized_distance_km
   );
-  const originalFuel = toFiniteNumber(
+  const originalFuel = toFiniteNumberPreferNonZero(
     row.original_fuel,
     row.estimated_fuel_consumption_liters,
     requestData.original_fuel,
@@ -1115,7 +1126,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     extraOptimizationData.original_fuel,
     extraOptimizationData.original_fuel_liters
   );
-  const optimizedFuel = toFiniteNumber(
+  const optimizedFuel = toFiniteNumberPreferNonZero(
     row.optimized_fuel,
     requestData.optimized_fuel,
     requestData.optimized_fuel_liters,
@@ -1135,7 +1146,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     extraOptimizationData.optimized_fuel,
     extraOptimizationData.optimized_fuel_liters
   );
-  const originalCO2 = toFiniteNumber(
+  const originalCO2 = toFiniteNumberPreferNonZero(
     row.original_co2,
     row.estimated_carbon_kg,
     requestData.original_co2,
@@ -1158,7 +1169,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     extraOptimizationData.original_co2,
     extraOptimizationData.original_co2_kg
   );
-  const optimizedCO2 = toFiniteNumber(
+  const optimizedCO2 = toFiniteNumberPreferNonZero(
     row.optimized_co2,
     row.optimized_carbon_kg,
     requestData.optimized_co2,
@@ -1190,7 +1201,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     optimizationData.aiRecommendation ||
     "Optimize this route";
   const textSavings = extractSavingsFromText(aiSuggestion);
-  const totalSavingsKm = toFiniteNumber(
+  const totalSavingsKm = toFiniteNumberPreferNonZero(
     row.savings_km,
     row.distance_saved_km,
     requestData.savings_km,
@@ -1212,7 +1223,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     extraOptimizationData.distance_saved_km,
     textSavings.km
   );
-  const totalSavingsFuel = toFiniteNumber(
+  const totalSavingsFuel = toFiniteNumberPreferNonZero(
     row.savings_fuel,
     row.fuel_saved,
     row.fuel_saved_liters,
@@ -1242,7 +1253,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     extraOptimizationData.fuel_saved_liters,
     textSavings.fuel
   );
-  const totalSavingsCO2 = toFiniteNumber(
+  const totalSavingsCO2 = toFiniteNumberPreferNonZero(
     row.savings_co2,
     row.co2_saved,
     row.co2_saved_kg,
