@@ -1646,6 +1646,53 @@ app.get("/api/logistics/dashboard", async (req, res) => {
       };
     }
 
+    // Route approvals are the source-of-truth for logistics dashboard counters/history flow.
+    if (hasRouteApprovals) {
+      const routePendingResult = await pool.query(
+        `SELECT 
+          ra.id as route_id, 
+          ra.route_type, 
+          ra.from_location, 
+          ra.to_location, 
+          ra.driver_name, 
+          ra.vehicle_type,
+          ra.departure_time, 
+          ra.original_distance, 
+          ra.optimized_distance, 
+          ra.original_fuel, 
+          ra.optimized_fuel, 
+          ra.original_co2, 
+          ra.optimized_co2, 
+          ra.savings_km, 
+          ra.savings_fuel, 
+          ra.savings_co2,
+          ra.ai_suggestion, 
+          ra.status, 
+          ra.submitted_by, 
+          ra.submitted_at
+        FROM route_approvals ra 
+        WHERE ${pendingRouteStatusPredicate}
+        ORDER BY submitted_at DESC 
+        LIMIT 20`
+      );
+
+      const routeStatsResult = await pool.query(
+        `SELECT 
+          (SELECT COUNT(*) FROM route_approvals WHERE ${pendingRouteStatusPredicate}) as pending_count,
+          (SELECT COUNT(*) FROM route_approvals WHERE UPPER(COALESCE(status, '')) = 'APPROVED') as approved_count,
+          (SELECT COUNT(*) FROM route_approvals WHERE UPPER(COALESCE(status, '')) = 'DECLINED') as declined_count,
+          COALESCE(AVG(savings_co2) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as avg_co2_saved,
+          COALESCE(SUM(savings_co2) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as total_co2_reduced,
+          COALESCE(SUM(savings_km) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as total_km_saved
+        FROM route_approvals`
+      );
+
+      statsResult = routeStatsResult;
+      if (routePendingResult.rows.length > 0 || !canUseManagerRouteData) {
+        pendingResult = routePendingResult;
+      }
+    }
+
     let driversResult = { rows: [] };
     try {
       driversResult = await pool.query(
@@ -1997,7 +2044,15 @@ app.get("/api/logistics/stats", async (req, res) => {
       hasManagerApprovals &&
       managerColumns.has("approval_type") &&
       managerColumns.has("status");
-    let result = canUseManagerStats
+    let result = hasRouteApprovals
+      ? await pool.query(`
+          SELECT COUNT(*) FILTER (WHERE ${pendingRouteStatusPredicate}) as pending_count, 
+                 COUNT(*) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED') as approved_count, 
+                 COUNT(*) FILTER (WHERE UPPER(COALESCE(status, '')) = 'DECLINED') as declined_count, 
+                 COALESCE(AVG(savings_co2) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as avg_co2_saved 
+          FROM route_approvals
+        `)
+      : canUseManagerStats
       ? await pool.query(`
           SELECT COUNT(*) FILTER (WHERE LOWER(status) IN ('pending', 'awaiting_approval')) as pending_count, 
                  COUNT(*) FILTER (WHERE LOWER(status) = 'approved') as approved_count, 
@@ -2005,14 +2060,6 @@ app.get("/api/logistics/stats", async (req, res) => {
                  0::numeric as avg_co2_saved
           FROM manager_approvals
           WHERE approval_type = 'route_optimization'
-        `)
-      : hasRouteApprovals
-      ? await pool.query(`
-          SELECT COUNT(*) FILTER (WHERE ${pendingRouteStatusPredicate}) as pending_count, 
-                 COUNT(*) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED') as approved_count, 
-                 COUNT(*) FILTER (WHERE UPPER(COALESCE(status, '')) = 'DECLINED') as declined_count, 
-                 COALESCE(AVG(savings_co2) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as avg_co2_saved 
-          FROM route_approvals
         `)
       : await pool.query(`
           SELECT COUNT(*) FILTER (WHERE status = 'pending') as pending_count, 
@@ -2023,19 +2070,20 @@ app.get("/api/logistics/stats", async (req, res) => {
           WHERE approval_type = 'route_optimization'
         `);
 
-    if (canUseManagerStats && hasRouteApprovals) {
+    if (hasRouteApprovals && canUseManagerStats) {
       const counts = result.rows[0] || {};
-      const managerTotal =
+      const routeTotal =
         (parseInt(counts.pending_count, 10) || 0) +
         (parseInt(counts.approved_count, 10) || 0) +
         (parseInt(counts.declined_count, 10) || 0);
-      if (managerTotal === 0) {
+      if (routeTotal === 0) {
         result = await pool.query(`
-          SELECT COUNT(*) FILTER (WHERE ${pendingRouteStatusPredicate}) as pending_count, 
-                 COUNT(*) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED') as approved_count, 
-                 COUNT(*) FILTER (WHERE UPPER(COALESCE(status, '')) = 'DECLINED') as declined_count, 
-                 COALESCE(AVG(savings_co2) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as avg_co2_saved 
-          FROM route_approvals
+          SELECT COUNT(*) FILTER (WHERE LOWER(status) IN ('pending', 'awaiting_approval')) as pending_count, 
+                 COUNT(*) FILTER (WHERE LOWER(status) = 'approved') as approved_count, 
+                 COUNT(*) FILTER (WHERE LOWER(status) IN ('declined', 'rejected')) as declined_count, 
+                 0::numeric as avg_co2_saved
+          FROM manager_approvals
+          WHERE approval_type = 'route_optimization'
         `);
       }
     }
@@ -2225,7 +2273,16 @@ app.get("/api/logistics/history", async (req, res) => {
     const managerHistoryOrderBy = managerColumns.has("updated_at")
       ? "ma.reviewed_at DESC NULLS LAST, ma.updated_at DESC"
       : "ma.reviewed_at DESC NULLS LAST, ma.created_at DESC NULLS LAST";
-    let result = canUseManagerRouteData
+    let result = hasRouteApprovals
+      ? await pool.query(`
+          SELECT id as approval_id, id as route_id, route_type as product_name, from_location as location, driver_name, 
+                 status, savings_km, savings_co2, approved_at as reviewed_at, manager_comment as review_notes 
+          FROM route_approvals
+          WHERE LOWER(COALESCE(status, '')) IN ('approved', 'declined', 'rejected')
+          ORDER BY approved_at DESC NULLS LAST, submitted_at DESC NULLS LAST
+          LIMIT 100
+        `)
+      : canUseManagerRouteData
       ? await pool.query(`
           SELECT
             ma.${managerPkCol} as approval_id,
@@ -2244,19 +2301,37 @@ app.get("/api/logistics/history", async (req, res) => {
           ORDER BY ${managerHistoryOrderBy}
           LIMIT 100
         `)
-      : hasRouteApprovals
-      ? await pool.query(`
-          SELECT id as approval_id, id as route_id, route_type as product_name, from_location as location, driver_name, 
-                 status, savings_km, savings_co2, approved_at as reviewed_at, manager_comment as review_notes 
-          FROM route_approvals WHERE status IN ('APPROVED', 'DECLINED', 'REJECTED') ORDER BY approved_at DESC LIMIT 100
-        `)
       : { rows: [] };
+
+    if (canUseManagerRouteData && result.rows.length === 0) {
+      result = await pool.query(`
+        SELECT
+          ma.${managerPkCol} as approval_id,
+          ${managerRouteRefExpr} as route_id,
+          COALESCE(ma.request_data->>'route_type', 'STANDARD') as product_name,
+          COALESCE(ma.request_data->>'from_location', 'Unknown') as location,
+          ma.request_data->>'driver_name' as driver_name,
+          UPPER(ma.status) as status,
+          COALESCE((ma.request_data->>'savings_km')::numeric, 0) as savings_km,
+          COALESCE((ma.request_data->>'savings_co2')::numeric, 0) as savings_co2,
+          ma.reviewed_at as reviewed_at,
+          COALESCE(ma.manager_comment, ma.decision_notes) as review_notes
+        FROM manager_approvals ma
+        WHERE ma.approval_type = 'route_optimization'
+          AND LOWER(ma.status) IN ('approved', 'declined', 'rejected')
+        ORDER BY ${managerHistoryOrderBy}
+        LIMIT 100
+      `);
+    }
 
     if (hasRouteApprovals && result.rows.length === 0) {
       result = await pool.query(`
         SELECT id as approval_id, id as route_id, route_type as product_name, from_location as location, driver_name, 
                status, savings_km, savings_co2, approved_at as reviewed_at, manager_comment as review_notes 
-        FROM route_approvals WHERE status IN ('APPROVED', 'DECLINED', 'REJECTED') ORDER BY approved_at DESC LIMIT 100
+        FROM route_approvals
+        WHERE LOWER(COALESCE(status, '')) IN ('approved', 'declined', 'rejected')
+        ORDER BY approved_at DESC NULLS LAST, submitted_at DESC NULLS LAST
+        LIMIT 100
       `);
     }
     res.json({ success: true, data: result.rows, message: null });
