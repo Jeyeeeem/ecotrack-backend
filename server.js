@@ -2261,6 +2261,8 @@ app.post("/api/logistics/approve", async (req, res) => {
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
     const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
+    const managerColumns = hasManagerApprovals ? await getManagerApprovalsColumns() : new Set();
+    const managerUpdatedAtClause = managerColumns.has("updated_at") ? ", updated_at = NOW()" : "";
     const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
     let managerApprovalRow = null;
@@ -2270,7 +2272,7 @@ app.post("/api/logistics/approve", async (req, res) => {
     if (hasManagerApprovals) {
       const maResult = await pool.query(
         `UPDATE manager_approvals
-         SET status = LOWER($1), manager_comment = $2, decision_notes = $2, reviewed_at = NOW(), updated_at = NOW()
+         SET status = LOWER($1), manager_comment = $2, decision_notes = $2, reviewed_at = NOW()${managerUpdatedAtClause}
          WHERE ${managerPkCol} = $3 AND approval_type = 'route_optimization'
          RETURNING *`,
         [status, comment || '', routeId]
@@ -2294,7 +2296,7 @@ app.post("/api/logistics/approve", async (req, res) => {
     } else {
       await pool.query(
         `UPDATE manager_approvals
-         SET status = LOWER($1), manager_comment = $2, decision_notes = $2, reviewed_at = NOW(), updated_at = NOW()
+         SET status = LOWER($1), manager_comment = $2, decision_notes = $2, reviewed_at = NOW()${managerUpdatedAtClause}
          WHERE ${managerPkCol} = $3`,
         [status, comment || '', routeId]
       );
