@@ -1503,7 +1503,7 @@ app.get("/api/logistics/dashboard", async (req, res) => {
         OR (
           approved_at IS NULL
           AND UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g'))
-              NOT IN ('APPROVED', 'DECLINED', 'REJECTED', 'CANCELLED', 'COMPLETED')
+              NOT IN ('APPROVED', 'DECLINED', 'REJECTED', 'CANCELLED', 'COMPLETED', 'SUPERSEDED')
         )
       )
     `;
@@ -1717,6 +1717,67 @@ app.get("/api/logistics/dashboard", async (req, res) => {
   }
 });
 
+app.post("/api/logistics/admin/cleanup-pending-duplicates", authenticate, authorize("admin"), async (req, res) => {
+  try {
+    const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
+    const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
+    if (!hasManagerApprovals) {
+      return res.json({ success: true, updated: 0, message: "manager_approvals table not found" });
+    }
+
+    const managerColumns = await getManagerApprovalsColumns();
+    if (!managerColumns.has("approval_type") || !managerColumns.has("status")) {
+      return res.json({ success: true, updated: 0, message: "Required columns missing in manager_approvals" });
+    }
+
+    const managerPkCol = await getManagerApprovalsPkColumn();
+    const keyColumns = ["route_id", "related_record_id", "delivery_id"]
+      .filter((column) => managerColumns.has(column));
+    const routeKeyExpr = keyColumns.length > 0
+      ? `COALESCE(${keyColumns.map((column) => `${column}::text`).join(", ")})`
+      : `${managerPkCol}::text`;
+    const orderExpr = managerColumns.has("created_at")
+      ? `created_at DESC NULLS LAST, ${managerPkCol} DESC`
+      : `${managerPkCol} DESC`;
+
+    const result = await pool.query(`
+      WITH ranked AS (
+        SELECT ${managerPkCol} AS pk,
+               ROW_NUMBER() OVER (
+                 PARTITION BY ${routeKeyExpr}
+                 ORDER BY ${orderExpr}
+               ) AS rn
+        FROM manager_approvals
+        WHERE approval_type = 'route_optimization'
+          AND (
+            LOWER(COALESCE(status, '')) IN ('pending', 'awaiting_approval', 'submitted', 'in_review', 'for_approval')
+            OR LOWER(COALESCE(status, '')) LIKE '%pending%'
+            OR LOWER(COALESCE(status, '')) LIKE '%await%'
+            OR LOWER(COALESCE(status, '')) LIKE '%review%'
+            OR LOWER(COALESCE(status, '')) LIKE '%submit%'
+          )
+      )
+      UPDATE manager_approvals ma
+      SET status = 'superseded',
+          manager_comment = COALESCE(ma.manager_comment, 'Superseded duplicate pending approval'),
+          updated_at = NOW()
+      FROM ranked r
+      WHERE ma.${managerPkCol} = r.pk
+        AND r.rn > 1
+      RETURNING ma.${managerPkCol} AS approval_id
+    `);
+
+    return res.json({
+      success: true,
+      updated: result.rowCount || 0,
+      message: `Superseded ${result.rowCount || 0} duplicate pending approvals`
+    });
+  } catch (err) {
+    console.error("cleanup-pending-duplicates error:", err);
+    return res.status(500).json({ success: false, message: err.message || "Cleanup failed" });
+  }
+});
+
 app.get("/api/logistics/route/:routeId", async (req, res) => {
   try {
     const { routeId } = req.params;
@@ -1804,7 +1865,7 @@ app.get("/api/logistics/pending", async (req, res) => {
         OR (
           approved_at IS NULL
           AND UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g'))
-              NOT IN ('APPROVED', 'DECLINED', 'REJECTED', 'CANCELLED', 'COMPLETED')
+              NOT IN ('APPROVED', 'DECLINED', 'REJECTED', 'CANCELLED', 'COMPLETED', 'SUPERSEDED')
         )
       )
     `;
@@ -1922,7 +1983,7 @@ app.get("/api/logistics/stats", async (req, res) => {
         OR (
           approved_at IS NULL
           AND UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g'))
-              NOT IN ('APPROVED', 'DECLINED', 'REJECTED', 'CANCELLED', 'COMPLETED')
+              NOT IN ('APPROVED', 'DECLINED', 'REJECTED', 'CANCELLED', 'COMPLETED', 'SUPERSEDED')
         )
       )
     `;

@@ -9,6 +9,36 @@ const router = express.Router();
 const pool = require("../database");
 const { authenticate, authorize } = require("../middleware/auth");
 
+const routePendingStatusWhere = `(
+  LOWER(COALESCE(status, '')) IN ('pending', 'awaiting_approval', 'submitted', 'in_review', 'for_approval')
+  OR LOWER(COALESCE(status, '')) LIKE '%pending%'
+  OR LOWER(COALESCE(status, '')) LIKE '%await%'
+  OR LOWER(COALESCE(status, '')) LIKE '%review%'
+  OR LOWER(COALESCE(status, '')) LIKE '%submit%'
+)`;
+
+async function supersedeDuplicatePendingRouteApprovals(routeApprovalId, keepApprovalId = null) {
+  const params = [routeApprovalId];
+  let keepClause = "";
+  if (keepApprovalId) {
+    params.push(keepApprovalId);
+    keepClause = `AND id <> $2`;
+  }
+
+  const result = await pool.query(`
+    UPDATE manager_approvals
+    SET status = 'superseded',
+        manager_comment = COALESCE(manager_comment, 'Superseded duplicate pending approval'),
+        updated_at = NOW()
+    WHERE approval_type = 'route_optimization'
+      AND COALESCE(route_id, related_record_id, delivery_id) = $1
+      AND ${routePendingStatusWhere}
+      ${keepClause}
+  `, params);
+
+  return result.rowCount || 0;
+}
+
 // ============================================================
 // INVENTORY MANAGER WORKFLOW - Spoilage Action Approvals
 // ============================================================
@@ -165,6 +195,28 @@ router.post("/logistics-manager/submit", authenticate, authorize('admin'), async
     }
     
     const route = routeResult.rows[0];
+
+    // Prevent duplicate pending approvals for the same route.
+    const existingPending = await pool.query(`
+      SELECT *
+      FROM manager_approvals
+      WHERE approval_type = 'route_optimization'
+        AND COALESCE(route_id, related_record_id, delivery_id) = $1
+        AND ${routePendingStatusWhere}
+      ORDER BY created_at DESC, id DESC
+    `, [route_approval_id]);
+
+    if (existingPending.rows.length > 0) {
+      const keep = existingPending.rows[0];
+      if (existingPending.rows.length > 1) {
+        await supersedeDuplicatePendingRouteApprovals(route_approval_id, keep.id);
+      }
+      return res.json({
+        success: true,
+        message: "Route already has a pending logistics approval",
+        approval: keep
+      });
+    }
     
     const result = await pool.query(`
       INSERT INTO manager_approvals 
