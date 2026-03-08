@@ -3295,6 +3295,45 @@ app.get("/api/driver/delivery/:id", async (req, res) => {
 
     let stops = [];
     let stopsRows = [];
+    const normalizeStopAddress = (value) => {
+      if (value == null) return "";
+      if (typeof value === "string") return value;
+      if (typeof value === "object") {
+        return String(
+          value.address ||
+          value.full_address ||
+          value.location ||
+          value.name ||
+          ""
+        );
+      }
+      return String(value);
+    };
+    const normalizeStopLatLng = (stop) => {
+      const lat = toFiniteNumber(
+        stop?.latitude,
+        stop?.lat,
+        stop?.address?.latitude,
+        stop?.address?.lat,
+        stop?.location?.latitude,
+        stop?.location?.lat
+      );
+      const lng = toFiniteNumber(
+        stop?.longitude,
+        stop?.lng,
+        stop?.lon,
+        stop?.address?.longitude,
+        stop?.address?.lng,
+        stop?.address?.lon,
+        stop?.location?.longitude,
+        stop?.location?.lng,
+        stop?.location?.lon
+      );
+      return {
+        latitude: lat !== 0 ? lat : null,
+        longitude: lng !== 0 ? lng : null
+      };
+    };
 
     try {
       const routeStopsTableCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
@@ -3338,22 +3377,20 @@ app.get("/api/driver/delivery/:id", async (req, res) => {
 
     if (stopsRows.length > 0) {
       stops = stopsRows.map(stop => ({
+        ...normalizeStopLatLng(stop),
         stopId: stop.stop_sequence,
         sequence: stop.stop_sequence,
         stopName: stop.location_name || `Stop ${stop.stop_sequence}`,
-        address: stop.address || "",
-        latitude: stop.latitude !== null ? parseFloat(stop.latitude) : null,
-        longitude: stop.longitude !== null ? parseFloat(stop.longitude) : null,
+        address: normalizeStopAddress(stop.address || stop.location_name),
         status: stop.status || "pending"
       }));
     } else if (Array.isArray(row.stops_json)) {
       stops = row.stops_json.map((stop, idx) => ({
+        ...normalizeStopLatLng(stop),
         stopId: idx + 1,
         sequence: idx + 1,
         stopName: stop.stopName || stop.location_name || stop.location || `Stop ${idx + 1}`,
-        address: stop.address || stop.location || "",
-        latitude: stop.latitude ?? null,
-        longitude: stop.longitude ?? null,
+        address: normalizeStopAddress(stop.address || stop.location),
         status: stop.status || "pending"
       }));
     } else {
