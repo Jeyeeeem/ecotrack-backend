@@ -2779,85 +2779,352 @@ app.post("/api/logistics/approve", async (req, res) => {
 
 app.get("/api/inventory/dashboard", async (req, res) => {
   try {
+    const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
+    const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
+    const managerColumns = hasManagerApprovals ? await getManagerApprovalsColumns() : new Set();
+    const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "approval_id";
+    const canUseManagerApprovals =
+      hasManagerApprovals &&
+      managerColumns.has("approval_type") &&
+      managerColumns.has("status");
+
+    if (canUseManagerApprovals) {
+      const hasAlertId = managerColumns.has("alert_id");
+      const alertTableCheck = await pool.query(`SELECT to_regclass('public.alerts') AS tbl`);
+      const hasAlerts = !!alertTableCheck.rows[0]?.tbl;
+      const pendingResult = await pool.query(
+        `
+        SELECT
+          ma.${managerPkCol} AS approval_id,
+          ma.status,
+          ma.risk_level,
+          ma.product_name,
+          ma.location,
+          ma.quantity,
+          ma.ai_suggestion,
+          ma.submitted_by,
+          ma.created_at,
+          ma.days_left
+          ${hasAlertId && hasAlerts ? ", ma.alert_id, a.product_name AS alert_product_name, a.risk_level AS alert_risk_level, a.location AS alert_location, a.quantity AS alert_quantity, a.details AS alert_details, a.days_left AS alert_days_left" : ""}
+        FROM manager_approvals ma
+        ${hasAlertId && hasAlerts ? "LEFT JOIN alerts a ON a.id = ma.alert_id" : ""}
+        WHERE ma.approval_type = 'spoilage_action'
+          AND (
+            LOWER(COALESCE(ma.status, '')) IN ('pending', 'pending_review', 'awaiting_approval', 'submitted', 'in_review')
+            OR LOWER(COALESCE(ma.status, '')) LIKE '%pending%'
+            OR LOWER(COALESCE(ma.status, '')) LIKE '%review%'
+            OR LOWER(COALESCE(ma.status, '')) LIKE '%await%'
+          )
+        ORDER BY ma.created_at DESC NULLS LAST
+        LIMIT 20
+      `
+      );
+
+      const statsResult = await pool.query(
+        `
+        SELECT
+          COUNT(*) FILTER (
+            WHERE LOWER(COALESCE(status, '')) IN ('pending', 'pending_review', 'awaiting_approval', 'submitted', 'in_review')
+               OR LOWER(COALESCE(status, '')) LIKE '%pending%'
+               OR LOWER(COALESCE(status, '')) LIKE '%review%'
+               OR LOWER(COALESCE(status, '')) LIKE '%await%'
+          ) AS pending_count,
+          COUNT(*) FILTER (WHERE LOWER(COALESCE(status, '')) IN ('approved', 'resolved')) AS approved_count,
+          COUNT(*) FILTER (WHERE LOWER(COALESCE(status, '')) IN ('declined', 'rejected')) AS declined_count
+        FROM manager_approvals
+        WHERE approval_type = 'spoilage_action'
+      `
+      );
+
+      const pendingItems = pendingResult.rows.map((row) => {
+        const quantityValue = row.quantity ?? row.alert_quantity;
+        const quantityLabel =
+          quantityValue === null || quantityValue === undefined || quantityValue === ""
+            ? "0 kg"
+            : `${quantityValue}${String(quantityValue).toLowerCase().includes("kg") ? "" : " kg"}`;
+
+        return {
+          id: parseInt(row.approval_id, 10) || 0,
+          itemNumber: `#${row.approval_id}`,
+          priority: row.risk_level || row.alert_risk_level || "MEDIUM",
+          productName: row.product_name || row.alert_product_name || "Unknown Product",
+          location: row.location || row.alert_location || "Unknown",
+          quantity: quantityLabel,
+          daysLeft: parseInt(row.days_left ?? row.alert_days_left, 10) || 0,
+          aiSuggestion: row.ai_suggestion || row.alert_details || "Review this item",
+          submittedBy: row.submitted_by ? String(row.submitted_by) : "System"
+        };
+      });
+
+      const riskStats = pendingItems.reduce(
+        (acc, item) => {
+          const level = String(item.priority || "").toUpperCase();
+          if (level === "HIGH") acc.highRisk += 1;
+          else if (level === "MEDIUM") acc.mediumRisk += 1;
+          else acc.lowRisk += 1;
+          return acc;
+        },
+        { highRisk: 0, mediumRisk: 0, lowRisk: 0 }
+      );
+
+      const stats = statsResult.rows[0] || {};
+      return res.json({
+        success: true,
+        summary: {
+          pendingApprovals: parseInt(stats.pending_count, 10) || pendingItems.length,
+          approvedToday: parseInt(stats.approved_count, 10) || 0,
+          declined: parseInt(stats.declined_count, 10) || 0,
+          highRisk: riskStats.highRisk,
+          mediumRisk: riskStats.mediumRisk,
+          lowRisk: riskStats.lowRisk
+        },
+        pendingItems,
+        message: null
+      });
+    }
+
     const pendingResult = await pool.query(`
-      SELECT id, product_id, product_name, alert_type, risk_level, details, days_left, temperature, humidity, 
-             location, quantity, value, status, created_at, submitted_by 
-      FROM alerts WHERE status = 'active' 
+      SELECT id, product_id, product_name, alert_type, risk_level, details, days_left, temperature, humidity,
+             location, quantity, value, status, created_at, submitted_by
+      FROM alerts WHERE status = 'active'
       ORDER BY CASE risk_level WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 3 END, days_left ASC LIMIT 20
     `);
     const statsResult = await pool.query(`
-      SELECT COUNT(*) as total_alerts, 
-             COUNT(*) FILTER (WHERE risk_level = 'HIGH') as high_risk, 
-             COUNT(*) FILTER (WHERE risk_level = 'MEDIUM') as medium_risk, 
-             COUNT(*) FILTER (WHERE risk_level = 'LOW') as low_risk, 
-             COUNT(*) FILTER (WHERE status = 'resolved') as resolved, 
-             COUNT(*) FILTER (WHERE status = 'active') as pending 
+      SELECT COUNT(*) as total_alerts,
+             COUNT(*) FILTER (WHERE risk_level = 'HIGH') as high_risk,
+             COUNT(*) FILTER (WHERE risk_level = 'MEDIUM') as medium_risk,
+             COUNT(*) FILTER (WHERE risk_level = 'LOW') as low_risk,
+             COUNT(*) FILTER (WHERE status = 'resolved') as resolved,
+             COUNT(*) FILTER (WHERE status = 'active') as pending
       FROM alerts
     `);
-    const pendingItems = pendingResult.rows.map(row => ({ 
-      id: row.id, 
-      itemNumber: `#${row.id}`, 
-      priority: row.risk_level || 'MEDIUM', 
-      productName: row.product_name || 'Unknown Product', 
-      location: row.location || 'Unknown', 
-      quantity: row.quantity ? `${row.quantity} kg` : '0 kg', 
-      daysLeft: row.days_left || 0, 
-      aiSuggestion: row.details || 'Review this item', 
-      submittedBy: row.submitted_by || 'System' 
+    const pendingItems = pendingResult.rows.map((row) => ({
+      id: row.id,
+      itemNumber: `#${row.id}`,
+      priority: row.risk_level || "MEDIUM",
+      productName: row.product_name || "Unknown Product",
+      location: row.location || "Unknown",
+      quantity: row.quantity ? `${row.quantity} kg` : "0 kg",
+      daysLeft: row.days_left || 0,
+      aiSuggestion: row.details || "Review this item",
+      submittedBy: row.submitted_by || "System"
     }));
     const stats = statsResult.rows[0] || { total_alerts: 0, high_risk: 0, medium_risk: 0, low_risk: 0, resolved: 0, pending: 0 };
-    res.json({ 
-      success: true, 
-      summary: { 
-        pendingApprovals: parseInt(stats.pending) || 0, 
-        approvedToday: parseInt(stats.resolved) || 0, 
-        declined: 0, 
-        highRisk: parseInt(stats.high_risk) || 0, 
-        mediumRisk: parseInt(stats.medium_risk) || 0, 
-        lowRisk: parseInt(stats.low_risk) || 0 
-      }, 
-      pendingItems: pendingItems, 
-      message: null 
+    res.json({
+      success: true,
+      summary: {
+        pendingApprovals: parseInt(stats.pending, 10) || 0,
+        approvedToday: parseInt(stats.resolved, 10) || 0,
+        declined: 0,
+        highRisk: parseInt(stats.high_risk, 10) || 0,
+        mediumRisk: parseInt(stats.medium_risk, 10) || 0,
+        lowRisk: parseInt(stats.low_risk, 10) || 0
+      },
+      pendingItems,
+      message: null
     });
-  } catch (err) { res.status(500).json({ success: false, message: "Database error" }); }
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Database error" });
+  }
 });
 
 app.post("/api/inventory/approve", async (req, res) => {
   const { itemId, decision, comment } = req.body;
+  if (!itemId || !decision) {
+    return res.status(400).json({ success: false, message: "itemId and decision are required" });
+  }
+
   try {
-    const status = decision.toUpperCase() === 'APPROVE' ? 'resolved' : 'declined';
-    await pool.query(`UPDATE alerts SET status = $1, updated_at = NOW() WHERE id = $2`, [status, itemId]);
-    res.json({ success: true, message: `Item ${status} successfully` });
-  } catch (err) { res.status(500).json({ success: false }); }
+    const isApprove = String(decision).toUpperCase() === "APPROVE";
+    const managerStatus = isApprove ? "approved" : "rejected";
+    const alertStatus = isApprove ? "resolved" : "declined";
+
+    const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
+    const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
+    const managerColumns = hasManagerApprovals ? await getManagerApprovalsColumns() : new Set();
+    const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "approval_id";
+    const canUseManagerApprovals =
+      hasManagerApprovals &&
+      managerColumns.has("approval_type") &&
+      managerColumns.has("status");
+
+    let managerUpdated = false;
+    let matchedAlertId = null;
+
+    if (canUseManagerApprovals) {
+      const setClauses = ["status = $1"];
+      const params = [managerStatus];
+      let idx = 2;
+      const cleanComment = comment ?? null;
+
+      if (managerColumns.has("reviewed_at")) setClauses.push("reviewed_at = NOW()");
+      if (managerColumns.has("decision_date")) setClauses.push("decision_date = NOW()");
+      if (managerColumns.has("review_notes")) {
+        setClauses.push(`review_notes = $${idx}`);
+        params.push(cleanComment);
+        idx++;
+      }
+      if (managerColumns.has("manager_comment")) {
+        setClauses.push(`manager_comment = $${idx}`);
+        params.push(cleanComment);
+        idx++;
+      }
+      if (managerColumns.has("decision_notes")) {
+        setClauses.push(`decision_notes = $${idx}`);
+        params.push(cleanComment);
+        idx++;
+      }
+      if (managerColumns.has("decision")) {
+        setClauses.push(`decision = $${idx}`);
+        params.push(managerStatus);
+        idx++;
+      }
+
+      const whereClauses = [`${managerPkCol}::text = $${idx}`];
+      params.push(String(itemId));
+      idx++;
+
+      if (managerColumns.has("alert_id")) {
+        whereClauses.push(`COALESCE(alert_id::text, '') = $${idx - 1}`);
+      }
+
+      const returningCols = [`${managerPkCol} AS approval_id`];
+      if (managerColumns.has("alert_id")) returningCols.push("alert_id");
+
+      const managerUpdateResult = await pool.query(
+        `
+        UPDATE manager_approvals
+        SET ${setClauses.join(", ")}
+        WHERE approval_type = 'spoilage_action'
+          AND (${whereClauses.join(" OR ")})
+        RETURNING ${returningCols.join(", ")}
+      `,
+        params
+      );
+
+      if (managerUpdateResult.rowCount > 0) {
+        managerUpdated = true;
+        matchedAlertId = managerUpdateResult.rows[0]?.alert_id || null;
+      }
+    }
+
+    const updateAlertById = matchedAlertId || itemId;
+    await pool.query(`UPDATE alerts SET status = $1, updated_at = NOW() WHERE id::text = $2`, [alertStatus, String(updateAlertById)]);
+
+    if (!managerUpdated) {
+      return res.json({ success: true, message: `Alert ${alertStatus} successfully` });
+    }
+    return res.json({ success: true, message: `Item ${managerStatus} successfully` });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Database error" });
+  }
 });
 
 app.get("/api/inventory/history", async (req, res) => {
   try {
+    const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
+    const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
+    const managerColumns = hasManagerApprovals ? await getManagerApprovalsColumns() : new Set();
+    const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "approval_id";
+    const canUseManagerApprovals =
+      hasManagerApprovals &&
+      managerColumns.has("approval_type") &&
+      managerColumns.has("status");
+
+    if (canUseManagerApprovals) {
+      const hasAlertsTable = !!(await pool.query(`SELECT to_regclass('public.alerts') AS tbl`)).rows[0]?.tbl;
+      const hasAlertId = managerColumns.has("alert_id");
+      const decidedAtExpr = managerColumns.has("reviewed_at")
+        ? "ma.reviewed_at"
+        : managerColumns.has("decision_date")
+        ? "ma.decision_date"
+        : "ma.created_at";
+
+      const historyResult = await pool.query(
+        `
+        SELECT
+          ma.${managerPkCol} AS approval_id,
+          ma.status,
+          ma.risk_level,
+          ma.product_name,
+          ma.location,
+          ma.quantity,
+          ma.days_left,
+          ma.ai_suggestion,
+          ma.submitted_by,
+          ma.created_at,
+          ${decidedAtExpr} AS decided_at,
+          COALESCE(ma.manager_comment, ma.review_notes, ma.decision_notes) AS manager_comment
+          ${hasAlertId && hasAlertsTable ? ", ma.alert_id, a.alert_type, a.temperature, a.humidity, a.product_name AS alert_product_name, a.risk_level AS alert_risk_level, a.location AS alert_location, a.quantity AS alert_quantity, a.days_left AS alert_days_left, a.details AS alert_details" : ""}
+        FROM manager_approvals ma
+        ${hasAlertId && hasAlertsTable ? "LEFT JOIN alerts a ON a.id = ma.alert_id" : ""}
+        WHERE ma.approval_type = 'spoilage_action'
+          AND LOWER(COALESCE(ma.status, '')) IN ('approved', 'resolved', 'declined', 'rejected')
+        ORDER BY ${decidedAtExpr} DESC NULLS LAST, ma.created_at DESC NULLS LAST
+        LIMIT 50
+      `
+      );
+
+      const historyItems = historyResult.rows.map((row) => {
+        const quantityValue = row.quantity ?? row.alert_quantity;
+        const quantityLabel =
+          quantityValue === null || quantityValue === undefined || quantityValue === ""
+            ? "0 kg"
+            : `${quantityValue}${String(quantityValue).toLowerCase().includes("kg") ? "" : " kg"}`;
+        const normalized = String(row.status || "").toLowerCase();
+        const historyStatus =
+          normalized === "approved" || normalized === "resolved" ? "APPROVED" : "DECLINED";
+        return {
+          id: parseInt(row.approval_id, 10) || 0,
+          itemNumber: `#${row.approval_id}`,
+          priority: row.risk_level || row.alert_risk_level || "MEDIUM",
+          productName: row.product_name || row.alert_product_name || "Unknown Product",
+          location: row.location || row.alert_location || "Unknown",
+          quantity: quantityLabel,
+          daysLeft: parseInt(row.days_left ?? row.alert_days_left, 10) || 0,
+          aiSuggestion: row.ai_suggestion || row.alert_details || "No details",
+          status: historyStatus,
+          decidedBy: "Inventory Manager",
+          decidedAt: row.decided_at || row.created_at,
+          submittedBy: row.submitted_by ? String(row.submitted_by) : "System",
+          submittedAt: row.created_at,
+          temperature: row.temperature ?? null,
+          humidity: row.humidity ?? null,
+          alertType: row.alert_type ?? null,
+          managerComment: row.manager_comment || null
+        };
+      });
+
+      return res.json({ success: true, history: historyItems, message: null });
+    }
+
     const result = await pool.query(`
-      SELECT id, product_id, product_name, alert_type, risk_level, details, days_left, temperature, humidity, 
-             location, quantity, value, status, created_at, updated_at, submitted_by 
+      SELECT id, product_id, product_name, alert_type, risk_level, details, days_left, temperature, humidity,
+             location, quantity, value, status, created_at, updated_at, submitted_by
       FROM alerts WHERE status IN ('resolved', 'declined') ORDER BY updated_at DESC LIMIT 50
     `);
-    const historyItems = result.rows.map(row => ({ 
-      id: row.id, 
-      itemNumber: `#${row.id}`, 
-      priority: row.risk_level || 'MEDIUM', 
-      productName: row.product_name || 'Unknown Product', 
-      location: row.location || 'Unknown', 
-      quantity: row.quantity ? `${row.quantity} kg` : '0 kg', 
-      daysLeft: row.days_left || 0, 
-      aiSuggestion: row.details || 'No details', 
-      status: row.status === 'resolved' ? 'APPROVED' : 'DECLINED', 
-      decidedBy: 'Inventory Manager', 
-      decidedAt: row.updated_at || row.created_at, 
-      submittedBy: row.submitted_by || 'System', 
-      submittedAt: row.created_at, 
-      temperature: row.temperature, 
-      humidity: row.humidity, 
-      alertType: row.alert_type 
+    const historyItems = result.rows.map((row) => ({
+      id: row.id,
+      itemNumber: `#${row.id}`,
+      priority: row.risk_level || "MEDIUM",
+      productName: row.product_name || "Unknown Product",
+      location: row.location || "Unknown",
+      quantity: row.quantity ? `${row.quantity} kg` : "0 kg",
+      daysLeft: row.days_left || 0,
+      aiSuggestion: row.details || "No details",
+      status: row.status === "resolved" ? "APPROVED" : "DECLINED",
+      decidedBy: "Inventory Manager",
+      decidedAt: row.updated_at || row.created_at,
+      submittedBy: row.submitted_by || "System",
+      submittedAt: row.created_at,
+      temperature: row.temperature,
+      humidity: row.humidity,
+      alertType: row.alert_type
     }));
     res.json({ success: true, history: historyItems, message: null });
-  } catch (err) { res.status(500).json({ success: false }); }
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Database error" });
+  }
 });
 
 // ============================================================
