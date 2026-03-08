@@ -106,8 +106,23 @@ async function getManagerApprovalsColumns() {
   }
 }
 
+async function getTableColumns(tableName) {
+  try {
+    const columnsResult = await pool.query(
+      `SELECT column_name
+       FROM information_schema.columns
+       WHERE table_schema = 'public' AND table_name = $1`,
+      [tableName]
+    );
+    return new Set(columnsResult.rows.map((row) => row.column_name));
+  } catch (error) {
+    return new Set();
+  }
+}
+
 async function getManagerApprovalsPkColumn() {
-  if (Date.now() - managerApprovalsPkCache.loadedAt < MANAGER_PK_CACHE_TTL_MS) {
+  const now = Date.now();
+  if (now - managerApprovalsPkCache.loadedAt < MANAGER_PK_CACHE_TTL_MS) {
     return managerApprovalsPkCache.value;
   }
 
@@ -932,6 +947,223 @@ app.get("/api/ecotrust/leaderboard", async (req, res) => {
 // LOGISTICS ROUTES (Existing)
 // ============================================================
 
+const toFiniteNumber = (...values) => {
+  for (const value of values) {
+    const n = Number(value);
+    if (!Number.isNaN(n) && Number.isFinite(n)) return n;
+  }
+  return 0;
+};
+
+const normalizeLogisticsStop = (stop, index) => {
+  const name = stop?.stop_name || stop?.stopName || stop?.location_name || stop?.location || stop?.name || `Stop ${index + 1}`;
+  const address = stop?.address || stop?.location || stop?.full_address || "";
+  return {
+    stop_name: String(name),
+    stopName: String(name),
+    address: String(address)
+  };
+};
+
+const parseMaybeJsonObject = (value) => {
+  if (!value) return {};
+  if (typeof value === "object") return value;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (e) {
+    return {};
+  }
+};
+
+async function buildLogisticsRoutePayload(row, options = {}) {
+  const routeIdFromParams = options.routeIdFromParams ? String(options.routeIdFromParams) : null;
+  const hasRouteStops = !!options.hasRouteStops;
+  const requestData = parseMaybeJsonObject(row.request_data);
+  const extraData = parseMaybeJsonObject(row.extra_data);
+  const routeData = parseMaybeJsonObject(extraData.route);
+  const optimization = parseMaybeJsonObject(extraData.optimization);
+  const optimizationData = parseMaybeJsonObject(optimization.optimization_data);
+  const routeIdRaw =
+    routeIdFromParams ||
+    row.route_id ||
+    row.related_record_id ||
+    row.delivery_id ||
+    row.id ||
+    row.approval_id ||
+    requestData.route_id ||
+    routeData.route_id;
+  const routeId = String(routeIdRaw || "");
+  const fromLocation =
+    row.from_location ||
+    requestData.from_location ||
+    routeData.origin_location?.address ||
+    row.location ||
+    "Warehouse";
+  const toLocation =
+    row.to_location ||
+    requestData.to_location ||
+    routeData.destination_location?.address ||
+    null;
+
+  let stops = [];
+  if (Array.isArray(row.stops_json) && row.stops_json.length > 0) {
+    stops = row.stops_json.map(normalizeLogisticsStop);
+  } else if (Array.isArray(requestData.stops) && requestData.stops.length > 0) {
+    stops = requestData.stops.map(normalizeLogisticsStop);
+  } else if (Array.isArray(routeData.stops) && routeData.stops.length > 0) {
+    stops = routeData.stops.map(normalizeLogisticsStop);
+  } else if (hasRouteStops && routeId) {
+    try {
+      const stopsResult = await pool.query(
+        `SELECT stop_sequence, location_name, address
+         FROM route_stops
+         WHERE route_id::text = $1
+         ORDER BY stop_sequence ASC`,
+        [routeId]
+      );
+      if (stopsResult.rows.length > 0) {
+        stops = stopsResult.rows.map(normalizeLogisticsStop);
+      }
+    } catch (e) {
+      // Ignore route stop lookup failures and keep fallback stops below.
+    }
+  }
+
+  if (stops.length === 0) {
+    stops = [normalizeLogisticsStop({ stop_name: fromLocation, address: fromLocation }, 0)];
+    if (toLocation) stops.push(normalizeLogisticsStop({ stop_name: toLocation, address: toLocation }, 1));
+  }
+
+  const originalDistance = toFiniteNumber(
+    row.original_distance,
+    row.total_distance_km,
+    requestData.original_distance,
+    routeData.total_distance_km,
+    optimization.original_distance,
+    optimizationData.originalDistance
+  );
+  const optimizedDistance = toFiniteNumber(
+    row.optimized_distance,
+    requestData.optimized_distance,
+    optimization.optimized_distance,
+    optimizationData.optimizedDistance
+  );
+  const originalFuel = toFiniteNumber(
+    row.original_fuel,
+    row.estimated_fuel_consumption_liters,
+    requestData.original_fuel,
+    routeData.estimated_fuel_consumption_liters,
+    optimization.original_fuel,
+    optimizationData.originalFuel
+  );
+  const optimizedFuel = toFiniteNumber(
+    row.optimized_fuel,
+    requestData.optimized_fuel,
+    optimization.optimized_fuel,
+    optimizationData.optimizedFuel
+  );
+  const originalCO2 = toFiniteNumber(
+    row.original_co2,
+    row.estimated_carbon_kg,
+    requestData.original_co2,
+    routeData.estimated_carbon_kg,
+    optimization.original_carbon_kg,
+    optimizationData.originalCarbon
+  );
+  const optimizedCO2 = toFiniteNumber(
+    row.optimized_co2,
+    row.optimized_carbon_kg,
+    requestData.optimized_co2,
+    optimization.optimized_carbon_kg,
+    optimizationData.optimizedCarbon
+  );
+  const totalSavingsKm = toFiniteNumber(
+    row.savings_km,
+    requestData.savings_km,
+    optimization.savings_km,
+    optimizationData.savingsKm
+  );
+  const totalSavingsFuel = toFiniteNumber(
+    row.savings_fuel,
+    requestData.savings_fuel,
+    optimization.savings_fuel,
+    optimizationData.savingsFuel
+  );
+  const totalSavingsCO2 = toFiniteNumber(
+    row.savings_co2,
+    requestData.savings_co2,
+    optimization.savings_co2,
+    optimizationData.savingsCo2
+  );
+
+  const aiSuggestion =
+    row.ai_suggestion ||
+    row.ai_recommendation ||
+    requestData.ai_suggestion ||
+    optimization.ai_recommendation ||
+    optimizationData.aiRecommendation ||
+    "Optimize this route";
+
+  const submittedBy = row.submitted_by || row.requested_by || row.reviewed_by || "System";
+  const payload = {
+    route_id: routeId,
+    routeId,
+    route_type: row.route_type || requestData.route_type || routeData.route_type || row.product_name || "STANDARD",
+    routeType: row.route_type || requestData.route_type || routeData.route_type || row.product_name || "STANDARD",
+    from_location: fromLocation,
+    from: fromLocation,
+    to_location: toLocation,
+    to: toLocation,
+    stops,
+    driver_name: row.driver_name || requestData.driver_name || routeData.driver_name || "Unassigned",
+    driver: row.driver_name || requestData.driver_name || routeData.driver_name || "Unassigned",
+    vehicle_type: row.vehicle_type || requestData.vehicle_type || routeData.vehicle_type || "Van",
+    vehicle: row.vehicle_type || requestData.vehicle_type || routeData.vehicle_type || "Van",
+    departure_time: row.departure_time || routeData.created_at || row.created_at || null,
+    departureTime: row.departure_time || routeData.created_at || row.created_at || null,
+    original_distance: originalDistance,
+    originalDistance,
+    optimized_distance: optimizedDistance,
+    optimizedDistance,
+    original_fuel: originalFuel,
+    originalFuel,
+    optimized_fuel: optimizedFuel,
+    optimizedFuel,
+    original_co2: originalCO2,
+    originalCO2,
+    optimized_co2: optimizedCO2,
+    optimizedCO2,
+    savings_km: totalSavingsKm,
+    totalSavingsKm,
+    savings_fuel: totalSavingsFuel,
+    totalSavingsFuel,
+    savings_co2: totalSavingsCO2,
+    totalSavingsCO2,
+    ai_suggestion: aiSuggestion,
+    aiSuggestion,
+    aiOptimization: {
+      originalDistance,
+      optimizedDistance,
+      originalFuel,
+      optimizedFuel,
+      originalCO2,
+      optimizedCO2
+    },
+    aiSavings: {
+      kmSaved: totalSavingsKm,
+      fuelSaved: totalSavingsFuel,
+      co2Saved: totalSavingsCO2
+    },
+    status: row.status || "PENDING",
+    submitted_by: String(submittedBy),
+    submittedBy: String(submittedBy),
+    submitted_at: row.submitted_at || row.created_at || null,
+    submittedTime: row.submitted_at || row.created_at || null
+  };
+  return payload;
+}
+
 app.get("/api/logistics/dashboard", async (req, res) => {
   try {
     const pendingRouteStatusPredicate = `
@@ -1105,48 +1337,11 @@ app.get("/api/logistics/dashboard", async (req, res) => {
     }
 
     const stats = statsResult.rows[0] || {};
-    const getNum = (...vals) => {
-      for (const v of vals) {
-        const n = Number(v);
-        if (!Number.isNaN(n) && Number.isFinite(n)) return n;
-      }
-      return 0;
-    };
-
-    const pendingRoutes = pendingResult.rows.map(row => {
-      const requestData = row.request_data && typeof row.request_data === "object" ? row.request_data : {};
-      const extraData = row.extra_data && typeof row.extra_data === "object" ? row.extra_data : {};
-      const routeData = extraData.route && typeof extraData.route === "object" ? extraData.route : {};
-      const optimization = extraData.optimization && typeof extraData.optimization === "object" ? extraData.optimization : {};
-      const optimizationData = optimization.optimization_data && typeof optimization.optimization_data === "object"
-        ? optimization.optimization_data
-        : {};
-      const routeId = row.route_id || row.id || row.approval_id || row.delivery_id || routeData.route_id || null;
-      const submittedBy = row.submitted_by || row.requested_by || row.reviewed_by || null;
-
-      return {
-        routeId: String(routeId || ""),
-        routeType: row.route_type || requestData.route_type || routeData.route_type || row.product_name || "STANDARD",
-        from: row.from_location || requestData.from_location || routeData.origin_location?.address || row.location || "Warehouse",
-        to: row.to_location || requestData.to_location || routeData.destination_location?.address || null,
-        driver: row.driver_name || requestData.driver_name || routeData.driver_name || "Unassigned",
-        vehicle: row.vehicle_type || requestData.vehicle_type || routeData.vehicle_type || "Van",
-        departureTime: row.departure_time || routeData.created_at || row.created_at || null,
-        originalDistance: getNum(row.original_distance, row.total_distance_km, requestData.original_distance, optimization.original_distance, optimizationData.originalDistance),
-        optimizedDistance: getNum(row.optimized_distance, requestData.optimized_distance, optimization.optimized_distance, optimizationData.optimizedDistance),
-        originalFuel: getNum(row.original_fuel, row.estimated_fuel_consumption_liters, requestData.original_fuel, optimization.original_fuel, optimizationData.originalFuel),
-        optimizedFuel: getNum(row.optimized_fuel, requestData.optimized_fuel, optimization.optimized_fuel, optimizationData.optimizedFuel),
-        originalCO2: getNum(row.original_co2, row.estimated_carbon_kg, requestData.original_co2, optimization.original_carbon_kg, optimizationData.originalCarbon),
-        optimizedCO2: getNum(row.optimized_co2, row.optimized_carbon_kg, requestData.optimized_co2, optimization.optimized_carbon_kg, optimizationData.optimizedCarbon),
-        totalSavingsKm: getNum(row.savings_km, requestData.savings_km, optimization.savings_km, optimizationData.savingsKm),
-        totalSavingsFuel: getNum(row.savings_fuel, requestData.savings_fuel, optimization.savings_fuel, optimizationData.savingsFuel),
-        totalSavingsCO2: getNum(row.savings_co2, requestData.savings_co2, optimization.savings_co2, optimizationData.savingsCo2),
-        aiSuggestion: row.ai_suggestion || row.ai_recommendation || requestData.ai_suggestion || optimization.ai_recommendation || optimizationData.aiRecommendation || "Optimize this route",
-        status: row.status || "PENDING",
-        submittedBy: submittedBy ? String(submittedBy) : "System",
-        submittedTime: row.submitted_at || row.created_at || null
-      };
-    });
+    const routeStopsTableCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
+    const hasRouteStops = !!routeStopsTableCheck.rows[0]?.tbl;
+    const pendingRoutes = await Promise.all(
+      pendingResult.rows.map((row) => buildLogisticsRoutePayload(row, { hasRouteStops }))
+    );
 
     res.json({
       success: true,
@@ -1178,6 +1373,82 @@ app.get("/api/logistics/dashboard", async (req, res) => {
       driverMonitor: [],
       message: `Logistics data temporarily unavailable: ${err.message || 'unknown error'}`
     });
+  }
+});
+
+app.get("/api/logistics/route/:routeId", async (req, res) => {
+  try {
+    const { routeId } = req.params;
+    if (!routeId) {
+      return res.status(400).json({ success: false, message: "Route ID is required" });
+    }
+
+    const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
+    const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
+    const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
+    const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
+    const managerColumns = hasManagerApprovals ? await getManagerApprovalsColumns() : new Set();
+    const canUseManagerRouteData =
+      hasManagerApprovals &&
+      managerColumns.has("approval_type") &&
+      managerColumns.has("status");
+    const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
+    const routeApprovalColumns = hasRouteApprovals ? await getTableColumns("route_approvals") : new Set();
+    const routeStopsTableCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
+    const hasRouteStops = !!routeStopsTableCheck.rows[0]?.tbl;
+
+    let row = null;
+    if (canUseManagerRouteData) {
+      const managerConditions = [`ma.${managerPkCol}::text = $1`];
+      if (managerColumns.has("route_id")) managerConditions.push(`COALESCE(ma.route_id::text, '') = $1`);
+      if (managerColumns.has("related_record_id")) managerConditions.push(`COALESCE(ma.related_record_id::text, '') = $1`);
+      if (managerColumns.has("delivery_id")) managerConditions.push(`COALESCE(ma.delivery_id::text, '') = $1`);
+      if (managerColumns.has("request_data")) managerConditions.push(`COALESCE(ma.request_data->>'route_id', '') = $1`);
+      if (managerColumns.has("extra_data")) managerConditions.push(`COALESCE(ma.extra_data->'route'->>'route_id', '') = $1`);
+
+    const managerOrderBy = managerColumns.has("created_at")
+      ? "ma.created_at DESC"
+      : managerColumns.has(managerPkCol)
+      ? `ma.${managerPkCol} DESC`
+      : "1";
+    const managerResult = await pool.query(
+        `SELECT *
+         FROM manager_approvals ma
+         WHERE ma.approval_type = 'route_optimization'
+           AND (
+             ${managerConditions.join("\n             OR ")}
+           )
+         ORDER BY ${managerOrderBy}
+         LIMIT 1`,
+        [routeId]
+      );
+      row = managerResult.rows[0] || null;
+    }
+
+    if (!row && hasRouteApprovals) {
+      const routeConditions = [`ra.id::text = $1`];
+      if (routeApprovalColumns.has("route_id")) routeConditions.push(`COALESCE(ra.route_id::text, '') = $1`);
+
+      const routeResult = await pool.query(
+        `SELECT *
+         FROM route_approvals ra
+         WHERE ${routeConditions.join("\n            OR ")}
+         ORDER BY ra.id DESC
+         LIMIT 1`,
+        [routeId]
+      );
+      row = routeResult.rows[0] || null;
+    }
+
+    if (!row) {
+      return res.status(404).json({ success: false, message: "Route not found" });
+    }
+
+    const route = await buildLogisticsRoutePayload(row, { routeIdFromParams: routeId, hasRouteStops });
+    return res.json({ success: true, route, message: null });
+  } catch (err) {
+    console.error("Logistics route details error:", err);
+    return res.status(500).json({ success: false, message: err.message || "Failed to fetch route details" });
   }
 });
 
