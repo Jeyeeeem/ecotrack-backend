@@ -1510,6 +1510,11 @@ app.get("/api/logistics/dashboard", async (req, res) => {
 
     const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
+    const routeApprovalColumns = hasRouteApprovals ? await getTableColumns("route_approvals") : new Set();
+    const routeApprovalKeyExpr =
+      hasRouteApprovals && routeApprovalColumns.has("route_id")
+        ? "COALESCE(route_id::text, id::text)"
+        : "id::text";
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
     const managerColumns = hasManagerApprovals ? await getManagerApprovalsColumns() : new Set();
@@ -1722,9 +1727,14 @@ app.get("/api/logistics/dashboard", async (req, res) => {
       if (hasDeliveries) {
         const deliveriesColumns = await getTableColumns("deliveries");
         const deliveryStatusExpr = deliveriesColumns.has("status") ? "LOWER(COALESCE(status, ''))" : "''";
+        const deliveryIdExpr = deliveriesColumns.has("delivery_id")
+          ? "delivery_id::text"
+          : deliveriesColumns.has("id")
+          ? "id::text"
+          : "NULL::text";
         const routeIdExpr = deliveriesColumns.has("route_id")
-          ? "COALESCE(route_id::text, delivery_id::text)"
-          : "delivery_id::text";
+          ? `COALESCE(route_id::text, ${deliveryIdExpr})`
+          : deliveryIdExpr;
         const deliveryStats = await pool.query(
           `SELECT
              COUNT(DISTINCT ${routeIdExpr}) FILTER (WHERE ${deliveryStatusExpr} IN ('assigned', 'accepted', 'in_progress', 'completed')) as approved_count,
@@ -1757,6 +1767,28 @@ app.get("/api/logistics/dashboard", async (req, res) => {
       if (currentTs >= existingTs) pendingRouteMap.set(key, route);
     }
     let pendingRoutes = Array.from(pendingRouteMap.values());
+    if (hasRouteApprovals && pendingRoutes.length > 0) {
+      try {
+        const resolvedRoutesResult = await pool.query(
+          `SELECT DISTINCT ${routeApprovalKeyExpr} AS route_key
+           FROM route_approvals
+           WHERE UPPER(COALESCE(status, '')) IN ('APPROVED', 'DECLINED', 'REJECTED', 'CANCELLED', 'COMPLETED')`
+        );
+        const resolvedRouteKeys = new Set(
+          resolvedRoutesResult.rows
+            .map((r) => String(r.route_key || "").trim())
+            .filter(Boolean)
+        );
+        if (resolvedRouteKeys.size > 0) {
+          pendingRoutes = pendingRoutes.filter((route) => {
+            const key = String(route.routeId || route.route_id || "").trim();
+            return !key || !resolvedRouteKeys.has(key);
+          });
+        }
+      } catch (resolvedErr) {
+        console.warn("Logistics pending resolved-route filter fallback:", resolvedErr.message);
+      }
+    }
 
     // If no pending approvals, surface recent assigned/active/completed delivery routes
     // so "All Routes" screen still has visible route items.
@@ -1766,6 +1798,45 @@ app.get("/api/logistics/dashboard", async (req, res) => {
         const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
         if (hasDeliveries) {
           const deliveriesColumns = await getTableColumns("deliveries");
+          const deliveryIdExpr = deliveriesColumns.has("delivery_id")
+            ? "delivery_id::text"
+            : deliveriesColumns.has("id")
+            ? "id::text"
+            : "NULL::text";
+          const fromExpr = deliveriesColumns.has("from_location")
+            ? "from_location"
+            : deliveriesColumns.has("origin")
+            ? "origin"
+            : "NULL::text";
+          const toExpr = deliveriesColumns.has("to_location")
+            ? "to_location"
+            : deliveriesColumns.has("destination")
+            ? "destination"
+            : "NULL::text";
+          const driverExpr = deliveriesColumns.has("driver_name")
+            ? "driver_name"
+            : deliveriesColumns.has("assigned_driver")
+            ? "assigned_driver"
+            : "NULL::text";
+          const vehicleExpr = deliveriesColumns.has("vehicle_type")
+            ? "vehicle_type"
+            : "'Van'::text";
+          const statusExpr = deliveriesColumns.has("status")
+            ? "LOWER(COALESCE(status, ''))"
+            : "'assigned'";
+          const distanceExpr = deliveriesColumns.has("distance_km") ? "distance_km" : "0";
+          const estFuelExpr = deliveriesColumns.has("estimated_fuel_consumption_liters")
+            ? "estimated_fuel_consumption_liters"
+            : "0";
+          const fuelExpr = deliveriesColumns.has("fuel_consumption")
+            ? "fuel_consumption"
+            : estFuelExpr;
+          const estCo2Expr = deliveriesColumns.has("estimated_carbon_kg")
+            ? "estimated_carbon_kg"
+            : "0";
+          const co2Expr = deliveriesColumns.has("carbon_emissions")
+            ? "carbon_emissions"
+            : estCo2Expr;
           const updatedExpr = deliveriesColumns.has("updated_at")
             ? "updated_at"
             : deliveriesColumns.has("departure_time")
@@ -1774,32 +1845,32 @@ app.get("/api/logistics/dashboard", async (req, res) => {
             ? "arrival_time"
             : "NOW()";
           const routeIdExpr = deliveriesColumns.has("route_id")
-            ? "COALESCE(route_id::text, delivery_id::text)"
-            : "delivery_id::text";
+            ? `COALESCE(route_id::text, ${deliveryIdExpr})`
+            : deliveryIdExpr;
           const recentRoutesResult = await pool.query(
             `SELECT
                ${routeIdExpr} as route_id,
                'delivery' as route_type,
-               from_location,
-               to_location,
-               driver_name,
-               vehicle_type,
-               departure_time,
-               COALESCE(distance_km, 0) as original_distance,
-               COALESCE(distance_km, 0) as optimized_distance,
-               COALESCE(estimated_fuel_consumption_liters, 0) as original_fuel,
-               COALESCE(fuel_consumption, estimated_fuel_consumption_liters, 0) as optimized_fuel,
-               COALESCE(estimated_carbon_kg, 0) as original_co2,
-               COALESCE(carbon_emissions, estimated_carbon_kg, 0) as optimized_co2,
+               ${fromExpr} as from_location,
+               ${toExpr} as to_location,
+               ${driverExpr} as driver_name,
+               ${vehicleExpr} as vehicle_type,
+               ${updatedExpr} as departure_time,
+               COALESCE(${distanceExpr}, 0) as original_distance,
+               COALESCE(${distanceExpr}, 0) as optimized_distance,
+               COALESCE(${estFuelExpr}, 0) as original_fuel,
+               COALESCE(${fuelExpr}, 0) as optimized_fuel,
+               COALESCE(${estCo2Expr}, 0) as original_co2,
+               COALESCE(${co2Expr}, 0) as optimized_co2,
                0::numeric as savings_km,
                0::numeric as savings_fuel,
                0::numeric as savings_co2,
                NULL::text as ai_suggestion,
-               UPPER(COALESCE(status, 'ASSIGNED')) as status,
-               driver_name as submitted_by,
+               UPPER(COALESCE(${statusExpr}, 'assigned')) as status,
+               ${driverExpr} as submitted_by,
                ${updatedExpr} as submitted_at
              FROM deliveries
-             WHERE LOWER(COALESCE(status, '')) IN ('assigned', 'accepted', 'in_progress', 'completed')
+             WHERE ${statusExpr} IN ('assigned', 'accepted', 'in_progress', 'completed')
              ORDER BY ${updatedExpr} DESC NULLS LAST
              LIMIT 20`
           );
@@ -1818,7 +1889,7 @@ app.get("/api/logistics/dashboard", async (req, res) => {
     res.json({
       success: true,
       summary: {
-        pendingApprovals: parseInt(stats.pending_count, 10) || pendingRoutes.length,
+        pendingApprovals: pendingRoutes.length,
         approvedToday: approvedCount,
         declined: declinedCount,
         avgCO2Saved: parseFloat(stats.avg_co2_saved) || 0,
@@ -2364,6 +2435,17 @@ app.get("/api/logistics/history", async (req, res) => {
   try {
     const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
+    const routeApprovalColumns = hasRouteApprovals ? await getTableColumns("route_approvals") : new Set();
+    const originalDistanceExpr = routeApprovalColumns.has("original_distance") ? "COALESCE(original_distance, 0)" : "0";
+    const optimizedDistanceExpr = routeApprovalColumns.has("optimized_distance") ? "COALESCE(optimized_distance, 0)" : "0";
+    const originalCo2Expr = routeApprovalColumns.has("original_co2") ? "COALESCE(original_co2, 0)" : "0";
+    const optimizedCo2Expr = routeApprovalColumns.has("optimized_co2") ? "COALESCE(optimized_co2, 0)" : "0";
+    const savingsKmExpr = routeApprovalColumns.has("savings_km")
+      ? `COALESCE(NULLIF(savings_km, 0), GREATEST(${originalDistanceExpr} - ${optimizedDistanceExpr}, 0), 0)`
+      : `GREATEST(${originalDistanceExpr} - ${optimizedDistanceExpr}, 0)`;
+    const savingsCo2Expr = routeApprovalColumns.has("savings_co2")
+      ? `COALESCE(NULLIF(savings_co2, 0), GREATEST(${originalCo2Expr} - ${optimizedCo2Expr}, 0), 0)`
+      : `GREATEST(${originalCo2Expr} - ${optimizedCo2Expr}, 0)`;
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
     const managerColumns = hasManagerApprovals ? await getManagerApprovalsColumns() : new Set();
@@ -2386,7 +2468,7 @@ app.get("/api/logistics/history", async (req, res) => {
     let result = hasRouteApprovals
       ? await pool.query(`
           SELECT id as approval_id, id as route_id, route_type as product_name, from_location, to_location, from_location as location, driver_name, 
-                 status, savings_km, savings_co2, approved_at as reviewed_at, manager_comment as review_notes 
+                 status, ${savingsKmExpr} as savings_km, ${savingsCo2Expr} as savings_co2, approved_at as reviewed_at, manager_comment as review_notes 
           FROM route_approvals
           WHERE LOWER(COALESCE(status, '')) IN ('approved', 'declined', 'rejected')
           ORDER BY approved_at DESC NULLS LAST, submitted_at DESC NULLS LAST
@@ -2441,7 +2523,7 @@ app.get("/api/logistics/history", async (req, res) => {
     if (hasRouteApprovals && result.rows.length === 0) {
       result = await pool.query(`
         SELECT id as approval_id, id as route_id, route_type as product_name, from_location, to_location, from_location as location, driver_name, 
-               status, savings_km, savings_co2, approved_at as reviewed_at, manager_comment as review_notes 
+               status, ${savingsKmExpr} as savings_km, ${savingsCo2Expr} as savings_co2, approved_at as reviewed_at, manager_comment as review_notes 
         FROM route_approvals
         WHERE LOWER(COALESCE(status, '')) IN ('approved', 'declined', 'rejected')
         ORDER BY approved_at DESC NULLS LAST, submitted_at DESC NULLS LAST
@@ -2455,6 +2537,33 @@ app.get("/api/logistics/history", async (req, res) => {
       const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
       if (hasDeliveries) {
         const deliveriesColumns = await getTableColumns("deliveries");
+        const deliveryIdExpr = deliveriesColumns.has("delivery_id")
+          ? "d.delivery_id::text"
+          : deliveriesColumns.has("id")
+          ? "d.id::text"
+          : "NULL::text";
+        const routeIdExpr = deliveriesColumns.has("route_id")
+          ? `COALESCE(d.route_id::text, ${deliveryIdExpr})`
+          : deliveryIdExpr;
+        const statusExpr = deliveriesColumns.has("status") ? "LOWER(COALESCE(d.status, ''))" : "'assigned'";
+        const fromExpr = deliveriesColumns.has("from_location")
+          ? "d.from_location"
+          : deliveriesColumns.has("origin")
+          ? "d.origin"
+          : "'Unknown'::text";
+        const toExpr = deliveriesColumns.has("to_location")
+          ? "d.to_location"
+          : deliveriesColumns.has("destination")
+          ? "d.destination"
+          : "NULL::text";
+        const vehicleExpr = deliveriesColumns.has("vehicle_type")
+          ? "d.vehicle_type"
+          : "'DELIVERY'::text";
+        const driverExpr = deliveriesColumns.has("driver_name")
+          ? "d.driver_name"
+          : deliveriesColumns.has("assigned_driver")
+          ? "d.assigned_driver"
+          : "NULL::text";
         const reviewedAtExpr = deliveriesColumns.has("updated_at")
           ? "d.updated_at"
           : deliveriesColumns.has("arrival_time")
@@ -2464,15 +2573,15 @@ app.get("/api/logistics/history", async (req, res) => {
           : "NULL";
         result = await pool.query(`
           SELECT
-            d.delivery_id as approval_id,
-            COALESCE(d.route_id::text, d.delivery_id::text) as route_id,
-            COALESCE(d.vehicle_type, 'DELIVERY') as product_name,
-            COALESCE(d.from_location, 'Unknown') as from_location,
-            COALESCE(d.to_location, null) as to_location,
-            COALESCE(d.from_location, 'Unknown') as location,
-            d.driver_name as driver_name,
+            ${deliveryIdExpr} as approval_id,
+            ${routeIdExpr} as route_id,
+            COALESCE(${vehicleExpr}, 'DELIVERY') as product_name,
+            COALESCE(${fromExpr}, 'Unknown') as from_location,
+            COALESCE(${toExpr}, null) as to_location,
+            COALESCE(${fromExpr}, 'Unknown') as location,
+            ${driverExpr} as driver_name,
             CASE
-              WHEN LOWER(COALESCE(d.status, '')) IN ('declined', 'rejected', 'cancelled') THEN 'DECLINED'
+              WHEN ${statusExpr} IN ('declined', 'rejected', 'cancelled') THEN 'DECLINED'
               ELSE 'APPROVED'
             END as status,
             0::numeric as savings_km,
@@ -2480,8 +2589,8 @@ app.get("/api/logistics/history", async (req, res) => {
             ${reviewedAtExpr} as reviewed_at,
             'Approved and assigned to driver'::text as review_notes
           FROM deliveries d
-          WHERE LOWER(COALESCE(d.status, '')) IN ('assigned', 'accepted', 'in_progress', 'completed', 'declined', 'rejected', 'cancelled')
-          ORDER BY ${reviewedAtExpr} DESC NULLS LAST, d.delivery_id DESC
+          WHERE ${statusExpr} IN ('assigned', 'accepted', 'in_progress', 'completed', 'declined', 'rejected', 'cancelled')
+          ORDER BY ${reviewedAtExpr} DESC NULLS LAST, ${deliveryIdExpr} DESC
           LIMIT 100
         `);
       }
@@ -3104,13 +3213,27 @@ app.get("/api/driver/routes", async (req, res) => {
 app.get("/api/driver/delivery/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const result = await pool.query(`
-      SELECT d.*, ra.route_type
-      FROM deliveries d
-      LEFT JOIN route_approvals ra ON d.route_id = ra.id
-      WHERE d.delivery_id = $1
-      LIMIT 1
-    `, [id]);
+    const deliveriesColumns = await getTableColumns("deliveries");
+    const deliveryIdCol = deliveriesColumns.has("delivery_id")
+      ? "delivery_id"
+      : deliveriesColumns.has("id")
+      ? "id"
+      : null;
+    const hasRouteIdCol = deliveriesColumns.has("route_id");
+    if (!deliveryIdCol) {
+      return res.status(500).json({ success: false, message: "Database error" });
+    }
+    const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
+    const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
+    const joinRouteApprovals = hasRouteApprovals && hasRouteIdCol;
+    const result = await pool.query(
+      `SELECT d.*${joinRouteApprovals ? ", ra.route_type" : ""}
+       FROM deliveries d
+       ${joinRouteApprovals ? "LEFT JOIN route_approvals ra ON d.route_id = ra.id" : ""}
+       WHERE d.${deliveryIdCol}::text = $1
+       LIMIT 1`,
+      [String(id)]
+    );
 
     if (result.rows.length === 0) {
       return res.status(404).json({ success: false, message: "Delivery not found" });
@@ -3191,7 +3314,7 @@ app.get("/api/driver/delivery/:id", async (req, res) => {
     res.json({
       success: true,
       delivery: {
-        deliveryId: row.delivery_id,
+        deliveryId: row.delivery_id ?? row.id ?? id,
         routeId: row.route_id,
         status: row.status,
         driver: row.driver_name,
