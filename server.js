@@ -934,6 +934,20 @@ app.get("/api/ecotrust/leaderboard", async (req, res) => {
 
 app.get("/api/logistics/dashboard", async (req, res) => {
   try {
+    const pendingRouteStatusPredicate = `
+      (
+        UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g')) LIKE '%PEND%'
+        OR UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g')) LIKE '%AWAIT%'
+        OR UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g')) LIKE '%REVIEW%'
+        OR UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g')) LIKE '%SUBMIT%'
+        OR (
+          approved_at IS NULL
+          AND UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g'))
+              NOT IN ('APPROVED', 'DECLINED', 'REJECTED', 'CANCELLED', 'COMPLETED')
+        )
+      )
+    `;
+
     const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
@@ -1016,18 +1030,14 @@ app.get("/api/logistics/dashboard", async (req, res) => {
             ra.submitted_by, 
             ra.submitted_at
           FROM route_approvals ra 
-          WHERE COALESCE(NULLIF(UPPER(REPLACE(TRIM(status), ' ', '_')), ''), 'PENDING')
-                IN ('PENDING', 'AWAITING_APPROVAL', 'AWAITINGAPPROVAL', 'PENDING_APPROVAL', 'SUBMITTED', 'FOR_APPROVAL', 'IN_REVIEW')
+          WHERE ${pendingRouteStatusPredicate}
           ORDER BY submitted_at DESC 
           LIMIT 20`
         );
 
         statsResult = await pool.query(
           `SELECT 
-            (SELECT COUNT(*) FROM route_approvals
-              WHERE COALESCE(NULLIF(UPPER(REPLACE(TRIM(status), ' ', '_')), ''), 'PENDING')
-                    IN ('PENDING', 'AWAITING_APPROVAL', 'AWAITINGAPPROVAL', 'PENDING_APPROVAL', 'SUBMITTED', 'FOR_APPROVAL', 'IN_REVIEW')
-            ) as pending_count,
+            (SELECT COUNT(*) FROM route_approvals WHERE ${pendingRouteStatusPredicate}) as pending_count,
             (SELECT COUNT(*) FROM route_approvals WHERE UPPER(COALESCE(status, '')) = 'APPROVED') as approved_count,
             (SELECT COUNT(*) FROM route_approvals WHERE UPPER(COALESCE(status, '')) = 'DECLINED') as declined_count,
             COALESCE(AVG(savings_co2) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as avg_co2_saved,
@@ -1060,18 +1070,14 @@ app.get("/api/logistics/dashboard", async (req, res) => {
           ra.submitted_by, 
           ra.submitted_at
         FROM route_approvals ra 
-        WHERE COALESCE(NULLIF(UPPER(REPLACE(TRIM(status), ' ', '_')), ''), 'PENDING')
-              IN ('PENDING', 'AWAITING_APPROVAL', 'AWAITINGAPPROVAL', 'PENDING_APPROVAL', 'SUBMITTED', 'FOR_APPROVAL', 'IN_REVIEW')
+        WHERE ${pendingRouteStatusPredicate}
         ORDER BY submitted_at DESC 
         LIMIT 20`
       );
 
       statsResult = await pool.query(
         `SELECT 
-          (SELECT COUNT(*) FROM route_approvals
-            WHERE COALESCE(NULLIF(UPPER(REPLACE(TRIM(status), ' ', '_')), ''), 'PENDING')
-                  IN ('PENDING', 'AWAITING_APPROVAL', 'AWAITINGAPPROVAL', 'PENDING_APPROVAL', 'SUBMITTED', 'FOR_APPROVAL', 'IN_REVIEW')
-          ) as pending_count,
+          (SELECT COUNT(*) FROM route_approvals WHERE ${pendingRouteStatusPredicate}) as pending_count,
           (SELECT COUNT(*) FROM route_approvals WHERE UPPER(COALESCE(status, '')) = 'APPROVED') as approved_count,
           (SELECT COUNT(*) FROM route_approvals WHERE UPPER(COALESCE(status, '')) = 'DECLINED') as declined_count,
           COALESCE(AVG(savings_co2) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as avg_co2_saved,
@@ -1172,6 +1178,20 @@ app.get("/api/logistics/dashboard", async (req, res) => {
 
 app.get("/api/logistics/pending", async (req, res) => {
   try {
+    const pendingRouteStatusPredicate = `
+      (
+        UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g')) LIKE '%PEND%'
+        OR UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g')) LIKE '%AWAIT%'
+        OR UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g')) LIKE '%REVIEW%'
+        OR UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g')) LIKE '%SUBMIT%'
+        OR (
+          approved_at IS NULL
+          AND UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g'))
+              NOT IN ('APPROVED', 'DECLINED', 'REJECTED', 'CANCELLED', 'COMPLETED')
+        )
+      )
+    `;
+
     const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
@@ -1220,8 +1240,7 @@ app.get("/api/logistics/pending", async (req, res) => {
                  savings_km, savings_fuel, savings_co2, ai_suggestion as ai_recommendation, status, 
                  submitted_by, submitted_at as created_at 
           FROM route_approvals
-          WHERE COALESCE(NULLIF(UPPER(REPLACE(TRIM(status), ' ', '_')), ''), 'PENDING')
-                IN ('PENDING', 'AWAITING_APPROVAL', 'AWAITINGAPPROVAL', 'PENDING_APPROVAL', 'SUBMITTED', 'FOR_APPROVAL', 'IN_REVIEW')
+          WHERE ${pendingRouteStatusPredicate}
           ORDER BY submitted_at DESC
         `);
       }
@@ -1233,8 +1252,7 @@ app.get("/api/logistics/pending", async (req, res) => {
                savings_km, savings_fuel, savings_co2, ai_suggestion as ai_recommendation, status, 
                submitted_by, submitted_at as created_at 
         FROM route_approvals
-        WHERE COALESCE(NULLIF(UPPER(REPLACE(TRIM(status), ' ', '_')), ''), 'PENDING')
-              IN ('PENDING', 'AWAITING_APPROVAL', 'AWAITINGAPPROVAL', 'PENDING_APPROVAL', 'SUBMITTED', 'FOR_APPROVAL', 'IN_REVIEW')
+        WHERE ${pendingRouteStatusPredicate}
         ORDER BY submitted_at DESC
       `);
     } else {
@@ -1246,6 +1264,20 @@ app.get("/api/logistics/pending", async (req, res) => {
 
 app.get("/api/logistics/stats", async (req, res) => {
   try {
+    const pendingRouteStatusPredicate = `
+      (
+        UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g')) LIKE '%PEND%'
+        OR UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g')) LIKE '%AWAIT%'
+        OR UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g')) LIKE '%REVIEW%'
+        OR UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g')) LIKE '%SUBMIT%'
+        OR (
+          approved_at IS NULL
+          AND UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g'))
+              NOT IN ('APPROVED', 'DECLINED', 'REJECTED', 'CANCELLED', 'COMPLETED')
+        )
+      )
+    `;
+
     const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
@@ -1266,10 +1298,7 @@ app.get("/api/logistics/stats", async (req, res) => {
         `)
       : hasRouteApprovals
       ? await pool.query(`
-          SELECT COUNT(*) FILTER (
-                   WHERE COALESCE(NULLIF(UPPER(REPLACE(TRIM(status), ' ', '_')), ''), 'PENDING')
-                         IN ('PENDING', 'AWAITING_APPROVAL', 'AWAITINGAPPROVAL', 'PENDING_APPROVAL', 'SUBMITTED', 'FOR_APPROVAL', 'IN_REVIEW')
-                 ) as pending_count, 
+          SELECT COUNT(*) FILTER (WHERE ${pendingRouteStatusPredicate}) as pending_count, 
                  COUNT(*) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED') as approved_count, 
                  COUNT(*) FILTER (WHERE UPPER(COALESCE(status, '')) = 'DECLINED') as declined_count, 
                  COALESCE(AVG(savings_co2) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as avg_co2_saved 
@@ -1292,10 +1321,7 @@ app.get("/api/logistics/stats", async (req, res) => {
         (parseInt(counts.declined_count, 10) || 0);
       if (managerTotal === 0) {
         result = await pool.query(`
-          SELECT COUNT(*) FILTER (
-                   WHERE COALESCE(NULLIF(UPPER(REPLACE(TRIM(status), ' ', '_')), ''), 'PENDING')
-                         IN ('PENDING', 'AWAITING_APPROVAL', 'AWAITINGAPPROVAL', 'PENDING_APPROVAL', 'SUBMITTED', 'FOR_APPROVAL', 'IN_REVIEW')
-                 ) as pending_count, 
+          SELECT COUNT(*) FILTER (WHERE ${pendingRouteStatusPredicate}) as pending_count, 
                  COUNT(*) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED') as approved_count, 
                  COUNT(*) FILTER (WHERE UPPER(COALESCE(status, '')) = 'DECLINED') as declined_count, 
                  COALESCE(AVG(savings_co2) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as avg_co2_saved 
