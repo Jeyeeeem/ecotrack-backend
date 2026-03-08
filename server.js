@@ -2413,6 +2413,13 @@ app.patch("/api/logistics/:id/decline", async (req, res) => {
   const { id } = req.params;
   const { reason } = req.body;
   try {
+    const declineReason = String(reason || "").trim();
+    if (!declineReason) {
+      return res.status(400).json({
+        success: false,
+        message: "Decline reason is required before returning route to admin"
+      });
+    }
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
     const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
@@ -2424,29 +2431,29 @@ app.patch("/api/logistics/:id/decline", async (req, res) => {
          SET status = 'declined', manager_comment = $1, decision_notes = $1, reviewed_at = NOW(), updated_at = NOW()
          WHERE ${managerPkCol} = $2 AND approval_type = 'route_optimization'
          RETURNING *`,
-        [reason || '', id]
+        [declineReason, id]
       );
       if (hasRouteApprovals) {
         if (maResult.rows.length > 0) {
           const routeRef = maResult.rows[0].route_id || maResult.rows[0].delivery_id;
           if (routeRef) {
-            await pool.query(`UPDATE route_approvals SET status = 'DECLINED', manager_comment = $1, approved_at = NOW() WHERE id = $2`, [reason || '', routeRef]);
+            await pool.query(`UPDATE route_approvals SET status = 'DECLINED', manager_comment = $1, approved_at = NOW() WHERE id = $2`, [declineReason, routeRef]);
           }
         } else {
-          await pool.query(`UPDATE route_approvals SET status = 'DECLINED', manager_comment = $1, approved_at = NOW() WHERE id = $2`, [reason || '', id]);
+          await pool.query(`UPDATE route_approvals SET status = 'DECLINED', manager_comment = $1, approved_at = NOW() WHERE id = $2`, [declineReason, id]);
         }
       }
     } else if (hasRouteApprovals) {
-      await pool.query(`UPDATE route_approvals SET status = 'DECLINED', manager_comment = $1, approved_at = NOW() WHERE id = $2`, [reason || '', id]);
+      await pool.query(`UPDATE route_approvals SET status = 'DECLINED', manager_comment = $1, approved_at = NOW() WHERE id = $2`, [declineReason, id]);
     } else {
       await pool.query(
         `UPDATE manager_approvals
          SET status = 'declined', manager_comment = $1, decision_notes = $1, reviewed_at = NOW(), updated_at = NOW()
          WHERE ${managerPkCol} = $2`,
-        [reason || '', id]
+        [declineReason, id]
       );
     }
-    res.json({ success: true, message: "Declined" });
+    res.json({ success: true, message: "Declined with reason and returned to admin" });
   } catch (err) { res.json({ success: false, message: "Decline failed" }); }
 });
 
@@ -2637,6 +2644,13 @@ app.post("/api/logistics/approve", async (req, res) => {
   try {
     const statusNormalized = String(decision || "").toUpperCase();
     const status = statusNormalized === 'APPROVE' ? 'APPROVED' : statusNormalized === 'PENDING' ? 'PENDING' : 'DECLINED';
+    const decisionComment = String(comment || "").trim();
+    if (status === 'DECLINED' && !decisionComment) {
+      return res.status(400).json({
+        success: false,
+        message: "Decline reason is required before returning route to admin"
+      });
+    }
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
     const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
@@ -2660,7 +2674,7 @@ app.post("/api/logistics/approve", async (req, res) => {
          WHERE approval_type = 'route_optimization'
            AND (${managerMatchClauses.join(" OR ")})
          RETURNING *`,
-        [status, comment || '', routeId]
+        [status, decisionComment, routeId]
       );
       if (maResult.rows.length > 0) {
         managerApprovalRow = maResult.rows[0];
@@ -2673,20 +2687,20 @@ app.post("/api/logistics/approve", async (req, res) => {
             maResult.rows[0].delivery_id;
           if (routeRef) {
             resolvedRouteId = routeRef;
-            await pool.query(`UPDATE route_approvals SET status = $1, manager_comment = $2, approved_at = NOW() WHERE id = $3`, [status, comment || '', routeRef]);
+            await pool.query(`UPDATE route_approvals SET status = $1, manager_comment = $2, approved_at = NOW() WHERE id = $3`, [status, decisionComment, routeRef]);
           }
         } else {
-          await pool.query(`UPDATE route_approvals SET status = $1, manager_comment = $2, approved_at = NOW() WHERE id = $3`, [status, comment || '', routeId]);
+          await pool.query(`UPDATE route_approvals SET status = $1, manager_comment = $2, approved_at = NOW() WHERE id = $3`, [status, decisionComment, routeId]);
         }
       }
     } else if (hasRouteApprovals) {
-      await pool.query(`UPDATE route_approvals SET status = $1, manager_comment = $2, approved_at = NOW() WHERE id = $3`, [status, comment || '', routeId]);
+      await pool.query(`UPDATE route_approvals SET status = $1, manager_comment = $2, approved_at = NOW() WHERE id = $3`, [status, decisionComment, routeId]);
     } else {
       await pool.query(
         `UPDATE manager_approvals
          SET status = LOWER($1), manager_comment = $2, decision_notes = $2, reviewed_at = NOW()${managerUpdatedAtClause}
          WHERE ${managerPkCol} = $3`,
-        [status, comment || '', routeId]
+        [status, decisionComment, routeId]
       );
     }
 
@@ -2841,7 +2855,12 @@ app.post("/api/logistics/approve", async (req, res) => {
       }
     }
 
-    res.json({ success: true, message: `Route ${status.toLowerCase()} successfully` });
+    res.json({
+      success: true,
+      message: status === 'DECLINED'
+        ? "Declined with reason and returned to admin"
+        : `Route ${status.toLowerCase()} successfully`
+    });
   } catch (err) {
     console.error("Logistics approve error:", err);
     res.json({ success: false, message: `Update failed: ${err.message || 'unknown error'}` });
