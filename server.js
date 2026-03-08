@@ -2306,13 +2306,6 @@ app.get("/api/driver/dashboard", async (req, res) => {
       LIMIT 20
     `, args);
 
-    const alertsResult = await pool.query(`
-      SELECT id, product_name, alert_type, risk_level, days_left, location, quantity
-      FROM alerts
-      WHERE status IN ('active', 'pending_review')
-      ORDER BY CASE risk_level WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END, created_at DESC
-      LIMIT 10
-    `);
 
     const mapDelivery = (row) => ({
       deliveryId: row.delivery_id,
@@ -2360,15 +2353,7 @@ app.get("/api/driver/dashboard", async (req, res) => {
       activeDeliveries,
       upcomingAssignments: pendingAcceptance,
       recentCompletions,
-      alerts: alertsResult.rows.map(row => ({
-        id: row.id,
-        productName: row.product_name,
-        alertType: row.alert_type,
-        riskLevel: row.risk_level,
-        daysLeft: row.days_left || 0,
-        location: row.location,
-        quantity: row.quantity ? `${row.quantity} kg` : null
-      })),
+      alerts: [],
       summary: { 
         totalCompleted: parseInt(stats.total_completed) || 0, 
         activeDeliveries: parseInt(stats.active_deliveries) || 0, 
