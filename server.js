@@ -1941,8 +1941,8 @@ app.get("/api/driver/routes", async (req, res) => {
       query += ` AND d.driver_name = $1`;
     }
     query += ` ORDER BY d.created_at DESC LIMIT 50`;
-    const result = await pool.query(query, params);
-    const routes = result.rows.map(row => ({
+    let result = await pool.query(query, params);
+    let routes = result.rows.map(row => ({
       deliveryId: row.delivery_id,
       routeId: row.route_id,
       status: row.status,
@@ -1958,6 +1958,63 @@ app.get("/api/driver/routes", async (req, res) => {
       estimatedCO2: parseFloat(row.estimated_carbon_kg) || 0,
       actualCO2: parseFloat(row.carbon_emissions) || 0
     }));
+
+    // Fallback for deployments where driver routes are stored in manager_approvals.extra_data
+    // and deliveries rows are not yet created.
+    if (routes.length === 0 && driver_name) {
+      const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
+      const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
+      if (hasManagerApprovals) {
+        const managerRows = await pool.query(`
+          SELECT *
+          FROM manager_approvals ma
+          WHERE ma.approval_type = 'route_optimization'
+            AND LOWER(COALESCE(ma.driver_name, ma.extra_data->'route'->>'driver_name', '')) = LOWER($1)
+          ORDER BY ma.created_at DESC
+          LIMIT 50
+        `, [driver_name]);
+
+        const mapStatus = (status) => {
+          const s = String(status || "").toLowerCase();
+          if (s.includes("reject") || s.includes("declin")) return "declined";
+          if (s.includes("complete")) return "completed";
+          if (s.includes("progress")) return "in_progress";
+          if (s.includes("approve") || s.includes("accept")) return "accepted";
+          return "assigned";
+        };
+
+        routes = managerRows.rows.map(row => {
+          const extra = row.extra_data && typeof row.extra_data === "object" ? row.extra_data : {};
+          const route = extra.route && typeof extra.route === "object" ? extra.route : {};
+          const opt = extra.optimization && typeof extra.optimization === "object" ? extra.optimization : {};
+          const optData = opt.optimization_data && typeof opt.optimization_data === "object" ? opt.optimization_data : {};
+          const num = (...vals) => {
+            for (const v of vals) {
+              const n = Number(v);
+              if (!Number.isNaN(n) && Number.isFinite(n)) return n;
+            }
+            return 0;
+          };
+
+          return {
+            deliveryId: row.delivery_id || row.approval_id,
+            routeId: route.route_id || row.delivery_id || row.approval_id,
+            status: mapStatus(row.status || row.decision),
+            driver: row.driver_name || route.driver_name || driver_name,
+            vehicle: row.vehicle_type || route.vehicle_type || "Van",
+            departureTime: route.created_at || row.created_at || null,
+            arrivalTime: row.reviewed_at || row.decision_date || null,
+            from: route.origin_location?.address || row.location || "",
+            to: route.destination_location?.address || "",
+            distance: num(row.total_distance_km, route.total_distance_km, opt.optimized_distance, optData.optimizedDistance),
+            estimatedFuel: num(row.estimated_fuel_consumption_liters, route.estimated_fuel_consumption_liters, opt.original_fuel, optData.originalFuel),
+            actualFuel: num(row.optimized_fuel, opt.optimized_fuel, optData.optimizedFuel),
+            estimatedCO2: num(row.estimated_carbon_kg, route.estimated_carbon_kg, opt.original_carbon_kg, optData.originalCarbon),
+            actualCO2: num(row.optimized_carbon_kg, opt.optimized_carbon_kg, optData.optimizedCarbon)
+          };
+        });
+      }
+    }
     res.json({ success: true, routes });
   } catch (err) { res.status(500).json({ success: false }); }
 });
@@ -2122,7 +2179,7 @@ app.get("/api/driver/assigned-routes", async (req, res) => {
     }
     
     // Get deliveries assigned to this driver
-    const result = await pool.query(`
+    let result = await pool.query(`
       SELECT d.*, ra.route_type, ra.original_distance, ra.optimized_distance, 
              ra.original_fuel, ra.optimized_fuel, ra.original_co2, ra.optimized_co2,
              ra.savings_km, ra.savings_fuel, ra.savings_co2
@@ -2131,6 +2188,21 @@ app.get("/api/driver/assigned-routes", async (req, res) => {
       WHERE d.driver_name = $1 AND d.status IN ('assigned', 'accepted', 'in_progress')
       ORDER BY d.departure_time ASC
     `, [driver_name]);
+
+    if (result.rows.length === 0) {
+      const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
+      const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
+      if (hasManagerApprovals) {
+        result = await pool.query(`
+          SELECT *
+          FROM manager_approvals ma
+          WHERE ma.approval_type = 'route_optimization'
+            AND LOWER(COALESCE(ma.driver_name, ma.extra_data->'route'->>'driver_name', '')) = LOWER($1)
+            AND LOWER(COALESCE(ma.status, '')) IN ('pending', 'approved', 'accepted', 'in_progress', 'awaiting_approval')
+          ORDER BY ma.created_at ASC
+        `, [driver_name]);
+      }
+    }
     
     res.json({ success: true, routes: result.rows });
   } catch (err) {
@@ -2147,7 +2219,7 @@ app.get("/api/driver/pending-deliveries", async (req, res) => {
       return res.status(400).json({ success: false, message: "Driver name is required" });
     }
     
-    const result = await pool.query(`
+    let result = await pool.query(`
       SELECT d.*, ra.route_type, ra.from_location, ra.to_location, 
              ra.original_distance, ra.optimized_distance, ra.original_fuel, ra.optimized_fuel,
              ra.original_co2, ra.optimized_co2, ra.savings_km, ra.savings_fuel, ra.savings_co2,
@@ -2157,8 +2229,121 @@ app.get("/api/driver/pending-deliveries", async (req, res) => {
       WHERE d.driver_name = $1 AND d.status = 'assigned'
       ORDER BY d.departure_time ASC
     `, [driver_name]);
+
+    if (result.rows.length === 0) {
+      const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
+      const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
+      if (hasManagerApprovals) {
+        result = await pool.query(`
+          SELECT *
+          FROM manager_approvals ma
+          WHERE ma.approval_type = 'route_optimization'
+            AND LOWER(COALESCE(ma.driver_name, ma.extra_data->'route'->>'driver_name', '')) = LOWER($1)
+            AND (
+              LOWER(COALESCE(ma.status, '')) IN ('pending', 'awaiting_approval', 'submitted', 'assigned')
+              OR LOWER(COALESCE(ma.status, '')) LIKE '%pending%'
+              OR LOWER(COALESCE(ma.status, '')) LIKE '%await%'
+            )
+          ORDER BY ma.created_at ASC
+        `, [driver_name]);
+      }
+    }
     
     res.json({ success: true, deliveries: result.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: "Database error" });
+  }
+});
+
+// Driver history endpoint for Delivery > History screen.
+app.get("/api/driver/history", async (req, res) => {
+  try {
+    const { driver_name } = req.query;
+    if (!driver_name) {
+      return res.status(400).json({ success: false, message: "Driver name is required" });
+    }
+
+    const deliveriesHistory = await pool.query(`
+      SELECT d.*, ra.route_type
+      FROM deliveries d
+      LEFT JOIN route_approvals ra ON d.route_id = ra.id
+      WHERE LOWER(COALESCE(d.driver_name, '')) = LOWER($1)
+        AND d.status IN ('completed', 'declined', 'cancelled')
+      ORDER BY d.completed_at DESC NULLS LAST, d.arrival_time DESC NULLS LAST, d.created_at DESC
+      LIMIT 100
+    `, [driver_name]);
+
+    let history = deliveriesHistory.rows.map(row => ({
+      deliveryId: row.delivery_id,
+      routeId: row.route_id,
+      routeType: row.route_type || null,
+      status: row.status,
+      driver: row.driver_name,
+      vehicle: row.vehicle_type,
+      departureTime: row.departure_time,
+      arrivalTime: row.arrival_time,
+      completedAt: row.completed_at || row.arrival_time || null,
+      from: row.from_location,
+      to: row.to_location,
+      distance: parseFloat(row.distance_km) || 0,
+      estimatedFuel: parseFloat(row.estimated_fuel_consumption_liters) || 0,
+      actualFuel: parseFloat(row.fuel_consumption) || 0,
+      estimatedCO2: parseFloat(row.estimated_carbon_kg) || 0,
+      actualCO2: parseFloat(row.carbon_emissions) || 0
+    }));
+
+    // Fallback history from manager approvals if delivery history table is empty.
+    if (history.length === 0) {
+      const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
+      const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
+      if (hasManagerApprovals) {
+        const managerHistory = await pool.query(`
+          SELECT *
+          FROM manager_approvals ma
+          WHERE ma.approval_type = 'route_optimization'
+            AND LOWER(COALESCE(ma.driver_name, ma.extra_data->'route'->>'driver_name', '')) = LOWER($1)
+            AND LOWER(COALESCE(ma.status, '')) IN ('approved', 'rejected', 'declined')
+          ORDER BY ma.reviewed_at DESC NULLS LAST, ma.decision_date DESC NULLS LAST, ma.created_at DESC
+          LIMIT 100
+        `, [driver_name]);
+
+        const num = (...vals) => {
+          for (const v of vals) {
+            const n = Number(v);
+            if (!Number.isNaN(n) && Number.isFinite(n)) return n;
+          }
+          return 0;
+        };
+
+        history = managerHistory.rows.map(row => {
+          const extra = row.extra_data && typeof row.extra_data === "object" ? row.extra_data : {};
+          const route = extra.route && typeof extra.route === "object" ? extra.route : {};
+          const opt = extra.optimization && typeof extra.optimization === "object" ? extra.optimization : {};
+          const optData = opt.optimization_data && typeof opt.optimization_data === "object" ? opt.optimization_data : {};
+          return {
+            deliveryId: row.delivery_id || row.approval_id,
+            routeId: route.route_id || row.delivery_id || row.approval_id,
+            routeType: route.route_type || null,
+            status: row.status,
+            driver: row.driver_name || route.driver_name || driver_name,
+            vehicle: row.vehicle_type || route.vehicle_type || "Van",
+            departureTime: route.created_at || row.created_at || null,
+            arrivalTime: row.reviewed_at || row.decision_date || null,
+            completedAt: row.reviewed_at || row.decision_date || row.created_at || null,
+            from: route.origin_location?.address || row.location || "",
+            to: route.destination_location?.address || "",
+            distance: num(row.total_distance_km, route.total_distance_km, opt.optimized_distance, optData.optimizedDistance),
+            estimatedFuel: num(row.estimated_fuel_consumption_liters, route.estimated_fuel_consumption_liters, opt.original_fuel, optData.originalFuel),
+            actualFuel: num(row.optimized_fuel, opt.optimized_fuel, optData.optimizedFuel),
+            estimatedCO2: num(row.estimated_carbon_kg, route.estimated_carbon_kg, opt.original_carbon_kg, optData.originalCarbon),
+            actualCO2: num(row.optimized_carbon_kg, opt.optimized_carbon_kg, optData.optimizedCarbon)
+          };
+        });
+      }
+    }
+
+    res.json({ success: true, history, message: null });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, message: "Database error" });
