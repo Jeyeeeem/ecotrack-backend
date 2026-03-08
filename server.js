@@ -1026,9 +1026,9 @@ app.get("/api/logistics/dashboard", async (req, res) => {
             (SELECT COUNT(*) FROM route_approvals WHERE UPPER(status) IN ('PENDING', 'AWAITING_APPROVAL')) as pending_count,
             (SELECT COUNT(*) FROM route_approvals WHERE status = 'APPROVED') as approved_count,
             (SELECT COUNT(*) FROM route_approvals WHERE status = 'DECLINED') as declined_count,
-            COALESCE(AVG(savings_co2), 0) FILTER (WHERE status = 'APPROVED') as avg_co2_saved,
-            COALESCE(SUM(savings_co2), 0) FILTER (WHERE status = 'APPROVED') as total_co2_reduced,
-            COALESCE(SUM(savings_km), 0) FILTER (WHERE status = 'APPROVED') as total_km_saved
+            COALESCE(AVG(savings_co2) FILTER (WHERE status = 'APPROVED'), 0) as avg_co2_saved,
+            COALESCE(SUM(savings_co2) FILTER (WHERE status = 'APPROVED'), 0) as total_co2_reduced,
+            COALESCE(SUM(savings_km) FILTER (WHERE status = 'APPROVED'), 0) as total_km_saved
           FROM route_approvals`
         );
       }
@@ -1066,9 +1066,9 @@ app.get("/api/logistics/dashboard", async (req, res) => {
           (SELECT COUNT(*) FROM route_approvals WHERE UPPER(status) IN ('PENDING', 'AWAITING_APPROVAL')) as pending_count,
           (SELECT COUNT(*) FROM route_approvals WHERE status = 'APPROVED') as approved_count,
           (SELECT COUNT(*) FROM route_approvals WHERE status = 'DECLINED') as declined_count,
-          COALESCE(AVG(savings_co2), 0) FILTER (WHERE status = 'APPROVED') as avg_co2_saved,
-          COALESCE(SUM(savings_co2), 0) FILTER (WHERE status = 'APPROVED') as total_co2_reduced,
-          COALESCE(SUM(savings_km), 0) FILTER (WHERE status = 'APPROVED') as total_km_saved
+          COALESCE(AVG(savings_co2) FILTER (WHERE status = 'APPROVED'), 0) as avg_co2_saved,
+          COALESCE(SUM(savings_co2) FILTER (WHERE status = 'APPROVED'), 0) as total_co2_reduced,
+          COALESCE(SUM(savings_km) FILTER (WHERE status = 'APPROVED'), 0) as total_km_saved
         FROM route_approvals`
       );
     } else {
@@ -1255,7 +1255,7 @@ app.get("/api/logistics/stats", async (req, res) => {
           SELECT COUNT(*) FILTER (WHERE UPPER(status) IN ('PENDING', 'AWAITING_APPROVAL')) as pending_count, 
                  COUNT(*) FILTER (WHERE UPPER(status) = 'APPROVED') as approved_count, 
                  COUNT(*) FILTER (WHERE UPPER(status) = 'DECLINED') as declined_count, 
-                 COALESCE(AVG(savings_co2), 0) FILTER (WHERE UPPER(status) = 'APPROVED') as avg_co2_saved 
+                 COALESCE(AVG(savings_co2) FILTER (WHERE UPPER(status) = 'APPROVED'), 0) as avg_co2_saved 
           FROM route_approvals
         `)
       : await pool.query(`
@@ -1278,7 +1278,7 @@ app.get("/api/logistics/stats", async (req, res) => {
           SELECT COUNT(*) FILTER (WHERE UPPER(status) IN ('PENDING', 'AWAITING_APPROVAL')) as pending_count, 
                  COUNT(*) FILTER (WHERE UPPER(status) = 'APPROVED') as approved_count, 
                  COUNT(*) FILTER (WHERE UPPER(status) = 'DECLINED') as declined_count, 
-                 COALESCE(AVG(savings_co2), 0) FILTER (WHERE UPPER(status) = 'APPROVED') as avg_co2_saved 
+                 COALESCE(AVG(savings_co2) FILTER (WHERE UPPER(status) = 'APPROVED'), 0) as avg_co2_saved 
           FROM route_approvals
         `);
       }
@@ -1722,9 +1722,9 @@ app.get("/api/driver/dashboard", async (req, res) => {
 
     const statsResult = await pool.query(`
       SELECT COUNT(*) FILTER (WHERE d.status = 'completed') as total_completed, 
-             COALESCE(SUM(d.distance_km), 0) FILTER (WHERE d.status = 'completed') as total_km, 
-             COALESCE(SUM(d.fuel_consumption), 0) FILTER (WHERE d.status = 'completed') as total_fuel, 
-             COALESCE(SUM(d.carbon_emissions), 0) FILTER (WHERE d.status = 'completed') as total_carbon,
+             COALESCE(SUM(d.distance_km) FILTER (WHERE d.status = 'completed'), 0) as total_km, 
+             COALESCE(SUM(d.fuel_consumption) FILTER (WHERE d.status = 'completed'), 0) as total_fuel, 
+             COALESCE(SUM(d.carbon_emissions) FILTER (WHERE d.status = 'completed'), 0) as total_carbon,
              COUNT(*) FILTER (WHERE d.status IN ('assigned', 'accepted', 'in_progress')) as active_deliveries
       FROM deliveries d
       WHERE d.driver_name IS NOT NULL ${clause}
