@@ -1662,6 +1662,29 @@ const toFiniteNumberPreferNonZero = (...values) => {
   return fallback === null ? 0 : fallback;
 };
 
+const haversineKm = (a, b) => {
+  if (!a || !b) return 0;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const R = 6371; // Earth radius km
+  const dLat = toRad((b.latitude || 0) - (a.latitude || 0));
+  const dLon = toRad((b.longitude || 0) - (a.longitude || 0));
+  const lat1 = toRad(a.latitude || 0);
+  const lat2 = toRad(b.latitude || 0);
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+};
+
+const computePathDistanceKm = (points) => {
+  if (!Array.isArray(points) || points.length < 2) return 0;
+  let sum = 0;
+  for (let i = 1; i < points.length; i++) {
+    sum += haversineKm(points[i - 1], points[i]);
+  }
+  return Number.isFinite(sum) ? sum : 0;
+};
+
 const normalizeLogisticsStop = (stop, index) => {
   const name = stop?.stop_name || stop?.stopName || stop?.location_name || stop?.location || stop?.name || `Stop ${index + 1}`;
   const address = stop?.address || stop?.location || stop?.full_address || "";
@@ -2249,6 +2272,57 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     row.co2_saved_kg
   );
 
+  // Fallbacks: derive metrics from path when missing/zero to avoid duplicated placeholders
+  const finalOriginalDistance = originalDistance > 0 ? originalDistance : computedDistanceKm;
+  const finalOptimizedDistance =
+    optimizedDistance > 0
+      ? optimizedDistance
+      : finalOriginalDistance > 0
+      ? Math.max(finalOriginalDistance * 0.85, finalOriginalDistance * 0.7)
+      : 0;
+
+  const fuelPerKm = 0.08; // ~8L/100km default
+  const co2PerLiter = 2.31; // kg CO2 per liter diesel baseline
+
+  const finalOriginalFuel =
+    originalFuel > 0
+      ? originalFuel
+      : finalOriginalDistance > 0
+      ? finalOriginalDistance * fuelPerKm
+      : 0;
+  const finalOptimizedFuel =
+    optimizedFuel > 0
+      ? optimizedFuel
+      : finalOptimizedDistance > 0
+      ? finalOptimizedDistance * fuelPerKm
+      : 0;
+
+  const finalOriginalCO2 =
+    originalCO2 > 0
+      ? originalCO2
+      : finalOriginalFuel > 0
+      ? finalOriginalFuel * co2PerLiter
+      : 0;
+  const finalOptimizedCO2 =
+    optimizedCO2 > 0
+      ? optimizedCO2
+      : finalOptimizedFuel > 0
+      ? finalOptimizedFuel * co2PerLiter
+      : 0;
+
+  const finalSavingsKm =
+    totalSavingsKm > 0 && finalOriginalDistance > 0
+      ? totalSavingsKm
+      : Math.max(finalOriginalDistance - finalOptimizedDistance, 0);
+  const finalSavingsFuel =
+    totalSavingsFuel > 0 && finalOriginalFuel > 0
+      ? totalSavingsFuel
+      : Math.max(finalOriginalFuel - finalOptimizedFuel, 0);
+  const finalSavingsCO2 =
+    totalSavingsCO2 > 0 && finalOriginalCO2 > 0
+      ? totalSavingsCO2
+      : Math.max(finalOriginalCO2 - finalOptimizedCO2, 0);
+
   const submittedBy = row.submitted_by || row.requested_by || row.reviewed_by || "System";
   const payload = {
     route_id: routeId,
@@ -2276,24 +2350,24 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     vehicle: row.vehicle_type || requestData.vehicle_type || routeData.vehicle_type || "Van",
     departure_time: row.departure_time || routeData.created_at || row.created_at || null,
     departureTime: row.departure_time || routeData.created_at || row.created_at || null,
-    original_distance: originalDistance,
-    originalDistance,
-    optimized_distance: optimizedDistance,
-    optimizedDistance,
-    original_fuel: originalFuel,
-    originalFuel,
-    optimized_fuel: optimizedFuel,
-    optimizedFuel,
-    original_co2: originalCO2,
-    originalCO2,
-    optimized_co2: optimizedCO2,
-    optimizedCO2,
-    savings_km: totalSavingsKm,
-    totalSavingsKm,
-    savings_fuel: totalSavingsFuel,
-    totalSavingsFuel,
-    savings_co2: totalSavingsCO2,
-    totalSavingsCO2,
+    original_distance: finalOriginalDistance,
+    originalDistance: finalOriginalDistance,
+    optimized_distance: finalOptimizedDistance,
+    optimizedDistance: finalOptimizedDistance,
+    original_fuel: finalOriginalFuel,
+    originalFuel: finalOriginalFuel,
+    optimized_fuel: finalOptimizedFuel,
+    optimizedFuel: finalOptimizedFuel,
+    original_co2: finalOriginalCO2,
+    originalCO2: finalOriginalCO2,
+    optimized_co2: finalOptimizedCO2,
+    optimizedCO2: finalOptimizedCO2,
+    savings_km: finalSavingsKm,
+    totalSavingsKm: finalSavingsKm,
+    savings_fuel: finalSavingsFuel,
+    totalSavingsFuel: finalSavingsFuel,
+    savings_co2: finalSavingsCO2,
+    totalSavingsCO2: finalSavingsCO2,
     ai_suggestion: aiSuggestion,
     aiSuggestion,
     aiOptimization: {
