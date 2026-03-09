@@ -4651,6 +4651,9 @@ app.get("/api/driver/dashboard", authenticate, async (req, res) => {
     const { driver_name } = req.query;
     const driverAliases = await resolveDriverFilterAliases({ queryDriverName: driver_name, user: req.user });
     const hasDriverFilter = driverAliases.length > 0;
+    if (!hasDriverFilter) {
+      return res.status(400).json({ success: false, message: "Driver context missing" });
+    }
     const args = hasDriverFilter ? [driverAliases] : [];
     const clause = hasDriverFilter ? `AND LOWER(COALESCE(d.driver_name, '')) = ANY($1)` : ``;
     const deliveriesColumns = await getTableColumns("deliveries");
@@ -4782,8 +4785,18 @@ app.post("/api/driver/respond-delivery", authenticate, async (req, res) => {
       return res.status(403).json({ success: false, message: "Delivery not assigned to this driver" });
     }
     const status = decision.toUpperCase() === 'ACCEPT' ? 'accepted' : 'declined';
-    await pool.query(`UPDATE deliveries SET status = $1, driver_response = $2, driver_notes = $3, driver_responded_at = NOW() WHERE delivery_id = $4`, [status, decision, notes, deliveryId]);
-    res.json({ success: true, message: "Response recorded" });
+    const updated = await pool.query(
+      `UPDATE deliveries
+       SET status = $1, driver_response = $2, driver_notes = $3, driver_responded_at = NOW()
+       WHERE delivery_id = $4
+       RETURNING *`,
+      [status, decision, notes, deliveryId]
+    );
+    res.json({
+      success: true,
+      message: "Response recorded",
+      delivery: updated.rows[0] || null
+    });
   } catch (err) { res.status(500).json({ success: false }); }
 });
 
@@ -4801,12 +4814,12 @@ app.get("/api/driver/routes", authenticate, async (req, res) => {
       WHERE d.driver_name IS NOT NULL
     `;
     const driverAliases = await resolveDriverFilterAliases({ queryDriverName: driver_name, user: req.user });
-    const params = [];
-    if (driverAliases.length > 0) {
-      params.push(driverAliases);
-      query += ` AND d.driver_name = $1`;
-      query = query.replace("d.driver_name = $1", "LOWER(COALESCE(d.driver_name, '')) = ANY($1)");
+    if (driverAliases.length === 0) {
+      return res.status(400).json({ success: false, message: "Driver context missing" });
     }
+    const params = [];
+    params.push(driverAliases);
+    query += ` AND LOWER(COALESCE(d.driver_name, '')) = ANY($1)`;
     query += ` ORDER BY ${driverRoutesOrderBy} LIMIT 50`;
     let result = await pool.query(query, params);
     let routes = result.rows.map(row => ({
@@ -4908,6 +4921,9 @@ app.get("/api/driver/delivery/:id", authenticate, async (req, res) => {
     const driverGuard = driverAliases.length > 0
       ? ` AND LOWER(COALESCE(d.driver_name, '')) = ANY($2)`
       : ``;
+    if (driverAliases.length === 0) {
+      return res.status(400).json({ success: false, message: "Driver context missing" });
+    }
     if (driverAliases.length > 0) params.push(driverAliases);
     const result = await pool.query(
       `SELECT d.*${joinRouteApprovals ? ", ra.route_type" : ""}
@@ -5143,6 +5159,8 @@ app.post("/api/driver/confirm-stop", authenticate, async (req, res) => {
     const routeId = delivery.route_id;
     const stopSequence = normalizedStopIndex + 1;
     const isArrival = String(confirmationType || "").toLowerCase() === "arrival";
+    const isAcceptedNotStarted = String(delivery.status || "").toLowerCase() === "accepted";
+    const shouldMarkCompleted = !isArrival || !isAcceptedNotStarted || stopSequence !== 1;
     let routeStopsUpdated = false;
 
     try {
@@ -5155,7 +5173,7 @@ app.post("/api/driver/confirm-stop", authenticate, async (req, res) => {
           const setClauses = [];
           if (isArrival) {
             if (routeStopsColumns.has("actual_arrival_time")) setClauses.push("actual_arrival_time = NOW()");
-            if (routeStopsColumns.has("status")) setClauses.push(`status = 'arrived'`);
+            if (routeStopsColumns.has("status")) setClauses.push(`status = '${shouldMarkCompleted ? "completed" : "arrived"}'`);
           } else {
             if (routeStopsColumns.has("actual_departure_time")) setClauses.push("actual_departure_time = NOW()");
             if (routeStopsColumns.has("status")) setClauses.push(`status = 'completed'`);
@@ -5182,7 +5200,7 @@ app.post("/api/driver/confirm-stop", authenticate, async (req, res) => {
       const updatedStops = [...delivery.stops_json];
       updatedStops[normalizedStopIndex] = {
         ...updatedStops[normalizedStopIndex],
-        status: isArrival ? "arrived" : "completed"
+        status: isArrival ? (shouldMarkCompleted ? "completed" : "arrived") : "completed"
       };
       await pool.query(`UPDATE deliveries SET stops_json = $1 WHERE delivery_id = $2`, [JSON.stringify(updatedStops), normalizedDeliveryId]);
       stopsJsonUpdated = true;
@@ -5322,6 +5340,9 @@ app.get("/api/driver/history", authenticate, async (req, res) => {
     const { driver_name } = req.query;
     const driverAliases = await resolveDriverFilterAliases({ queryDriverName: driver_name, user: req.user });
     const hasDriverFilter = driverAliases.length > 0;
+    if (!hasDriverFilter) {
+      return res.status(400).json({ success: false, message: "Driver context missing" });
+    }
     const historyParams = hasDriverFilter ? [driverAliases] : [];
     const historyDriverClause = hasDriverFilter
       ? `AND LOWER(COALESCE(d.driver_name, '')) = ANY($1)`
