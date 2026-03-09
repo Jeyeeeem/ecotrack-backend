@@ -3530,6 +3530,22 @@ app.post("/api/logistics/approve", async (req, res) => {
         });
       }
 
+      if (hasRouteApprovals && resolvedRouteId) {
+        try {
+          const routeApprovalColumns = await getTableColumns("route_approvals");
+          if (routeApprovalColumns.has("driver_name")) {
+            await pool.query(
+              `UPDATE route_approvals
+               SET driver_name = $1
+               WHERE id::text = $2 OR COALESCE(route_id::text, '') = $2`,
+              [assignedDriver, String(resolvedRouteId)]
+            );
+          }
+        } catch (routeDriverSyncErr) {
+          console.warn("Route approval driver sync fallback:", routeDriverSyncErr.message);
+        }
+      }
+
       const deliveriesTableCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
       const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
 
@@ -4560,12 +4576,70 @@ app.get("/api/sustainability/history", async (req, res) => {
 // DRIVER ROUTES (Existing)
 // ============================================================
 
-app.get("/api/driver/dashboard", async (req, res) => {
+async function resolveDriverFilterAliases({ queryDriverName, user }) {
+  const aliases = [];
+  const pushAlias = (value) => {
+    const normalized = String(value || "").trim().toLowerCase();
+    if (!normalized) return;
+    if (!aliases.includes(normalized)) aliases.push(normalized);
+  };
+
+  if (queryDriverName) pushAlias(queryDriverName);
+
+  const userId = Number(user?.userId || user?.id);
+  if (userId && Number.isFinite(userId)) {
+    try {
+      const userColumns = await getTableColumns("users");
+      const idCol = userColumns.has("user_id")
+        ? "user_id"
+        : userColumns.has("id")
+        ? "id"
+        : null;
+      if (idCol) {
+        const nameExpr = userColumns.has("full_name")
+          ? "NULLIF(full_name, '')"
+          : "NULL";
+        const usernameExpr = userColumns.has("username")
+          ? "NULLIF(username, '')"
+          : "NULL";
+        const nameFallbackExpr = userColumns.has("name")
+          ? "NULLIF(name, '')"
+          : "NULL";
+        const emailExpr = userColumns.has("email")
+          ? "NULLIF(email, '')"
+          : "NULL";
+
+        const userResult = await pool.query(
+          `SELECT ${nameExpr} AS full_name, ${nameFallbackExpr} AS name, ${usernameExpr} AS username, ${emailExpr} AS email
+           FROM users
+           WHERE ${idCol} = $1
+           LIMIT 1`,
+          [userId]
+        );
+        const row = userResult.rows[0];
+        if (row) {
+          pushAlias(row.full_name);
+          pushAlias(row.name);
+          pushAlias(row.username);
+          pushAlias(row.email);
+          if (row.email) pushAlias(String(row.email).split("@")[0]);
+        }
+      }
+    } catch (driverLookupErr) {
+      console.warn("Driver alias resolution fallback:", driverLookupErr.message);
+    }
+  }
+
+  return aliases;
+}
+
+app.get("/api/driver/dashboard", optionalAuth, async (req, res) => {
   try {
     const { driver_name } = req.query;
-    const hasDriverFilter = !!driver_name;
-    const args = hasDriverFilter ? [driver_name] : [];
-    const clause = hasDriverFilter ? `AND d.driver_name = $1` : ``;
+    const driverAliases = await resolveDriverFilterAliases({ queryDriverName: driver_name, user: req.user });
+    const hasDriverFilter = driverAliases.length > 0;
+    const args = hasDriverFilter ? [driverAliases] : [];
+    const clause = hasDriverFilter ? `AND LOWER(COALESCE(d.driver_name, '')) = ANY($1)` : ``;
     const deliveriesColumns = await getTableColumns("deliveries");
     const col = (name, fallbackSql) => deliveriesColumns.has(name) ? `d.${name}` : `${fallbackSql} as ${name}`;
     const orderByCreated = deliveriesColumns.has("created_at")
@@ -4685,7 +4759,7 @@ app.post("/api/driver/respond-delivery", async (req, res) => {
   } catch (err) { res.status(500).json({ success: false }); }
 });
 
-app.get("/api/driver/routes", async (req, res) => {
+app.get("/api/driver/routes", optionalAuth, async (req, res) => {
   try {
     const { driver_name } = req.query;
     const deliveriesColumns = await getTableColumns("deliveries");
@@ -4698,10 +4772,12 @@ app.get("/api/driver/routes", async (req, res) => {
       LEFT JOIN route_approvals ra ON d.route_id = ra.id
       WHERE d.driver_name IS NOT NULL
     `;
+    const driverAliases = await resolveDriverFilterAliases({ queryDriverName: driver_name, user: req.user });
     const params = [];
-    if (driver_name) {
-      params.push(driver_name);
+    if (driverAliases.length > 0) {
+      params.push(driverAliases);
       query += ` AND d.driver_name = $1`;
+      query = query.replace("d.driver_name = $1", "LOWER(COALESCE(d.driver_name, '')) = ANY($1)");
     }
     query += ` ORDER BY ${driverRoutesOrderBy} LIMIT 50`;
     let result = await pool.query(query, params);
@@ -4724,7 +4800,7 @@ app.get("/api/driver/routes", async (req, res) => {
 
     // Fallback for deployments where driver routes are stored in manager_approvals.extra_data
     // and deliveries rows are not yet created.
-    if (routes.length === 0 && driver_name) {
+    if (routes.length === 0 && driverAliases.length > 0) {
       const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
       const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
       if (hasManagerApprovals) {
@@ -4732,10 +4808,10 @@ app.get("/api/driver/routes", async (req, res) => {
           SELECT *
           FROM manager_approvals ma
           WHERE ma.approval_type = 'route_optimization'
-            AND LOWER(COALESCE(ma.driver_name, ma.extra_data->'route'->>'driver_name', '')) = LOWER($1)
+            AND LOWER(COALESCE(ma.driver_name, ma.extra_data->'route'->>'driver_name', '')) = ANY($1)
           ORDER BY ma.created_at DESC
           LIMIT 50
-        `, [driver_name]);
+        `, [driverAliases]);
 
         const mapStatus = (status) => {
           const s = String(status || "").toLowerCase();
@@ -4763,7 +4839,7 @@ app.get("/api/driver/routes", async (req, res) => {
             deliveryId: row.delivery_id || row.approval_id,
             routeId: route.route_id || row.delivery_id || row.approval_id,
             status: mapStatus(row.status || row.decision),
-            driver: row.driver_name || route.driver_name || driver_name,
+            driver: row.driver_name || route.driver_name || driverAliases[0] || null,
             vehicle: row.vehicle_type || route.vehicle_type || "Van",
             departureTime: route.created_at || row.created_at || null,
             arrivalTime: row.reviewed_at || row.decision_date || null,
@@ -4782,9 +4858,11 @@ app.get("/api/driver/routes", async (req, res) => {
   } catch (err) { res.status(500).json({ success: false }); }
 });
 
-app.get("/api/driver/delivery/:id", async (req, res) => {
+app.get("/api/driver/delivery/:id", optionalAuth, async (req, res) => {
   try {
     const { id } = req.params;
+    const { driver_name } = req.query;
+    const driverAliases = await resolveDriverFilterAliases({ queryDriverName: driver_name, user: req.user });
     const deliveriesColumns = await getTableColumns("deliveries");
     const deliveryIdCol = deliveriesColumns.has("delivery_id")
       ? "delivery_id"
@@ -4798,13 +4876,18 @@ app.get("/api/driver/delivery/:id", async (req, res) => {
     const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
     const joinRouteApprovals = hasRouteApprovals && hasRouteIdCol;
+    const params = [String(id)];
+    const driverGuard = driverAliases.length > 0
+      ? ` AND LOWER(COALESCE(d.driver_name, '')) = ANY($2)`
+      : ``;
+    if (driverAliases.length > 0) params.push(driverAliases);
     const result = await pool.query(
       `SELECT d.*${joinRouteApprovals ? ", ra.route_type" : ""}
        FROM deliveries d
        ${joinRouteApprovals ? "LEFT JOIN route_approvals ra ON d.route_id = ra.id" : ""}
-       WHERE d.${deliveryIdCol}::text = $1
+       WHERE d.${deliveryIdCol}::text = $1${driverGuard}
        LIMIT 1`,
-      [String(id)]
+      params
     );
 
     if (result.rows.length === 0) {
@@ -5020,10 +5103,11 @@ app.get("/api/drivers", async (req, res) => {
 });
 
 // Get assigned routes for a driver (for driver's dashboard)
-app.get("/api/driver/assigned-routes", async (req, res) => {
+app.get("/api/driver/assigned-routes", optionalAuth, async (req, res) => {
   try {
     const { driver_name } = req.query;
-    if (!driver_name) {
+    const driverAliases = await resolveDriverFilterAliases({ queryDriverName: driver_name, user: req.user });
+    if (driverAliases.length === 0) {
       return res.status(400).json({ success: false, message: "Driver name is required" });
     }
     
@@ -5034,9 +5118,9 @@ app.get("/api/driver/assigned-routes", async (req, res) => {
              ra.savings_km, ra.savings_fuel, ra.savings_co2
       FROM deliveries d
       LEFT JOIN route_approvals ra ON d.route_id = ra.id
-      WHERE d.driver_name = $1 AND d.status IN ('assigned', 'accepted', 'in_progress')
+      WHERE LOWER(COALESCE(d.driver_name, '')) = ANY($1) AND d.status IN ('assigned', 'accepted', 'in_progress')
       ORDER BY d.departure_time ASC
-    `, [driver_name]);
+    `, [driverAliases]);
 
     if (result.rows.length === 0) {
       const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
@@ -5046,10 +5130,10 @@ app.get("/api/driver/assigned-routes", async (req, res) => {
           SELECT *
           FROM manager_approvals ma
           WHERE ma.approval_type = 'route_optimization'
-            AND LOWER(COALESCE(ma.driver_name, ma.extra_data->'route'->>'driver_name', '')) = LOWER($1)
+            AND LOWER(COALESCE(ma.driver_name, ma.extra_data->'route'->>'driver_name', '')) = ANY($1)
             AND LOWER(COALESCE(ma.status, '')) IN ('pending', 'approved', 'accepted', 'in_progress', 'awaiting_approval')
           ORDER BY ma.created_at ASC
-        `, [driver_name]);
+        `, [driverAliases]);
       }
     }
     
@@ -5061,10 +5145,11 @@ app.get("/api/driver/assigned-routes", async (req, res) => {
 });
 
 // Get pending deliveries for a driver (new assignments)
-app.get("/api/driver/pending-deliveries", async (req, res) => {
+app.get("/api/driver/pending-deliveries", optionalAuth, async (req, res) => {
   try {
     const { driver_name } = req.query;
-    if (!driver_name) {
+    const driverAliases = await resolveDriverFilterAliases({ queryDriverName: driver_name, user: req.user });
+    if (driverAliases.length === 0) {
       return res.status(400).json({ success: false, message: "Driver name is required" });
     }
     
@@ -5075,9 +5160,9 @@ app.get("/api/driver/pending-deliveries", async (req, res) => {
              ra.ai_suggestion
       FROM deliveries d
       LEFT JOIN route_approvals ra ON d.route_id = ra.id
-      WHERE d.driver_name = $1 AND d.status = 'assigned'
+      WHERE LOWER(COALESCE(d.driver_name, '')) = ANY($1) AND d.status = 'assigned'
       ORDER BY d.departure_time ASC
-    `, [driver_name]);
+    `, [driverAliases]);
 
     if (result.rows.length === 0) {
       const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
@@ -5087,14 +5172,14 @@ app.get("/api/driver/pending-deliveries", async (req, res) => {
           SELECT *
           FROM manager_approvals ma
           WHERE ma.approval_type = 'route_optimization'
-            AND LOWER(COALESCE(ma.driver_name, ma.extra_data->'route'->>'driver_name', '')) = LOWER($1)
+            AND LOWER(COALESCE(ma.driver_name, ma.extra_data->'route'->>'driver_name', '')) = ANY($1)
             AND (
               LOWER(COALESCE(ma.status, '')) IN ('pending', 'awaiting_approval', 'submitted', 'assigned')
               OR LOWER(COALESCE(ma.status, '')) LIKE '%pending%'
               OR LOWER(COALESCE(ma.status, '')) LIKE '%await%'
             )
           ORDER BY ma.created_at ASC
-        `, [driver_name]);
+        `, [driverAliases]);
       }
     }
     
@@ -5106,13 +5191,14 @@ app.get("/api/driver/pending-deliveries", async (req, res) => {
 });
 
 // Driver history endpoint for Delivery > History screen.
-app.get("/api/driver/history", async (req, res) => {
+app.get("/api/driver/history", optionalAuth, async (req, res) => {
   try {
     const { driver_name } = req.query;
-    const hasDriverFilter = !!driver_name;
-    const historyParams = hasDriverFilter ? [driver_name] : [];
+    const driverAliases = await resolveDriverFilterAliases({ queryDriverName: driver_name, user: req.user });
+    const hasDriverFilter = driverAliases.length > 0;
+    const historyParams = hasDriverFilter ? [driverAliases] : [];
     const historyDriverClause = hasDriverFilter
-      ? `AND LOWER(COALESCE(d.driver_name, '')) = LOWER($1)`
+      ? `AND LOWER(COALESCE(d.driver_name, '')) = ANY($1)`
       : ``;
 
     const deliveriesHistory = await pool.query(`
@@ -5150,9 +5236,9 @@ app.get("/api/driver/history", async (req, res) => {
       const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
       const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
       if (hasManagerApprovals) {
-        const managerParams = hasDriverFilter ? [driver_name] : [];
+        const managerParams = hasDriverFilter ? [driverAliases] : [];
         const managerDriverClause = hasDriverFilter
-          ? `AND LOWER(COALESCE(ma.driver_name, ma.extra_data->'route'->>'driver_name', '')) = LOWER($1)`
+          ? `AND LOWER(COALESCE(ma.driver_name, ma.extra_data->'route'->>'driver_name', '')) = ANY($1)`
           : ``;
         const managerHistory = await pool.query(`
           SELECT *
@@ -5182,7 +5268,7 @@ app.get("/api/driver/history", async (req, res) => {
             routeId: route.route_id || row.delivery_id || row.approval_id,
             routeType: route.route_type || null,
             status: row.status,
-            driver: row.driver_name || route.driver_name || driver_name,
+            driver: row.driver_name || route.driver_name || driverAliases[0] || null,
             vehicle: row.vehicle_type || route.vehicle_type || "Van",
             departureTime: route.created_at || row.created_at || null,
             arrivalTime: row.reviewed_at || row.decision_date || null,
