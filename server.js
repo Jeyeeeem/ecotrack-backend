@@ -3242,7 +3242,7 @@ app.get("/api/logistics/history", async (req, res) => {
 });
 
 app.post("/api/logistics/approve", async (req, res) => {
-  const { routeId, decision, comment } = req.body;
+  const { routeId, decision, comment, driverName, driverUserId } = req.body;
   try {
     const statusNormalized = String(decision || "").toUpperCase();
     const status = statusNormalized === 'APPROVE' ? 'APPROVED' : statusNormalized === 'PENDING' ? 'PENDING' : 'DECLINED';
@@ -3317,13 +3317,85 @@ app.post("/api/logistics/approve", async (req, res) => {
       const routeData = parseMaybeJsonObject(extraData.route);
       const optimization = parseMaybeJsonObject(extraData.optimization);
       const optimizationData = parseMaybeJsonObject(optimization.optimization_data);
+      const requestedDriverName = String(driverName || "").trim();
+      const requestedDriverId =
+        Number.isFinite(Number(driverUserId)) && Number(driverUserId) > 0
+          ? Number(driverUserId)
+          : null;
+
+      let selectedDriverName = null;
+      const usersTableCheck = await pool.query(`SELECT to_regclass('public.users') AS tbl`);
+      const hasUsers = !!usersTableCheck.rows[0]?.tbl;
+      const usersColumns = hasUsers ? await getTableColumns("users") : new Set();
+
+      if (hasUsers) {
+        const idCol = usersColumns.has("user_id")
+          ? "user_id"
+          : usersColumns.has("id")
+          ? "id"
+          : null;
+        const nameExpr = usersColumns.has("full_name")
+          ? "COALESCE(NULLIF(u.full_name, ''), NULLIF(u.name, ''), NULLIF(u.username, ''), u.email)"
+          : usersColumns.has("name")
+          ? "COALESCE(NULLIF(u.name, ''), NULLIF(u.username, ''), u.email)"
+          : usersColumns.has("username")
+          ? "COALESCE(NULLIF(u.username, ''), u.email)"
+          : usersColumns.has("email")
+          ? "u.email"
+          : "NULL";
+        const rolePredicate = usersColumns.has("role")
+          ? "LOWER(COALESCE(u.role, '')) = 'driver'"
+          : "TRUE";
+
+        let matchedDriver = null;
+
+        if (requestedDriverId && idCol) {
+          const byId = await pool.query(
+            `SELECT ${idCol}::int AS user_id, ${nameExpr} AS driver_name
+             FROM users u
+             WHERE ${idCol} = $1 AND ${rolePredicate}
+             LIMIT 1`,
+            [requestedDriverId]
+          );
+          matchedDriver = byId.rows[0] || null;
+        }
+
+        if (!matchedDriver && requestedDriverName) {
+          const byName = await pool.query(
+            `SELECT ${idCol || "NULL::int"} AS user_id, ${nameExpr} AS driver_name
+             FROM users u
+             WHERE ${rolePredicate}
+               AND (
+                 LOWER(COALESCE(${nameExpr}, '')) = LOWER($1)
+                 ${usersColumns.has("email") ? "OR LOWER(COALESCE(u.email, '')) = LOWER($1)" : ""}
+                 ${usersColumns.has("username") ? "OR LOWER(COALESCE(u.username, '')) = LOWER($1)" : ""}
+               )
+             LIMIT 1`,
+            [requestedDriverName]
+          );
+          matchedDriver = byName.rows[0] || null;
+        }
+
+        if (matchedDriver?.driver_name) {
+          selectedDriverName = String(matchedDriver.driver_name).trim();
+        }
+      }
 
       const assignedDriver =
+        selectedDriverName ||
+        requestedDriverName ||
         routeRow?.driver_name ||
         managerApprovalRow?.driver_name ||
         requestData.driver_name ||
         routeData.driver_name ||
         null;
+
+      if (!assignedDriver) {
+        return res.status(400).json({
+          success: false,
+          message: "Please select a valid driver before approving this route"
+        });
+      }
 
       const deliveriesTableCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
       const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
@@ -3332,6 +3404,22 @@ app.post("/api/logistics/approve", async (req, res) => {
         try {
           const deliveriesColumns = await getTableColumns("deliveries");
           if (deliveriesColumns.has("route_id")) {
+            const availabilityCheck = await pool.query(
+              `SELECT delivery_id
+               FROM deliveries
+               WHERE LOWER(COALESCE(driver_name, '')) = LOWER($1)
+                 AND LOWER(COALESCE(status, '')) IN ('assigned', 'accepted', 'in_progress')
+                 AND route_id::text <> $2
+               LIMIT 1`,
+              [assignedDriver, String(resolvedRouteId)]
+            );
+            if (availabilityCheck.rows.length > 0) {
+              return res.status(409).json({
+                success: false,
+                message: "Selected driver is not currently available"
+              });
+            }
+
             const routeDistance = toFiniteNumberPreferNonZero(
               routeRow?.optimized_distance,
               routeRow?.original_distance,
