@@ -3462,26 +3462,63 @@ app.post("/api/logistics/approve", async (req, res) => {
       const deliveriesTableCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
       const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
 
+      // Hard guard: selected driver must not already have pending/active work.
+      try {
+        let hasBlockingWork = false;
+
+        if (hasDeliveries) {
+          const deliveriesColumns = await getTableColumns("deliveries");
+          if (deliveriesColumns.has("driver_name") && deliveriesColumns.has("status")) {
+            const deliveryBusy = await pool.query(
+              `SELECT 1
+               FROM deliveries
+               WHERE LOWER(COALESCE(driver_name, '')) = LOWER($1)
+                 AND LOWER(COALESCE(status, '')) IN ('pending', 'assigned', 'accepted', 'in_progress')
+                 AND COALESCE(route_id::text, '') <> $2
+               LIMIT 1`,
+              [assignedDriver, String(resolvedRouteId || "")]
+            );
+            hasBlockingWork = hasBlockingWork || deliveryBusy.rows.length > 0;
+          }
+        }
+
+        if (!hasBlockingWork && hasRouteApprovals) {
+          const routeApprovalColumns = await getTableColumns("route_approvals");
+          if (routeApprovalColumns.has("driver_name") && routeApprovalColumns.has("status")) {
+            const routeBusy = await pool.query(
+              `SELECT 1
+               FROM route_approvals
+               WHERE LOWER(COALESCE(driver_name, '')) = LOWER($1)
+                 AND (
+                   LOWER(COALESCE(status, '')) IN ('pending', 'awaiting_approval', 'submitted', 'in_review', 'for_approval', 'assigned', 'accepted', 'in_progress')
+                   OR LOWER(COALESCE(status, '')) LIKE '%pending%'
+                   OR LOWER(COALESCE(status, '')) LIKE '%await%'
+                   OR LOWER(COALESCE(status, '')) LIKE '%review%'
+                   OR LOWER(COALESCE(status, '')) LIKE '%submit%'
+                 )
+                 AND COALESCE(id::text, '') <> $2
+                 AND COALESCE(route_id::text, '') <> $2
+               LIMIT 1`,
+              [assignedDriver, String(resolvedRouteId || "")]
+            );
+            hasBlockingWork = hasBlockingWork || routeBusy.rows.length > 0;
+          }
+        }
+
+        if (hasBlockingWork) {
+          return res.status(409).json({
+            success: false,
+            message: "Selected driver already has a pending/active route"
+          });
+        }
+      } catch (availabilityErr) {
+        console.warn("Driver availability guard fallback:", availabilityErr.message);
+      }
+
       if (hasDeliveries && assignedDriver && resolvedRouteId) {
         try {
           const deliveriesColumns = await getTableColumns("deliveries");
           if (deliveriesColumns.has("route_id")) {
-            const availabilityCheck = await pool.query(
-              `SELECT delivery_id
-               FROM deliveries
-               WHERE LOWER(COALESCE(driver_name, '')) = LOWER($1)
-                 AND LOWER(COALESCE(status, '')) IN ('assigned', 'accepted', 'in_progress')
-                 AND route_id::text <> $2
-               LIMIT 1`,
-              [assignedDriver, String(resolvedRouteId)]
-            );
-            if (availabilityCheck.rows.length > 0) {
-              return res.status(409).json({
-                success: false,
-                message: "Selected driver is not currently available"
-              });
-            }
-
             const routeDistance = toFiniteNumberPreferNonZero(
               routeRow?.optimized_distance,
               routeRow?.original_distance,
