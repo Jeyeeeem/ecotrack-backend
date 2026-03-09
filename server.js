@@ -4633,7 +4633,7 @@ async function resolveDriverFilterAliases({ queryDriverName, user }) {
   return aliases;
 }
 
-app.get("/api/driver/dashboard", optionalAuth, async (req, res) => {
+app.get("/api/driver/dashboard", authenticate, async (req, res) => {
   try {
     const { driver_name } = req.query;
     const driverAliases = await resolveDriverFilterAliases({ queryDriverName: driver_name, user: req.user });
@@ -4750,16 +4750,31 @@ app.get("/api/driver/dashboard", optionalAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ success: false }); }
 });
 
-app.post("/api/driver/respond-delivery", async (req, res) => {
+app.post("/api/driver/respond-delivery", authenticate, async (req, res) => {
   const { deliveryId, decision, notes } = req.body;
   try {
+    const driverAliases = await resolveDriverFilterAliases({ queryDriverName: null, user: req.user });
+    if (!driverAliases.length) {
+      return res.status(400).json({ success: false, message: "Driver context missing" });
+    }
+    const ownerResult = await pool.query(
+      `SELECT delivery_id
+       FROM deliveries
+       WHERE delivery_id = $1
+         AND LOWER(COALESCE(driver_name, '')) = ANY($2)
+       LIMIT 1`,
+      [deliveryId, driverAliases]
+    );
+    if (!ownerResult.rows.length) {
+      return res.status(403).json({ success: false, message: "Delivery not assigned to this driver" });
+    }
     const status = decision.toUpperCase() === 'ACCEPT' ? 'accepted' : 'declined';
     await pool.query(`UPDATE deliveries SET status = $1, driver_response = $2, driver_notes = $3, driver_responded_at = NOW() WHERE delivery_id = $4`, [status, decision, notes, deliveryId]);
     res.json({ success: true, message: "Response recorded" });
   } catch (err) { res.status(500).json({ success: false }); }
 });
 
-app.get("/api/driver/routes", optionalAuth, async (req, res) => {
+app.get("/api/driver/routes", authenticate, async (req, res) => {
   try {
     const { driver_name } = req.query;
     const deliveriesColumns = await getTableColumns("deliveries");
@@ -4858,7 +4873,7 @@ app.get("/api/driver/routes", optionalAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ success: false }); }
 });
 
-app.get("/api/driver/delivery/:id", optionalAuth, async (req, res) => {
+app.get("/api/driver/delivery/:id", authenticate, async (req, res) => {
   try {
     const { id } = req.params;
     const { driver_name } = req.query;
@@ -5039,23 +5054,52 @@ app.get("/api/driver/delivery/:id", optionalAuth, async (req, res) => {
   }
 });
 
-app.post("/api/driver/start-delivery", async (req, res) => {
+app.post("/api/driver/start-delivery", authenticate, async (req, res) => {
   const { deliveryId } = req.body;
   try {
-    await pool.query(`UPDATE deliveries SET status = 'in_progress', departure_time = NOW() WHERE delivery_id = $1`, [deliveryId]);
+    const driverAliases = await resolveDriverFilterAliases({ queryDriverName: null, user: req.user });
+    if (!driverAliases.length) {
+      return res.status(400).json({ success: false, message: "Driver context missing" });
+    }
+    const updated = await pool.query(
+      `UPDATE deliveries
+       SET status = 'in_progress', departure_time = NOW()
+       WHERE delivery_id = $1
+         AND LOWER(COALESCE(driver_name, '')) = ANY($2)
+       RETURNING delivery_id`,
+      [deliveryId, driverAliases]
+    );
+    if (!updated.rows.length) {
+      return res.status(403).json({ success: false, message: "Delivery not assigned to this driver" });
+    }
     res.json({ success: true, message: "Started" });
   } catch (err) { res.status(500).json({ success: false }); }
 });
 
-app.post("/api/driver/complete-delivery", async (req, res) => {
+app.post("/api/driver/complete-delivery", authenticate, async (req, res) => {
   const { deliveryId, actualFuel, actualDistance, actualCO2, notes } = req.body;
   try {
-    await pool.query(`UPDATE deliveries SET status = 'completed', arrival_time = NOW(), completed_at = NOW(), fuel_consumption = $1, distance_km = $2, carbon_emissions = $3, delivery_notes = $4 WHERE delivery_id = $5`, [actualFuel, actualDistance, actualCO2, notes, deliveryId]);
+    const driverAliases = await resolveDriverFilterAliases({ queryDriverName: null, user: req.user });
+    if (!driverAliases.length) {
+      return res.status(400).json({ success: false, message: "Driver context missing" });
+    }
+    const updated = await pool.query(
+      `UPDATE deliveries
+       SET status = 'completed', arrival_time = NOW(), completed_at = NOW(),
+           fuel_consumption = $1, distance_km = $2, carbon_emissions = $3, delivery_notes = $4
+       WHERE delivery_id = $5
+         AND LOWER(COALESCE(driver_name, '')) = ANY($6)
+       RETURNING delivery_id`,
+      [actualFuel, actualDistance, actualCO2, notes, deliveryId, driverAliases]
+    );
+    if (!updated.rows.length) {
+      return res.status(403).json({ success: false, message: "Delivery not assigned to this driver" });
+    }
     res.json({ success: true, message: "Completed" });
   } catch (err) { res.status(500).json({ success: false }); }
 });
 
-app.post("/api/driver/confirm-stop", async (req, res) => {
+app.post("/api/driver/confirm-stop", authenticate, async (req, res) => {
   const { deliveryId, stopIndex, confirmationType } = req.body;
   try {
     const normalizedDeliveryId = Number(deliveryId);
@@ -5067,9 +5111,16 @@ app.post("/api/driver/confirm-stop", async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid stopIndex" });
     }
 
+    const driverAliases = await resolveDriverFilterAliases({ queryDriverName: null, user: req.user });
+    if (!driverAliases.length) {
+      return res.status(400).json({ success: false, message: "Driver context missing" });
+    }
     const deliveryResult = await pool.query(
-      `SELECT route_id, stops_json, status FROM deliveries WHERE delivery_id = $1`,
-      [normalizedDeliveryId]
+      `SELECT route_id, stops_json, status
+       FROM deliveries
+       WHERE delivery_id = $1
+         AND LOWER(COALESCE(driver_name, '')) = ANY($2)`,
+      [normalizedDeliveryId, driverAliases]
     );
     if (deliveryResult.rows.length === 0) {
       return res.status(404).json({ success: false, message: "Delivery not found" });
@@ -5165,7 +5216,7 @@ app.get("/api/drivers", async (req, res) => {
 });
 
 // Get assigned routes for a driver (for driver's dashboard)
-app.get("/api/driver/assigned-routes", optionalAuth, async (req, res) => {
+app.get("/api/driver/assigned-routes", authenticate, async (req, res) => {
   try {
     const { driver_name } = req.query;
     const driverAliases = await resolveDriverFilterAliases({ queryDriverName: driver_name, user: req.user });
@@ -5207,7 +5258,7 @@ app.get("/api/driver/assigned-routes", optionalAuth, async (req, res) => {
 });
 
 // Get pending deliveries for a driver (new assignments)
-app.get("/api/driver/pending-deliveries", optionalAuth, async (req, res) => {
+app.get("/api/driver/pending-deliveries", authenticate, async (req, res) => {
   try {
     const { driver_name } = req.query;
     const driverAliases = await resolveDriverFilterAliases({ queryDriverName: driver_name, user: req.user });
@@ -5253,7 +5304,7 @@ app.get("/api/driver/pending-deliveries", optionalAuth, async (req, res) => {
 });
 
 // Driver history endpoint for Delivery > History screen.
-app.get("/api/driver/history", optionalAuth, async (req, res) => {
+app.get("/api/driver/history", authenticate, async (req, res) => {
   try {
     const { driver_name } = req.query;
     const driverAliases = await resolveDriverFilterAliases({ queryDriverName: driver_name, user: req.user });
