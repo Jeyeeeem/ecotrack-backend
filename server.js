@@ -1798,6 +1798,10 @@ async function buildLogisticsRoutePayload(row, options = {}) {
   let requestOptimization = parseMaybeJsonObject(requestData.optimization);
   let requestOptimizationData = parseMaybeJsonObject(requestOptimization.optimization_data);
   let extraOptimizationData = parseMaybeJsonObject(extraData.optimization_data);
+  let requestSavings = parseMaybeJsonObject(requestData.savings);
+  let optimizationSavings = parseMaybeJsonObject(optimization.savings);
+  let requestOptimizationSavings = parseMaybeJsonObject(requestOptimization.savings);
+  let optimizationDataSavings = parseMaybeJsonObject(optimizationData.savings);
   const routeIdRaw =
     routeIdFromParams ||
     row.route_id ||
@@ -1858,6 +1862,10 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     const fallbackRequestOptimization = parseMaybeJsonObject(fallbackRequestData.optimization);
     const fallbackRequestOptimizationData = parseMaybeJsonObject(fallbackRequestOptimization.optimization_data);
     const fallbackExtraOptimizationData = parseMaybeJsonObject(fallbackExtraData.optimization_data);
+    const fallbackRequestSavings = parseMaybeJsonObject(fallbackRequestData.savings);
+    const fallbackOptimizationSavings = parseMaybeJsonObject(fallbackOptimization.savings);
+    const fallbackRequestOptimizationSavings = parseMaybeJsonObject(fallbackRequestOptimization.savings);
+    const fallbackOptimizationDataSavings = parseMaybeJsonObject(fallbackOptimizationData.savings);
 
     requestData = { ...fallbackRequestData, ...requestData };
     extraData = { ...fallbackExtraData, ...extraData };
@@ -1867,6 +1875,10 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     requestOptimization = { ...fallbackRequestOptimization, ...requestOptimization };
     requestOptimizationData = { ...fallbackRequestOptimizationData, ...requestOptimizationData };
     extraOptimizationData = { ...fallbackExtraOptimizationData, ...extraOptimizationData };
+    requestSavings = { ...fallbackRequestSavings, ...requestSavings };
+    optimizationSavings = { ...fallbackOptimizationSavings, ...optimizationSavings };
+    requestOptimizationSavings = { ...fallbackRequestOptimizationSavings, ...requestOptimizationSavings };
+    optimizationDataSavings = { ...fallbackOptimizationDataSavings, ...optimizationDataSavings };
   }
 
   const fromLocation =
@@ -1988,8 +2000,6 @@ async function buildLogisticsRoutePayload(row, options = {}) {
 
   const originalDistance = toFiniteNumberPreferNonZero(
     routeOptimizationSnapshot?.original_distance_km,
-    row.original_distance,
-    row.total_distance_km,
     requestData.original_distance,
     requestData.original_distance_km,
     routeData.total_distance_km,
@@ -2007,11 +2017,12 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     requestOptimizationData.original_distance_km,
     extraOptimizationData.originalDistance,
     extraOptimizationData.original_distance,
-    extraOptimizationData.original_distance_km
+    extraOptimizationData.original_distance_km,
+    row.original_distance,
+    row.total_distance_km
   );
   const optimizedDistance = toFiniteNumberPreferNonZero(
     routeOptimizationSnapshot?.optimized_distance_km,
-    row.optimized_distance,
     requestData.optimized_distance,
     requestData.optimized_distance_km,
     routeData.optimized_distance,
@@ -2028,12 +2039,11 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     requestOptimizationData.optimized_distance_km,
     extraOptimizationData.optimizedDistance,
     extraOptimizationData.optimized_distance,
-    extraOptimizationData.optimized_distance_km
+    extraOptimizationData.optimized_distance_km,
+    row.optimized_distance
   );
   const originalFuel = toFiniteNumberPreferNonZero(
     routeOptimizationSnapshot?.original_fuel_liters,
-    row.original_fuel,
-    row.estimated_fuel_consumption_liters,
     requestData.original_fuel,
     requestData.original_fuel_liters,
     routeData.estimated_fuel_consumption_liters,
@@ -2051,11 +2061,12 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     requestOptimizationData.original_fuel_liters,
     extraOptimizationData.originalFuel,
     extraOptimizationData.original_fuel,
-    extraOptimizationData.original_fuel_liters
+    extraOptimizationData.original_fuel_liters,
+    row.original_fuel,
+    row.estimated_fuel_consumption_liters
   );
   const optimizedFuel = toFiniteNumberPreferNonZero(
     routeOptimizationSnapshot?.optimized_fuel_liters,
-    row.optimized_fuel,
     requestData.optimized_fuel,
     requestData.optimized_fuel_liters,
     routeData.optimized_fuel,
@@ -2072,12 +2083,11 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     requestOptimizationData.optimized_fuel_liters,
     extraOptimizationData.optimizedFuel,
     extraOptimizationData.optimized_fuel,
-    extraOptimizationData.optimized_fuel_liters
+    extraOptimizationData.optimized_fuel_liters,
+    row.optimized_fuel
   );
   const originalCO2 = toFiniteNumberPreferNonZero(
     routeOptimizationSnapshot?.original_carbon_kg,
-    row.original_co2,
-    row.estimated_carbon_kg,
     requestData.original_co2,
     requestData.original_co2_kg,
     routeData.estimated_carbon_kg,
@@ -2096,12 +2106,12 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     requestOptimizationData.original_co2_kg,
     extraOptimizationData.originalCarbon,
     extraOptimizationData.original_co2,
-    extraOptimizationData.original_co2_kg
+    extraOptimizationData.original_co2_kg,
+    row.original_co2,
+    row.estimated_carbon_kg
   );
   const optimizedCO2 = toFiniteNumberPreferNonZero(
     routeOptimizationSnapshot?.optimized_carbon_kg,
-    row.optimized_co2,
-    row.optimized_carbon_kg,
     requestData.optimized_co2,
     requestData.optimized_co2_kg,
     routeData.optimized_co2,
@@ -2119,14 +2129,21 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     requestOptimizationData.optimized_co2_kg,
     extraOptimizationData.optimizedCarbon,
     extraOptimizationData.optimized_co2,
-    extraOptimizationData.optimized_co2_kg
+    extraOptimizationData.optimized_co2_kg,
+    row.optimized_co2,
+    row.optimized_carbon_kg
   );
   const aiSuggestion =
     requestData.ai_suggestion ||
+    requestData.ai_recommendation ||
+    requestData.aiRecommendation ||
     requestOptimization.ai_recommendation ||
     optimization.ai_recommendation ||
     requestOptimizationData.aiRecommendation ||
     optimizationData.aiRecommendation ||
+    routeData.ai_suggestion ||
+    routeData.ai_recommendation ||
+    extraOptimizationData.aiRecommendation ||
     routeOptimizationSnapshot?.ai_recommendation ||
     managerFallbackRow?.ai_suggestion ||
     managerFallbackRow?.ai_recommendation ||
@@ -2136,8 +2153,6 @@ async function buildLogisticsRoutePayload(row, options = {}) {
   const textSavings = extractSavingsFromText(aiSuggestion);
   const totalSavingsKm = toFiniteNumberPreferNonZero(
     routeOptimizationSnapshot?.savings_km,
-    row.savings_km,
-    row.distance_saved_km,
     requestData.savings_km,
     requestData.distance_saved_km,
     routeData.savings_km,
@@ -2155,13 +2170,16 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     extraOptimizationData.savingsKm,
     extraOptimizationData.savings_km,
     extraOptimizationData.distance_saved_km,
-    textSavings.km
+    requestSavings.distance,
+    optimizationSavings.distance,
+    requestOptimizationSavings.distance,
+    optimizationDataSavings.distance,
+    textSavings.km,
+    row.savings_km,
+    row.distance_saved_km
   );
   const totalSavingsFuel = toFiniteNumberPreferNonZero(
     routeOptimizationSnapshot?.savings_fuel,
-    row.savings_fuel,
-    row.fuel_saved,
-    row.fuel_saved_liters,
     requestData.savings_fuel,
     requestData.fuel_saved,
     requestData.fuel_saved_liters,
@@ -2186,13 +2204,17 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     extraOptimizationData.savings_fuel,
     extraOptimizationData.fuel_saved,
     extraOptimizationData.fuel_saved_liters,
-    textSavings.fuel
+    requestSavings.fuel,
+    optimizationSavings.fuel,
+    requestOptimizationSavings.fuel,
+    optimizationDataSavings.fuel,
+    textSavings.fuel,
+    row.savings_fuel,
+    row.fuel_saved,
+    row.fuel_saved_liters
   );
   const totalSavingsCO2 = toFiniteNumberPreferNonZero(
     routeOptimizationSnapshot?.savings_co2,
-    row.savings_co2,
-    row.co2_saved,
-    row.co2_saved_kg,
     requestData.savings_co2,
     requestData.co2_saved,
     requestData.co2_saved_kg,
@@ -2217,7 +2239,14 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     extraOptimizationData.savings_co2,
     extraOptimizationData.co2_saved,
     extraOptimizationData.co2_saved_kg,
-    textSavings.co2
+    requestSavings.emissions,
+    optimizationSavings.emissions,
+    requestOptimizationSavings.emissions,
+    optimizationDataSavings.emissions,
+    textSavings.co2,
+    row.savings_co2,
+    row.co2_saved,
+    row.co2_saved_kg
   );
 
   const submittedBy = row.submitted_by || row.requested_by || row.reviewed_by || "System";
@@ -2308,6 +2337,9 @@ app.get("/api/logistics/dashboard", async (req, res) => {
     const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
     const routeApprovalColumns = hasRouteApprovals ? await getTableColumns("route_approvals") : new Set();
+    const routeApprovalRefExpr = routeApprovalColumns.has("route_id")
+      ? "COALESCE(ra.route_id, ra.id)"
+      : "ra.id";
     const routeApprovalKeyExpr =
       hasRouteApprovals && routeApprovalColumns.has("route_id")
         ? "COALESCE(route_id::text, id::text)"
@@ -2356,7 +2388,7 @@ app.get("/api/logistics/dashboard", async (req, res) => {
       if (pendingResult.rows.length === 0 && hasRouteApprovals) {
         pendingResult = await pool.query(
           `SELECT 
-            ra.id as route_id, 
+            ${routeApprovalKeyExpr} as route_id, 
             ra.route_type, 
             ra.from_location, 
             ra.to_location, 
@@ -2396,7 +2428,7 @@ app.get("/api/logistics/dashboard", async (req, res) => {
     } else if (hasRouteApprovals) {
       pendingResult = await pool.query(
         `SELECT 
-          ra.id as route_id, 
+          ${routeApprovalKeyExpr} as route_id, 
           ra.route_type, 
           ra.from_location, 
           ra.to_location, 
@@ -2448,11 +2480,13 @@ app.get("/api/logistics/dashboard", async (req, res) => {
       };
     }
 
-    // Route approvals are the source-of-truth for logistics dashboard counters/history flow.
+    // Keep route_approvals for aggregate counters, but preserve manager_approvals
+    // rows when available so dashboard cards use the same optimization payload
+    // that admin submitted.
     if (hasRouteApprovals) {
       const routePendingResult = await pool.query(
         `SELECT 
-          ra.id as route_id, 
+          ${routeApprovalKeyExpr} as route_id, 
           ra.route_type, 
           ra.from_location, 
           ra.to_location, 
@@ -2490,7 +2524,7 @@ app.get("/api/logistics/dashboard", async (req, res) => {
       );
 
       statsResult = routeStatsResult;
-      if (routePendingResult.rows.length > 0 || !canUseManagerRouteData) {
+      if (!canUseManagerRouteData || pendingResult.rows.length === 0) {
         pendingResult = routePendingResult;
       }
     }
@@ -3283,10 +3317,10 @@ app.get("/api/logistics/history", async (req, res) => {
       : "ma.reviewed_at DESC NULLS LAST, ma.created_at DESC NULLS LAST";
     let result = hasRouteApprovals
       ? await pool.query(`
-          SELECT ra.id as approval_id, ra.id as route_id, ra.route_type as product_name, ra.from_location, ra.to_location, ra.from_location as location, ra.driver_name, 
+          SELECT ra.id as approval_id, ${routeApprovalRefExpr} as route_id, ra.route_type as product_name, ra.from_location, ra.to_location, ra.from_location as location, ra.driver_name, 
                  ra.status, ${savingsKmExpr} as savings_km, ${savingsCo2Expr} as savings_co2, COALESCE(NULLIF(ra.ai_suggestion, ''), ${roAiExpr}, '') as ai_suggestion, ra.approved_at as reviewed_at, ra.manager_comment as review_notes 
           FROM route_approvals ra
-          ${joinRouteOptimizations ? "LEFT JOIN route_optimizations ro ON ro.route_id = ra.id" : ""}
+          ${joinRouteOptimizations ? "LEFT JOIN route_optimizations ro ON ro.route_id = " + routeApprovalRefExpr : ""}
           WHERE LOWER(COALESCE(ra.status, '')) IN ('approved', 'declined', 'rejected')
           ORDER BY ra.approved_at DESC NULLS LAST, ra.submitted_at DESC NULLS LAST
           LIMIT 100
@@ -3341,10 +3375,10 @@ app.get("/api/logistics/history", async (req, res) => {
 
     if (hasRouteApprovals && result.rows.length === 0) {
       result = await pool.query(`
-        SELECT ra.id as approval_id, ra.id as route_id, ra.route_type as product_name, ra.from_location, ra.to_location, ra.from_location as location, ra.driver_name, 
+        SELECT ra.id as approval_id, ${routeApprovalRefExpr} as route_id, ra.route_type as product_name, ra.from_location, ra.to_location, ra.from_location as location, ra.driver_name, 
                ra.status, ${savingsKmExpr} as savings_km, ${savingsCo2Expr} as savings_co2, COALESCE(NULLIF(ra.ai_suggestion, ''), ${roAiExpr}, '') as ai_suggestion, ra.approved_at as reviewed_at, ra.manager_comment as review_notes 
         FROM route_approvals ra
-        ${joinRouteOptimizations ? "LEFT JOIN route_optimizations ro ON ro.route_id = ra.id" : ""}
+        ${joinRouteOptimizations ? "LEFT JOIN route_optimizations ro ON ro.route_id = " + routeApprovalRefExpr : ""}
         WHERE LOWER(COALESCE(ra.status, '')) IN ('approved', 'declined', 'rejected')
         ORDER BY ra.approved_at DESC NULLS LAST, ra.submitted_at DESC NULLS LAST
         LIMIT 100
