@@ -1759,6 +1759,34 @@ const buildRoadRoutePath = async (points) => {
   }
 };
 
+const getRouteOptimizationSnapshot = async (routeId) => {
+  if (!routeId) return null;
+  try {
+    const tableCheck = await pool.query(`SELECT to_regclass('public.route_optimizations') AS tbl`);
+    const hasRouteOptimizations = !!tableCheck.rows[0]?.tbl;
+    if (!hasRouteOptimizations) return null;
+
+    const columns = await getTableColumns("route_optimizations");
+    if (!columns.has("route_id")) return null;
+
+    const hasCreatedAt = columns.has("created_at");
+    const hasId = columns.has("id");
+    const orderExpr = hasCreatedAt
+      ? "created_at DESC"
+      : hasId
+      ? "id DESC"
+      : "route_id DESC";
+
+    const result = await pool.query(
+      `SELECT * FROM route_optimizations WHERE route_id::text = $1 ORDER BY ${orderExpr} LIMIT 1`,
+      [String(routeId)]
+    );
+    return result.rows[0] || null;
+  } catch (_) {
+    return null;
+  }
+};
+
 async function buildLogisticsRoutePayload(row, options = {}) {
   const routeIdFromParams = options.routeIdFromParams ? String(options.routeIdFromParams) : null;
   const hasRouteStops = !!options.hasRouteStops;
@@ -1780,6 +1808,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     requestData.route_id ||
     routeData.route_id;
   const routeId = String(routeIdRaw || "");
+  const routeOptimizationSnapshot = await getRouteOptimizationSnapshot(routeId);
 
   // Some deployments store richer optimization data in manager_approvals.request_data/extra_data
   // while route_approvals can contain zeros. Merge manager payload as fallback source-of-truth.
@@ -1958,6 +1987,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
   }
 
   const originalDistance = toFiniteNumberPreferNonZero(
+    routeOptimizationSnapshot?.original_distance_km,
     row.original_distance,
     row.total_distance_km,
     requestData.original_distance,
@@ -1980,6 +2010,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     extraOptimizationData.original_distance_km
   );
   const optimizedDistance = toFiniteNumberPreferNonZero(
+    routeOptimizationSnapshot?.optimized_distance_km,
     row.optimized_distance,
     requestData.optimized_distance,
     requestData.optimized_distance_km,
@@ -2000,6 +2031,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     extraOptimizationData.optimized_distance_km
   );
   const originalFuel = toFiniteNumberPreferNonZero(
+    routeOptimizationSnapshot?.original_fuel_liters,
     row.original_fuel,
     row.estimated_fuel_consumption_liters,
     requestData.original_fuel,
@@ -2022,6 +2054,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     extraOptimizationData.original_fuel_liters
   );
   const optimizedFuel = toFiniteNumberPreferNonZero(
+    routeOptimizationSnapshot?.optimized_fuel_liters,
     row.optimized_fuel,
     requestData.optimized_fuel,
     requestData.optimized_fuel_liters,
@@ -2042,6 +2075,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     extraOptimizationData.optimized_fuel_liters
   );
   const originalCO2 = toFiniteNumberPreferNonZero(
+    routeOptimizationSnapshot?.original_carbon_kg,
     row.original_co2,
     row.estimated_carbon_kg,
     requestData.original_co2,
@@ -2065,6 +2099,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     extraOptimizationData.original_co2_kg
   );
   const optimizedCO2 = toFiniteNumberPreferNonZero(
+    routeOptimizationSnapshot?.optimized_carbon_kg,
     row.optimized_co2,
     row.optimized_carbon_kg,
     requestData.optimized_co2,
@@ -2087,18 +2122,20 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     extraOptimizationData.optimized_co2_kg
   );
   const aiSuggestion =
-    row.ai_suggestion ||
-    row.ai_recommendation ||
-    managerFallbackRow?.ai_suggestion ||
-    managerFallbackRow?.ai_recommendation ||
     requestData.ai_suggestion ||
     requestOptimization.ai_recommendation ||
     optimization.ai_recommendation ||
     requestOptimizationData.aiRecommendation ||
     optimizationData.aiRecommendation ||
+    routeOptimizationSnapshot?.ai_recommendation ||
+    managerFallbackRow?.ai_suggestion ||
+    managerFallbackRow?.ai_recommendation ||
+    row.ai_suggestion ||
+    row.ai_recommendation ||
     "Optimize this route";
   const textSavings = extractSavingsFromText(aiSuggestion);
   const totalSavingsKm = toFiniteNumberPreferNonZero(
+    routeOptimizationSnapshot?.savings_km,
     row.savings_km,
     row.distance_saved_km,
     requestData.savings_km,
@@ -2121,6 +2158,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     textSavings.km
   );
   const totalSavingsFuel = toFiniteNumberPreferNonZero(
+    routeOptimizationSnapshot?.savings_fuel,
     row.savings_fuel,
     row.fuel_saved,
     row.fuel_saved_liters,
@@ -2151,6 +2189,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     textSavings.fuel
   );
   const totalSavingsCO2 = toFiniteNumberPreferNonZero(
+    routeOptimizationSnapshot?.savings_co2,
     row.savings_co2,
     row.co2_saved,
     row.co2_saved_kg,
@@ -3197,16 +3236,32 @@ app.get("/api/logistics/history", async (req, res) => {
     const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
     const routeApprovalColumns = hasRouteApprovals ? await getTableColumns("route_approvals") : new Set();
-    const originalDistanceExpr = routeApprovalColumns.has("original_distance") ? "COALESCE(original_distance, 0)" : "0";
-    const optimizedDistanceExpr = routeApprovalColumns.has("optimized_distance") ? "COALESCE(optimized_distance, 0)" : "0";
-    const originalCo2Expr = routeApprovalColumns.has("original_co2") ? "COALESCE(original_co2, 0)" : "0";
-    const optimizedCo2Expr = routeApprovalColumns.has("optimized_co2") ? "COALESCE(optimized_co2, 0)" : "0";
+    const routeOptimizationTableCheck = await pool.query(`SELECT to_regclass('public.route_optimizations') AS tbl`);
+    const hasRouteOptimizations = !!routeOptimizationTableCheck.rows[0]?.tbl;
+    const routeOptimizationColumns = hasRouteOptimizations ? await getTableColumns("route_optimizations") : new Set();
+    const joinRouteOptimizations =
+      hasRouteApprovals &&
+      hasRouteOptimizations &&
+      routeOptimizationColumns.has("route_id");
+    const roSavingsKmExpr = joinRouteOptimizations && routeOptimizationColumns.has("savings_km")
+      ? "COALESCE(ro.savings_km, 0)"
+      : "0";
+    const roSavingsCo2Expr = joinRouteOptimizations && routeOptimizationColumns.has("savings_co2")
+      ? "COALESCE(ro.savings_co2, 0)"
+      : "0";
+    const roAiExpr = joinRouteOptimizations && routeOptimizationColumns.has("ai_recommendation")
+      ? "NULLIF(ro.ai_recommendation, '')"
+      : "NULL";
+    const originalDistanceExpr = routeApprovalColumns.has("original_distance") ? "COALESCE(ra.original_distance, 0)" : "0";
+    const optimizedDistanceExpr = routeApprovalColumns.has("optimized_distance") ? "COALESCE(ra.optimized_distance, 0)" : "0";
+    const originalCo2Expr = routeApprovalColumns.has("original_co2") ? "COALESCE(ra.original_co2, 0)" : "0";
+    const optimizedCo2Expr = routeApprovalColumns.has("optimized_co2") ? "COALESCE(ra.optimized_co2, 0)" : "0";
     const savingsKmExpr = routeApprovalColumns.has("savings_km")
-      ? `COALESCE(NULLIF(savings_km, 0), GREATEST(${originalDistanceExpr} - ${optimizedDistanceExpr}, 0), 0)`
-      : `GREATEST(${originalDistanceExpr} - ${optimizedDistanceExpr}, 0)`;
+      ? `COALESCE(NULLIF(ra.savings_km, 0), ${roSavingsKmExpr}, GREATEST(${originalDistanceExpr} - ${optimizedDistanceExpr}, 0), 0)`
+      : `COALESCE(${roSavingsKmExpr}, GREATEST(${originalDistanceExpr} - ${optimizedDistanceExpr}, 0), 0)`;
     const savingsCo2Expr = routeApprovalColumns.has("savings_co2")
-      ? `COALESCE(NULLIF(savings_co2, 0), GREATEST(${originalCo2Expr} - ${optimizedCo2Expr}, 0), 0)`
-      : `GREATEST(${originalCo2Expr} - ${optimizedCo2Expr}, 0)`;
+      ? `COALESCE(NULLIF(ra.savings_co2, 0), ${roSavingsCo2Expr}, GREATEST(${originalCo2Expr} - ${optimizedCo2Expr}, 0), 0)`
+      : `COALESCE(${roSavingsCo2Expr}, GREATEST(${originalCo2Expr} - ${optimizedCo2Expr}, 0), 0)`;
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
     const managerColumns = hasManagerApprovals ? await getManagerApprovalsColumns() : new Set();
@@ -3228,11 +3283,12 @@ app.get("/api/logistics/history", async (req, res) => {
       : "ma.reviewed_at DESC NULLS LAST, ma.created_at DESC NULLS LAST";
     let result = hasRouteApprovals
       ? await pool.query(`
-          SELECT id as approval_id, id as route_id, route_type as product_name, from_location, to_location, from_location as location, driver_name, 
-                 status, ${savingsKmExpr} as savings_km, ${savingsCo2Expr} as savings_co2, ai_suggestion, approved_at as reviewed_at, manager_comment as review_notes 
-          FROM route_approvals
-          WHERE LOWER(COALESCE(status, '')) IN ('approved', 'declined', 'rejected')
-          ORDER BY approved_at DESC NULLS LAST, submitted_at DESC NULLS LAST
+          SELECT ra.id as approval_id, ra.id as route_id, ra.route_type as product_name, ra.from_location, ra.to_location, ra.from_location as location, ra.driver_name, 
+                 ra.status, ${savingsKmExpr} as savings_km, ${savingsCo2Expr} as savings_co2, COALESCE(NULLIF(ra.ai_suggestion, ''), ${roAiExpr}, '') as ai_suggestion, ra.approved_at as reviewed_at, ra.manager_comment as review_notes 
+          FROM route_approvals ra
+          ${joinRouteOptimizations ? "LEFT JOIN route_optimizations ro ON ro.route_id = ra.id" : ""}
+          WHERE LOWER(COALESCE(ra.status, '')) IN ('approved', 'declined', 'rejected')
+          ORDER BY ra.approved_at DESC NULLS LAST, ra.submitted_at DESC NULLS LAST
           LIMIT 100
         `)
       : canUseManagerRouteData
@@ -3285,11 +3341,12 @@ app.get("/api/logistics/history", async (req, res) => {
 
     if (hasRouteApprovals && result.rows.length === 0) {
       result = await pool.query(`
-        SELECT id as approval_id, id as route_id, route_type as product_name, from_location, to_location, from_location as location, driver_name, 
-               status, ${savingsKmExpr} as savings_km, ${savingsCo2Expr} as savings_co2, ai_suggestion, approved_at as reviewed_at, manager_comment as review_notes 
-        FROM route_approvals
-        WHERE LOWER(COALESCE(status, '')) IN ('approved', 'declined', 'rejected')
-        ORDER BY approved_at DESC NULLS LAST, submitted_at DESC NULLS LAST
+        SELECT ra.id as approval_id, ra.id as route_id, ra.route_type as product_name, ra.from_location, ra.to_location, ra.from_location as location, ra.driver_name, 
+               ra.status, ${savingsKmExpr} as savings_km, ${savingsCo2Expr} as savings_co2, COALESCE(NULLIF(ra.ai_suggestion, ''), ${roAiExpr}, '') as ai_suggestion, ra.approved_at as reviewed_at, ra.manager_comment as review_notes 
+        FROM route_approvals ra
+        ${joinRouteOptimizations ? "LEFT JOIN route_optimizations ro ON ro.route_id = ra.id" : ""}
+        WHERE LOWER(COALESCE(ra.status, '')) IN ('approved', 'declined', 'rejected')
+        ORDER BY ra.approved_at DESC NULLS LAST, ra.submitted_at DESC NULLS LAST
         LIMIT 100
       `);
     }
