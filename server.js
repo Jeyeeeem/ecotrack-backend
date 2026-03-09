@@ -4190,9 +4190,11 @@ app.post("/api/inventory/approve", async (req, res) => {
   }
 
   try {
-    const isApprove = String(decision).toUpperCase() === "APPROVE";
-    const managerStatus = isApprove ? "approved" : "rejected";
-    const alertStatus = isApprove ? "resolved" : "declined";
+    const normalizedDecision = String(decision).trim().toUpperCase();
+    const isPending = normalizedDecision === "PENDING";
+    const isApprove = normalizedDecision === "APPROVE" || normalizedDecision === "APPROVED";
+    const managerStatus = isPending ? "pending_review" : isApprove ? "approved" : "rejected";
+    const alertStatus = isPending ? "active" : isApprove ? "resolved" : "declined";
 
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
@@ -4267,9 +4269,9 @@ app.post("/api/inventory/approve", async (req, res) => {
     await pool.query(`UPDATE alerts SET status = $1, updated_at = NOW() WHERE id::text = $2`, [alertStatus, String(updateAlertById)]);
 
     if (!managerUpdated) {
-      return res.json({ success: true, message: `Alert ${alertStatus} successfully` });
+      return res.json({ success: true, message: `Alert moved to ${alertStatus} successfully` });
     }
-    return res.json({ success: true, message: `Item ${managerStatus} successfully` });
+    return res.json({ success: true, message: `Item moved to ${managerStatus} successfully` });
   } catch (err) {
     res.status(500).json({ success: false, message: "Database error" });
   }
