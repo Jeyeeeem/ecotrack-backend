@@ -1762,14 +1762,14 @@ const buildRoadRoutePath = async (points) => {
 async function buildLogisticsRoutePayload(row, options = {}) {
   const routeIdFromParams = options.routeIdFromParams ? String(options.routeIdFromParams) : null;
   const hasRouteStops = !!options.hasRouteStops;
-  const requestData = parseMaybeJsonObject(row.request_data);
-  const extraData = parseMaybeJsonObject(row.extra_data);
-  const routeData = parseMaybeJsonObject(extraData.route);
-  const optimization = parseMaybeJsonObject(extraData.optimization);
-  const optimizationData = parseMaybeJsonObject(optimization.optimization_data);
-  const requestOptimization = parseMaybeJsonObject(requestData.optimization);
-  const requestOptimizationData = parseMaybeJsonObject(requestOptimization.optimization_data);
-  const extraOptimizationData = parseMaybeJsonObject(extraData.optimization_data);
+  let requestData = parseMaybeJsonObject(row.request_data);
+  let extraData = parseMaybeJsonObject(row.extra_data);
+  let routeData = parseMaybeJsonObject(extraData.route);
+  let optimization = parseMaybeJsonObject(extraData.optimization);
+  let optimizationData = parseMaybeJsonObject(optimization.optimization_data);
+  let requestOptimization = parseMaybeJsonObject(requestData.optimization);
+  let requestOptimizationData = parseMaybeJsonObject(requestOptimization.optimization_data);
+  let extraOptimizationData = parseMaybeJsonObject(extraData.optimization_data);
   const routeIdRaw =
     routeIdFromParams ||
     row.route_id ||
@@ -1780,6 +1780,66 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     requestData.route_id ||
     routeData.route_id;
   const routeId = String(routeIdRaw || "");
+
+  // Some deployments store richer optimization data in manager_approvals.request_data/extra_data
+  // while route_approvals can contain zeros. Merge manager payload as fallback source-of-truth.
+  let managerFallbackRow = null;
+  if (routeId) {
+    try {
+      const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
+      const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
+      if (hasManagerApprovals) {
+        const managerColumns = await getManagerApprovalsColumns();
+        const managerPkCol = await getManagerApprovalsPkColumn();
+        const managerMatchClauses = [];
+        if (managerColumns.has("route_id")) managerMatchClauses.push(`COALESCE(ma.route_id::text, '') = $1`);
+        if (managerColumns.has("related_record_id")) managerMatchClauses.push(`COALESCE(ma.related_record_id::text, '') = $1`);
+        if (managerColumns.has("delivery_id")) managerMatchClauses.push(`COALESCE(ma.delivery_id::text, '') = $1`);
+        if (managerColumns.has(managerPkCol)) managerMatchClauses.push(`ma.${managerPkCol}::text = $1`);
+        if (managerColumns.has("request_data")) managerMatchClauses.push(`COALESCE(ma.request_data->>'route_id', '') = $1`);
+        if (managerColumns.has("extra_data")) managerMatchClauses.push(`COALESCE(ma.extra_data->'route'->>'route_id', '') = $1`);
+
+        if (managerMatchClauses.length > 0) {
+          const managerOrderBy = managerColumns.has("created_at")
+            ? "ma.created_at DESC"
+            : `ma.${managerPkCol} DESC`;
+          const fallbackResult = await pool.query(
+            `SELECT *
+             FROM manager_approvals ma
+             WHERE ma.approval_type = 'route_optimization'
+               AND (${managerMatchClauses.join(" OR ")})
+             ORDER BY ${managerOrderBy}
+             LIMIT 1`,
+            [routeId]
+          );
+          managerFallbackRow = fallbackResult.rows[0] || null;
+        }
+      }
+    } catch (e) {
+      managerFallbackRow = null;
+    }
+  }
+
+  if (managerFallbackRow) {
+    const fallbackRequestData = parseMaybeJsonObject(managerFallbackRow.request_data);
+    const fallbackExtraData = parseMaybeJsonObject(managerFallbackRow.extra_data);
+    const fallbackRouteData = parseMaybeJsonObject(fallbackExtraData.route);
+    const fallbackOptimization = parseMaybeJsonObject(fallbackExtraData.optimization);
+    const fallbackOptimizationData = parseMaybeJsonObject(fallbackOptimization.optimization_data);
+    const fallbackRequestOptimization = parseMaybeJsonObject(fallbackRequestData.optimization);
+    const fallbackRequestOptimizationData = parseMaybeJsonObject(fallbackRequestOptimization.optimization_data);
+    const fallbackExtraOptimizationData = parseMaybeJsonObject(fallbackExtraData.optimization_data);
+
+    requestData = { ...fallbackRequestData, ...requestData };
+    extraData = { ...fallbackExtraData, ...extraData };
+    routeData = { ...fallbackRouteData, ...routeData };
+    optimization = { ...fallbackOptimization, ...optimization };
+    optimizationData = { ...fallbackOptimizationData, ...optimizationData };
+    requestOptimization = { ...fallbackRequestOptimization, ...requestOptimization };
+    requestOptimizationData = { ...fallbackRequestOptimizationData, ...requestOptimizationData };
+    extraOptimizationData = { ...fallbackExtraOptimizationData, ...extraOptimizationData };
+  }
+
   const fromLocation =
     row.from_location ||
     requestData.from_location ||
@@ -2029,6 +2089,8 @@ async function buildLogisticsRoutePayload(row, options = {}) {
   const aiSuggestion =
     row.ai_suggestion ||
     row.ai_recommendation ||
+    managerFallbackRow?.ai_suggestion ||
+    managerFallbackRow?.ai_recommendation ||
     requestData.ai_suggestion ||
     requestOptimization.ai_recommendation ||
     optimization.ai_recommendation ||
