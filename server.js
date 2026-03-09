@@ -3911,7 +3911,7 @@ async function applyInventoryDecisionByApprovalId(approvalId, decision, reviewNo
   const normalizedDecision = String(decision || "").trim().toLowerCase();
   const isPending = normalizedDecision === "pending";
   const isApprove = normalizedDecision === "approve" || normalizedDecision === "approved";
-  const managerStatus = isPending ? "pending_review" : isApprove ? "approved" : "rejected";
+  const managerStatus = isPending ? "pending" : isApprove ? "approved" : "rejected";
   const alertStatus = isPending ? "active" : isApprove ? "resolved" : "declined";
 
   const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
@@ -3931,24 +3931,29 @@ async function applyInventoryDecisionByApprovalId(approvalId, decision, reviewNo
     const params = [managerStatus];
     let idx = 2;
 
-    if (managerColumns.has("reviewed_at")) setClauses.push("reviewed_at = NOW()");
-    if (managerColumns.has("decision_date")) setClauses.push("decision_date = NOW()");
-    if (managerColumns.has("review_notes")) {
+    if (isPending) {
+      if (managerColumns.has("reviewed_at")) setClauses.push("reviewed_at = NULL");
+      if (managerColumns.has("decision_date")) setClauses.push("decision_date = NULL");
+    } else {
+      if (managerColumns.has("reviewed_at")) setClauses.push("reviewed_at = NOW()");
+      if (managerColumns.has("decision_date")) setClauses.push("decision_date = NOW()");
+    }
+    if (!isPending && managerColumns.has("review_notes")) {
       setClauses.push(`review_notes = $${idx}`);
       params.push(reviewNotes || null);
       idx++;
     }
-    if (managerColumns.has("manager_comment")) {
+    if (!isPending && managerColumns.has("manager_comment")) {
       setClauses.push(`manager_comment = $${idx}`);
       params.push(reviewNotes || null);
       idx++;
     }
-    if (managerColumns.has("decision_notes")) {
+    if (!isPending && managerColumns.has("decision_notes")) {
       setClauses.push(`decision_notes = $${idx}`);
       params.push(reviewNotes || null);
       idx++;
     }
-    if (managerColumns.has("decision")) {
+    if (!isPending && managerColumns.has("decision")) {
       setClauses.push(`decision = $${idx}`);
       params.push(managerStatus);
       idx++;
@@ -4193,7 +4198,7 @@ app.post("/api/inventory/approve", async (req, res) => {
     const normalizedDecision = String(decision).trim().toUpperCase();
     const isPending = normalizedDecision === "PENDING";
     const isApprove = normalizedDecision === "APPROVE" || normalizedDecision === "APPROVED";
-    const managerStatus = isPending ? "pending_review" : isApprove ? "approved" : "rejected";
+    const managerStatus = isPending ? "pending" : isApprove ? "approved" : "rejected";
     const alertStatus = isPending ? "active" : isApprove ? "resolved" : "declined";
 
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
@@ -4214,24 +4219,29 @@ app.post("/api/inventory/approve", async (req, res) => {
       let idx = 2;
       const cleanComment = comment ?? null;
 
-      if (managerColumns.has("reviewed_at")) setClauses.push("reviewed_at = NOW()");
-      if (managerColumns.has("decision_date")) setClauses.push("decision_date = NOW()");
-      if (managerColumns.has("review_notes")) {
+      if (isPending) {
+        if (managerColumns.has("reviewed_at")) setClauses.push("reviewed_at = NULL");
+        if (managerColumns.has("decision_date")) setClauses.push("decision_date = NULL");
+      } else {
+        if (managerColumns.has("reviewed_at")) setClauses.push("reviewed_at = NOW()");
+        if (managerColumns.has("decision_date")) setClauses.push("decision_date = NOW()");
+      }
+      if (!isPending && managerColumns.has("review_notes")) {
         setClauses.push(`review_notes = $${idx}`);
         params.push(cleanComment);
         idx++;
       }
-      if (managerColumns.has("manager_comment")) {
+      if (!isPending && managerColumns.has("manager_comment")) {
         setClauses.push(`manager_comment = $${idx}`);
         params.push(cleanComment);
         idx++;
       }
-      if (managerColumns.has("decision_notes")) {
+      if (!isPending && managerColumns.has("decision_notes")) {
         setClauses.push(`decision_notes = $${idx}`);
         params.push(cleanComment);
         idx++;
       }
-      if (managerColumns.has("decision")) {
+      if (!isPending && managerColumns.has("decision")) {
         setClauses.push(`decision = $${idx}`);
         params.push(managerStatus);
         idx++;
