@@ -3909,9 +3909,10 @@ async function fetchInventoryApprovalsForWeb({ includeHistory = false, limit = 5
 
 async function applyInventoryDecisionByApprovalId(approvalId, decision, reviewNotes = "") {
   const normalizedDecision = String(decision || "").trim().toLowerCase();
+  const isPending = normalizedDecision === "pending";
   const isApprove = normalizedDecision === "approve" || normalizedDecision === "approved";
-  const managerStatus = isApprove ? "approved" : "rejected";
-  const alertStatus = isApprove ? "resolved" : "declined";
+  const managerStatus = isPending ? "pending_review" : isApprove ? "approved" : "rejected";
+  const alertStatus = isPending ? "active" : isApprove ? "resolved" : "declined";
 
   const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
   const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
@@ -4475,7 +4476,7 @@ app.patch("/api/approvals/:id/decision", async (req, res) => {
     const id = req.params.id;
     const decisionRaw = String(req.body?.decision || "").trim().toLowerCase();
     const reviewNotes = req.body?.review_notes || req.body?.comment || "";
-    if (!["approved", "declined", "approve", "decline", "rejected"].includes(decisionRaw)) {
+    if (!["approved", "declined", "approve", "decline", "rejected", "pending"].includes(decisionRaw)) {
       return res.status(400).json({ success: false, message: "Invalid decision" });
     }
     const decision = decisionRaw === "rejected" ? "declined" : decisionRaw;
