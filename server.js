@@ -2458,18 +2458,89 @@ app.get("/api/logistics/dashboard", async (req, res) => {
 
     let driversResult = { rows: [] };
     try {
-      driversResult = await pool.query(
-        `SELECT 
+      const usersResult = await pool.query(
+        `SELECT
           u.user_id,
           COALESCE(NULLIF(u.full_name, ''), u.name, u.email) as full_name,
-          u.email,
-          d.from_location || ' → ' || d.to_location as route_name,
-          d.status as route_status, 0 as stops_completed, 2 as stops_total
+          u.email
         FROM users u
-        LEFT JOIN deliveries d ON d.driver_name = COALESCE(NULLIF(u.full_name, ''), u.name) AND d.status IN ('assigned', 'accepted', 'in_progress')
         WHERE u.role = 'driver'
         ORDER BY COALESCE(NULLIF(u.full_name, ''), u.name, u.email) ASC`
       );
+
+      const busyByDriver = new Map();
+      const upsertBusy = (driverName, routeName, routeStatus) => {
+        const key = String(driverName || "").trim().toLowerCase();
+        if (!key) return;
+        if (busyByDriver.has(key)) return;
+        busyByDriver.set(key, {
+          route_name: routeName || null,
+          route_status: routeStatus || null
+        });
+      };
+
+      try {
+        const deliveriesTableCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
+        const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
+        if (hasDeliveries) {
+          const busyDeliveries = await pool.query(
+            `SELECT
+              COALESCE(driver_name, '') AS driver_name,
+              COALESCE(from_location, '') || ' → ' || COALESCE(to_location, '') AS route_name,
+              status AS route_status
+             FROM deliveries
+             WHERE LOWER(COALESCE(status, '')) IN ('pending', 'assigned', 'accepted', 'in_progress')
+             ORDER BY COALESCE(updated_at, departure_time, created_at) DESC NULLS LAST`
+          );
+          for (const row of busyDeliveries.rows) {
+            upsertBusy(row.driver_name, row.route_name, row.route_status);
+          }
+        }
+      } catch (driverDeliveryErr) {
+        console.warn("Driver monitor deliveries lookup fallback:", driverDeliveryErr.message);
+      }
+
+      if (hasRouteApprovals) {
+        try {
+          const busyRouteApprovals = await pool.query(
+            `SELECT
+              COALESCE(driver_name, '') AS driver_name,
+              COALESCE(from_location, '') || ' → ' || COALESCE(to_location, '') AS route_name,
+              status AS route_status
+             FROM route_approvals
+             WHERE COALESCE(driver_name, '') <> ''
+               AND (
+                 LOWER(COALESCE(status, '')) IN ('pending', 'awaiting_approval', 'submitted', 'in_review', 'for_approval', 'assigned', 'accepted', 'in_progress')
+                 OR LOWER(COALESCE(status, '')) LIKE '%pending%'
+                 OR LOWER(COALESCE(status, '')) LIKE '%await%'
+                 OR LOWER(COALESCE(status, '')) LIKE '%review%'
+                 OR LOWER(COALESCE(status, '')) LIKE '%submit%'
+               )
+             ORDER BY COALESCE(submitted_at, approved_at) DESC NULLS LAST, id DESC`
+          );
+          for (const row of busyRouteApprovals.rows) {
+            upsertBusy(row.driver_name, row.route_name, row.route_status);
+          }
+        } catch (driverRouteErr) {
+          console.warn("Driver monitor route_approvals lookup fallback:", driverRouteErr.message);
+        }
+      }
+
+      driversResult = {
+        rows: usersResult.rows.map((u) => {
+          const displayName = String(u.full_name || "").trim();
+          const busy = busyByDriver.get(displayName.toLowerCase());
+          return {
+            user_id: u.user_id,
+            full_name: displayName,
+            email: u.email,
+            route_name: busy?.route_name || null,
+            route_status: busy?.route_status || null,
+            stops_completed: 0,
+            stops_total: 2
+          };
+        })
+      };
     } catch (driverErr) {
       console.warn("Logistics driver monitor fallback:", driverErr.message);
     }
