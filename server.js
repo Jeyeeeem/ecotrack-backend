@@ -5047,38 +5047,89 @@ app.post("/api/driver/complete-delivery", async (req, res) => {
 app.post("/api/driver/confirm-stop", async (req, res) => {
   const { deliveryId, stopIndex, confirmationType } = req.body;
   try {
-    const deliveryResult = await pool.query(`SELECT route_id, stops_json FROM deliveries WHERE delivery_id = $1`, [deliveryId]);
+    const normalizedDeliveryId = Number(deliveryId);
+    const normalizedStopIndex = Number(stopIndex);
+    if (!Number.isFinite(normalizedDeliveryId) || normalizedDeliveryId <= 0) {
+      return res.status(400).json({ success: false, message: "Invalid deliveryId" });
+    }
+    if (!Number.isFinite(normalizedStopIndex) || normalizedStopIndex < 0) {
+      return res.status(400).json({ success: false, message: "Invalid stopIndex" });
+    }
+
+    const deliveryResult = await pool.query(
+      `SELECT route_id, stops_json, status FROM deliveries WHERE delivery_id = $1`,
+      [normalizedDeliveryId]
+    );
     if (deliveryResult.rows.length === 0) {
       return res.status(404).json({ success: false, message: "Delivery not found" });
     }
 
     const delivery = deliveryResult.rows[0];
     const routeId = delivery.route_id;
-    const stopSequence = Number(stopIndex) + 1;
+    const stopSequence = normalizedStopIndex + 1;
     const isArrival = String(confirmationType || "").toLowerCase() === "arrival";
+    let routeStopsUpdated = false;
 
-    await pool.query(`
-      UPDATE route_stops
-      SET
-        actual_arrival_time = CASE WHEN $1 THEN NOW() ELSE actual_arrival_time END,
-        actual_departure_time = CASE WHEN $1 THEN actual_departure_time ELSE NOW() END,
-        status = CASE WHEN $1 THEN 'arrived' ELSE 'completed' END,
-        updated_at = NOW()
-      WHERE route_id = $2 AND stop_sequence = $3
-    `, [isArrival, routeId, stopSequence]);
+    try {
+      const routeStopsTableCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
+      const hasRouteStops = !!routeStopsTableCheck.rows[0]?.tbl;
+      if (hasRouteStops && routeId !== null && routeId !== undefined) {
+        const routeStopsColumns = await getTableColumns("route_stops");
+        const canMatchRouteStop = routeStopsColumns.has("route_id") && routeStopsColumns.has("stop_sequence");
+        if (canMatchRouteStop) {
+          const setClauses = [];
+          if (isArrival) {
+            if (routeStopsColumns.has("actual_arrival_time")) setClauses.push("actual_arrival_time = NOW()");
+            if (routeStopsColumns.has("status")) setClauses.push(`status = 'arrived'`);
+          } else {
+            if (routeStopsColumns.has("actual_departure_time")) setClauses.push("actual_departure_time = NOW()");
+            if (routeStopsColumns.has("status")) setClauses.push(`status = 'completed'`);
+          }
+          if (routeStopsColumns.has("updated_at")) setClauses.push("updated_at = NOW()");
 
-    if (Array.isArray(delivery.stops_json) && delivery.stops_json[stopIndex]) {
-      const updatedStops = [...delivery.stops_json];
-      updatedStops[stopIndex] = {
-        ...updatedStops[stopIndex],
-        status: isArrival ? "arrived" : "completed"
-      };
-      await pool.query(`UPDATE deliveries SET stops_json = $1 WHERE delivery_id = $2`, [JSON.stringify(updatedStops), deliveryId]);
+          if (setClauses.length > 0) {
+            const routeStopUpdate = await pool.query(
+              `UPDATE route_stops
+               SET ${setClauses.join(", ")}
+               WHERE route_id = $1 AND stop_sequence = $2`,
+              [routeId, stopSequence]
+            );
+            routeStopsUpdated = routeStopUpdate.rowCount > 0;
+          }
+        }
+      }
+    } catch (routeStopsErr) {
+      console.warn("confirm-stop route_stops fallback:", routeStopsErr.message);
     }
 
-    res.json({ success: true, message: isArrival ? "Stop arrival confirmed" : "Stop departure confirmed" });
+    let stopsJsonUpdated = false;
+    if (Array.isArray(delivery.stops_json) && delivery.stops_json[normalizedStopIndex]) {
+      const updatedStops = [...delivery.stops_json];
+      updatedStops[normalizedStopIndex] = {
+        ...updatedStops[normalizedStopIndex],
+        status: isArrival ? "arrived" : "completed"
+      };
+      await pool.query(`UPDATE deliveries SET stops_json = $1 WHERE delivery_id = $2`, [JSON.stringify(updatedStops), normalizedDeliveryId]);
+      stopsJsonUpdated = true;
+    }
+
+    // Ensure delivery transitions from accepted -> in_progress upon first arrival confirmation.
+    if (isArrival && String(delivery.status || "").toLowerCase() === "accepted") {
+      await pool.query(
+        `UPDATE deliveries SET status = 'in_progress' WHERE delivery_id = $1`,
+        [normalizedDeliveryId]
+      );
+    }
+
+    res.json({
+      success: true,
+      message: isArrival ? "Stop arrival confirmed" : "Stop departure confirmed",
+      routeStopsUpdated,
+      stopsJsonUpdated
+    });
   } catch (err) {
-    res.status(500).json({ success: false, message: "Database error" });
+    console.error("confirm-stop error:", err);
+    res.status(500).json({ success: false, message: err.message || "Database error" });
   }
 });
 
