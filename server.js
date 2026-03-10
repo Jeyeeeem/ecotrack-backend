@@ -447,6 +447,34 @@ function numOrNull(v) {
   return Number.isFinite(n) ? n : null;
 }
 
+// Normalize inventory rows for app/web (snake + camel + derived fields)
+function mapInventoryRow(row = {}) {
+  const daysUntilExpiry =
+    row.expected_expiry_date != null
+      ? Math.max(
+          0,
+          Math.ceil(
+            (new Date(row.expected_expiry_date).getTime() - Date.now()) / (24 * 60 * 60 * 1000)
+          )
+        )
+      : row.days_until_expiry ?? null;
+
+  return {
+    ...row,
+    productName: row.product_name,
+    productType: row.product_type,
+    storageCategory: row.storage_category,
+    shelfLifeDays: row.shelf_life_days,
+    compatibleWith: row.compatible_with,
+    avoidWith: row.avoid_with,
+    optimalTempMin: row.optimal_temp_min,
+    optimalTempMax: row.optimal_temp_max,
+    optimalHumidityMin: row.optimal_humidity_min,
+    optimalHumidityMax: row.optimal_humidity_max,
+    daysUntilExpiry
+  };
+}
+
 app.get("/api/products", authenticate, async (req, res) => {
   try {
     const businessId = req.user?.businessId || null;
@@ -766,7 +794,8 @@ app.get("/api/inventory", authenticate, async (req, res) => {
     `,
       [businessId]
     );
-    res.json({ success: true, data: result.rows, inventory: result.rows, count: result.rows.length });
+    const rows = result.rows.map(mapInventoryRow);
+    res.json({ success: true, data: rows, inventory: rows, count: rows.length });
   } catch (err) {
     console.error("GET /api/inventory error:", err);
     res.status(500).json({ success: false, message: "Database error" });
@@ -802,7 +831,8 @@ app.get("/api/inventory/:id(\\d+)", authenticate, async (req, res) => {
     if (result.rows.length === 0) {
       return res.status(404).json({ success: false, message: "Inventory record not found" });
     }
-    res.json({ success: true, data: result.rows[0], inventory: result.rows[0] });
+    const row = mapInventoryRow(result.rows[0]);
+    res.json({ success: true, data: row, inventory: row });
   } catch (err) {
     console.error("GET /api/inventory/:id error:", err);
     res.status(500).json({ success: false, message: "Database error" });
@@ -849,7 +879,8 @@ app.post("/api/inventory", authenticate, async (req, res) => {
         body.ripeness_stage || body.ripenessStage || null
       ]
     );
-    res.status(201).json({ success: true, data: inserted.rows[0], inventory: inserted.rows[0] });
+    const row = mapInventoryRow(inserted.rows[0]);
+    res.status(201).json({ success: true, data: row, inventory: row });
   } catch (err) {
     console.error("POST /api/inventory error:", err);
     res.status(500).json({ success: false, message: "Database error" });
