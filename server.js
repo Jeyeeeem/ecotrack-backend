@@ -1359,6 +1359,112 @@ app.get("/api/inventory/stats", authenticate, async (req, res) => {
   }
 });
 
+// AI insights for inventory dashboard (lightweight heuristic)
+app.post("/api/ai/inventory-insights", authenticate, async (req, res) => {
+  try {
+    const businessId = req.user?.businessId || null;
+
+    // Pending approvals (spoilage_action)
+    const pendingResult = await pool.query(
+      `
+      SELECT COUNT(*) AS pending_count,
+             COUNT(*) FILTER (WHERE LOWER(COALESCE(risk_level,'')) = 'high') AS high_risk
+      FROM manager_approvals
+      WHERE approval_type = 'spoilage_action'
+        AND (${inventoryPendingStatusPredicate})
+        ${businessId ? "AND business_id = $1" : ""}
+    `,
+      businessId ? [businessId] : []
+    );
+    const pendingApprovals = parseInt(pendingResult.rows[0]?.pending_count || 0, 10);
+    const highRisk = parseInt(pendingResult.rows[0]?.high_risk || 0, 10);
+
+    // Approved today
+    const approvedResult = await pool.query(
+      `
+      SELECT COUNT(*) AS approved_today
+      FROM manager_approvals
+      WHERE approval_type = 'spoilage_action'
+        AND LOWER(COALESCE(status,'')) IN ('approved','resolved')
+        AND reviewed_at >= date_trunc('day', NOW())
+        ${businessId ? "AND business_id = $1" : ""}
+    `,
+      businessId ? [businessId] : []
+    );
+    const approvedToday = parseInt(approvedResult.rows[0]?.approved_today || 0, 10);
+
+    // Expiring items (inventory expiring within 3 days)
+    const expiringResult = await pool.query(
+      `
+      SELECT COUNT(*) AS expiring
+      FROM inventory i
+      WHERE (i.expected_expiry_date - CURRENT_DATE) <= 3
+        AND COALESCE(LOWER(i.current_condition), '') <> 'spoiled'
+        ${businessId ? "AND i.business_id = $1" : ""}
+    `,
+      businessId ? [businessId] : []
+    );
+    const expiringItems = parseInt(expiringResult.rows[0]?.expiring || 0, 10);
+
+    // Build recommendations
+    const urgentRecommendations = [];
+    if (highRisk > 0) {
+      urgentRecommendations.push({
+        priority: "HIGH",
+        type: "Spoilage",
+        title: "Review high‑risk spoilage alerts",
+        description: `You have ${highRisk} high-risk items pending review.`,
+        actionRequired: "Open Inventory Approvals and resolve high-risk items first.",
+        estimatedImpact: { financial: "Reduce wastage costs", timeframe: "Today" }
+      });
+    }
+    if (expiringItems > 0) {
+      urgentRecommendations.push({
+        priority: "MEDIUM",
+        type: "Expiry",
+        title: "Items expiring soon",
+        description: `${expiringItems} batch(es) expire within 3 days.`,
+        actionRequired: "Prioritize dispatch or adjust storage for these batches.",
+        estimatedImpact: { financial: "Preserve margin", timeframe: "This week" }
+      });
+    }
+    if (urgentRecommendations.length === 0) {
+      urgentRecommendations.push({
+        priority: "LOW",
+        type: "Status",
+        title: "All clear",
+        description: "No urgent spoilage risks detected.",
+        actionRequired: "Monitor periodically.",
+        estimatedImpact: { financial: "Stable", timeframe: "Ongoing" }
+      });
+    }
+
+    const todayOverview = {
+      keyMetrics: [
+        `${pendingApprovals} pending approvals`,
+        `${highRisk} high-risk alerts`,
+        `${expiringItems} expiring ≤3d`
+      ],
+      opportunities: pendingApprovals > 0 ? ["Resolve pending approvals to free up safe batches"] : [],
+      warnings: highRisk > 0 ? ["High-risk items need immediate action"] : [],
+      pendingApprovals,
+      approvedToday,
+      highPriority: highRisk,
+      expiringItems
+    };
+
+    res.json({
+      success: true,
+      urgentRecommendations,
+      todayOverview,
+      message: null
+    });
+  } catch (err) {
+    console.error("POST /api/ai/inventory-insights error:", err);
+    res.status(500).json({ success: false, message: "Failed to generate inventory AI insights" });
+  }
+});
+
 // ============================================================
 // DELIVERY ROUTES ROUTES
 // ============================================================
