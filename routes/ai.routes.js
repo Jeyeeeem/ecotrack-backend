@@ -382,6 +382,186 @@ Return STRICT JSON with this exact structure:
 });
 
 // ============================================================
+// POST /api/ai/inventory-dashboard-insights - Get AI-powered insights for inventory dashboard (aggregated stats)
+// ============================================================
+router.post('/inventory-dashboard-insights', authenticate, async (req, res) => {
+  const { pendingApprovals, approvedToday, declined, highRisk, mediumRisk, lowRisk } = req.body;
+
+  const stats = {
+    pendingApprovals: safeNumber(pendingApprovals, 0),
+    approvedToday: safeNumber(approvedToday, 0),
+    declined: safeNumber(declined, 0),
+    highRisk: safeNumber(highRisk, 0),
+    mediumRisk: safeNumber(mediumRisk, 0),
+    lowRisk: safeNumber(lowRisk, 0)
+  };
+
+  function deterministicDashboardInsightsFallback(stats) {
+    const urgentRecommendations = [];
+    const totalRisk = stats.highRisk + stats.mediumRisk + stats.lowRisk;
+    
+    if (stats.highRisk > 0) {
+      urgentRecommendations.push({
+        priority: 'HIGH',
+        type: 'SPOILAGE',
+        title: `${stats.highRisk} high-risk batch${stats.highRisk > 1 ? 'es' : ''} require immediate attention`,
+        description: `${stats.highRisk} inventory batch${stats.highRisk > 1 ? 'es' : ''} flagged as high risk need urgent approval decision.`,
+        estimatedImpact: {
+          financial: `PHP ${(stats.highRisk * 15000).toLocaleString()} potential loss prevention`,
+          timeframe: 'Within 24 hours'
+        },
+        actionRequired: 'Review and prioritize high-risk inventory batches for immediate dispatch or discount.'
+      });
+    }
+
+    if (stats.mediumRisk > 0) {
+      urgentRecommendations.push({
+        priority: 'MEDIUM',
+        type: 'INVENTORY',
+        title: `${stats.mediumRisk} medium-risk batch${stats.mediumRisk > 1 ? 'es' : ''} need attention`,
+        description: `${stats.mediumRisk} inventory batch${stats.mediumRisk > 1 ? 'es' : ''} require monitoring within the next few days.`,
+        estimatedImpact: {
+          financial: `PHP ${(stats.mediumRisk * 8000).toLocaleString()} potential savings`,
+          timeframe: 'Within 3-5 days'
+        },
+        actionRequired: 'Schedule dispatch for medium-risk inventory within the week.'
+      });
+    }
+
+    if (stats.pendingApprovals > 5) {
+      urgentRecommendations.push({
+        priority: stats.highRisk > 0 ? 'HIGH' : 'MEDIUM',
+        type: 'APPROVAL',
+        title: `${stats.pendingApprovals} pending approval${stats.pendingApprovals > 1 ? 's' : ''} backlog`,
+        description: `${stats.pendingApprovals} inventory items await manager approval, creating potential delivery delays.`,
+        estimatedImpact: {
+          financial: `PHP ${(stats.pendingApprovals * 5000).toLocaleString()} in delayed sales`,
+          timeframe: 'Immediate action needed'
+        },
+        actionRequired: 'Clear pending approvals to maintain delivery schedule.'
+      });
+    }
+
+    if (urgentRecommendations.length === 0) {
+      urgentRecommendations.push({
+        priority: 'LOW',
+        type: 'OPTIMIZATION',
+        title: 'Inventory operations running smoothly',
+        description: 'All inventory metrics are within acceptable ranges.',
+        estimatedImpact: {
+          financial: 'Continue current practices',
+          timeframe: 'Ongoing'
+        },
+        actionRequired: 'Maintain standard monitoring and quality checks.'
+      });
+    }
+
+    const warnings = [];
+    if (stats.highRisk > 0) warnings.push(`${stats.highRisk} high-risk batches need immediate action`);
+    if (stats.pendingApprovals > 5) warnings.push(`${stats.pendingApprovals} items pending approval`);
+    if (stats.declined > stats.approvedToday) warnings.push('Declined items exceed approvals today');
+
+    return {
+      urgentRecommendations,
+      todayOverview: {
+        keyMetrics: [
+          `${stats.pendingApprovals} items pending approval`,
+          `${stats.approvedToday} approved today`,
+          `${stats.declined} declined today`,
+          `${totalRisk} total risk-flagged items (${stats.highRisk} high, ${stats.mediumRisk} medium, ${stats.lowRisk} low)`
+        ],
+        opportunities: [
+          'Process high-risk items first to minimize spoilage',
+          'Bundle medium-risk items with high-priority deliveries',
+          'Review declined items for process improvement'
+        ],
+        warnings: warnings.length > 0 ? warnings : ['All systems normal']
+      }
+    };
+  }
+
+  try {
+    const prompt = `Analyze this inventory dashboard data for a Philippine food distribution company.
+
+CURRENT INVENTORY STATUS:
+- Pending Approvals: ${stats.pendingApprovals}
+- Approved Today: ${stats.approvedToday}
+- Declined Today: ${stats.declined}
+- High Risk Items: ${stats.highRisk}
+- Medium Risk Items: ${stats.mediumRisk}
+- Low Risk Items: ${stats.lowRisk}
+
+Return STRICT JSON with this exact structure:
+{
+  "urgentRecommendations": [
+    {
+      "priority": "HIGH|MEDIUM|LOW",
+      "type": "SPOILAGE|INVENTORY|APPROVAL|OPTIMIZATION",
+      "title": "...",
+      "description": "...",
+      "estimatedImpact": { "financial": "...", "timeframe": "..." },
+      "actionRequired": "..."
+    }
+  ],
+  "todayOverview": {
+    "keyMetrics": ["...", "..."],
+    "opportunities": ["...", "..."],
+    "warnings": ["..."]
+  }
+}`;
+
+    const responseText = await callGroq(prompt);
+    const parsed = strictJsonParse(responseText);
+
+    if (!parsed || !parsed.urgentRecommendations) {
+      const fallback = deterministicDashboardInsightsFallback(stats);
+      return res.json({
+        success: true,
+        ...fallback,
+        message: 'Insights generated with fallback'
+      });
+    }
+
+    const result = {
+      urgentRecommendations: Array.isArray(parsed.urgentRecommendations)
+        ? parsed.urgentRecommendations.slice(0, 5).map(rec => ({
+            priority: safeString(rec.priority, 'LOW').toUpperCase(),
+            type: safeString(rec.type, 'OPTIMIZATION').toUpperCase(),
+            title: safeString(rec.title, 'Recommendation'),
+            description: safeString(rec.description, ''),
+            estimatedImpact: {
+              financial: safeString(rec.estimatedImpact?.financial, 'N/A'),
+              timeframe: safeString(rec.estimatedImpact?.timeframe, 'N/A')
+            },
+            actionRequired: safeString(rec.actionRequired, '')
+          }))
+        : [],
+      todayOverview: {
+        keyMetrics: Array.isArray(parsed.todayOverview?.keyMetrics)
+          ? parsed.todayOverview.keyMetrics.map(m => safeString(m)).filter(Boolean)
+          : [],
+        opportunities: Array.isArray(parsed.todayOverview?.opportunities)
+          ? parsed.todayOverview.opportunities.map(o => safeString(o)).filter(Boolean)
+          : [],
+        warnings: Array.isArray(parsed.todayOverview?.warnings)
+          ? parsed.todayOverview.warnings.map(w => safeString(w)).filter(Boolean)
+          : []
+      }
+    };
+
+    res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('AI Inventory dashboard insights error:', error.message);
+    const fallback = deterministicDashboardInsightsFallback(stats);
+    res.json({
+      success: true,
+      ...fallback,
+      message: 'Insights generated with fallback: ' + error.message
+    });
+  }
+});
+
+// ============================================================
 // POST /api/ai/inventory-insights - Get AI-powered inventory/alert insights
 // ============================================================
 router.post('/inventory-insights', authenticate, async (req, res) => {
