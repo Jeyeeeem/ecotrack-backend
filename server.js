@@ -750,11 +750,19 @@ app.get("/api/inventory", authenticate, async (req, res) => {
         p.product_name,
         p.product_type,
         p.storage_category,
-        p.shelf_life_days
+        p.shelf_life_days,
+        p.compatible_with,
+        p.avoid_with,
+        p.optimal_temp_min,
+        p.optimal_temp_max,
+        p.optimal_humidity_min,
+        p.optimal_humidity_max,
+        (i.expected_expiry_date - CURRENT_DATE) AS days_until_expiry
       FROM inventory i
       LEFT JOIN products p ON p.product_id = i.product_id
       WHERE i.business_id = $1
-      ORDER BY i.created_at DESC NULLS LAST
+        AND COALESCE(LOWER(i.current_condition), '') <> 'spoiled'
+      ORDER BY i.expected_expiry_date ASC NULLS LAST, i.created_at DESC NULLS LAST
     `,
       [businessId]
     );
@@ -771,7 +779,19 @@ app.get("/api/inventory/:id(\\d+)", authenticate, async (req, res) => {
     const inventoryId = parseInt(req.params.id, 10);
     const result = await pool.query(
       `
-      SELECT i.*, p.product_name, p.product_type, p.storage_category, p.shelf_life_days
+      SELECT
+        i.*,
+        p.product_name,
+        p.product_type,
+        p.storage_category,
+        p.shelf_life_days,
+        p.compatible_with,
+        p.avoid_with,
+        p.optimal_temp_min,
+        p.optimal_temp_max,
+        p.optimal_humidity_min,
+        p.optimal_humidity_max,
+        (i.expected_expiry_date - CURRENT_DATE) AS days_until_expiry
       FROM inventory i
       LEFT JOIN products p ON p.product_id = i.product_id
       WHERE i.inventory_id = $1 AND i.business_id = $2
@@ -838,33 +858,49 @@ app.post("/api/inventory", authenticate, async (req, res) => {
 
 app.post("/api/inventory/check-compatibility", authenticate, async (req, res) => {
   try {
-    const { productA, productB } = req.body || {};
-    if (!productA || !productB) {
-      return res.status(400).json({ success: false, message: "productA and productB are required" });
+    const businessId = req.user?.businessId || null;
+    const body = req.body || {};
+    const avoidListRaw = body.avoid_with || body.avoidWith || body.avoidList || [];
+    const avoidList = Array.isArray(avoidListRaw) ? avoidListRaw : [];
+
+    // Backward compatibility for legacy payload
+    if (body.productA && body.productB && avoidList.length === 0) {
+      avoidList.push(body.productB);
     }
-    const result = await pool.query(
+
+    if (!businessId) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+
+    if (!avoidList || avoidList.length === 0) {
+      return res.json({ success: true, conflicts: [], hasConflict: false, compatible: true, reason: "No avoid list provided" });
+    }
+
+    const normalizedList = avoidList.map((x) => String(x || "").trim()).filter(Boolean);
+    if (normalizedList.length === 0) {
+      return res.json({ success: true, conflicts: [], hasConflict: false, compatible: true, reason: "No avoid list provided" });
+    }
+
+    const conflictQuery = await pool.query(
       `
-      SELECT product_id, product_name, compatible_with, avoid_with
-      FROM products
-      WHERE LOWER(product_name) IN (LOWER($1), LOWER($2))
+      SELECT DISTINCT p.product_name
+      FROM inventory i
+      JOIN products p ON p.product_id = i.product_id
+      WHERE i.business_id = $1
+        AND COALESCE(LOWER(i.current_condition), '') <> 'spoiled'
+        AND COALESCE(i.quantity, 0) > 0
+        AND LOWER(p.product_name) = ANY($2::text[])
     `,
-      [productA, productB]
+      [businessId, normalizedList.map((n) => n.toLowerCase())]
     );
-    const rows = result.rows || [];
-    if (rows.length < 2) {
-      return res.json({ success: true, compatible: true, reason: "No explicit compatibility rules found" });
-    }
-    const a = rows.find((r) => String(r.product_name).toLowerCase() === String(productA).toLowerCase()) || rows[0];
-    const bName = String(productB).toLowerCase();
-    const avoid = Array.isArray(a.avoid_with) ? a.avoid_with.map((x) => String(x).toLowerCase()) : [];
-    const comp = Array.isArray(a.compatible_with) ? a.compatible_with.map((x) => String(x).toLowerCase()) : [];
-    if (avoid.includes(bName)) {
-      return res.json({ success: true, compatible: false, reason: `${productA} should not be stored with ${productB}` });
-    }
-    if (comp.length > 0 && !comp.includes(bName)) {
-      return res.json({ success: true, compatible: true, reason: "No direct conflict found" });
-    }
-    return res.json({ success: true, compatible: true, reason: "Compatible" });
+
+    const conflicts = conflictQuery.rows.map((r) => r.product_name);
+    const hasConflict = conflicts.length > 0;
+    const reason = hasConflict
+      ? `Avoid co-storing with: ${conflicts.join(", ")}`
+      : "No conflicts detected with current inventory";
+
+    return res.json({ success: true, conflicts, hasConflict, compatible: !hasConflict, reason });
   } catch (err) {
     console.error("POST /api/inventory/check-compatibility error:", err);
     res.status(500).json({ success: false, message: "Database error" });
@@ -1257,23 +1293,37 @@ app.delete("/api/inventory/items/:id", authenticate, authorize('admin', 'manager
   }
 });
 
-// Inventory stats
+// Inventory stats (business-scoped, aligned with web dashboard)
 app.get("/api/inventory/stats", authenticate, async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT 
-        COUNT(*) as total_items,
-        COUNT(*) FILTER (WHERE status = 'active') as active_items,
-        COUNT(*) FILTER (WHERE risk_level = 'HIGH') as high_risk,
-        COUNT(*) FILTER (WHERE risk_level = 'MEDIUM') as medium_risk,
-        COUNT(*) FILTER (WHERE risk_level = 'LOW') as low_risk,
-        SUM(quantity) as total_quantity,
-        COUNT(*) FILTER (WHERE days_until_expiry <= 7) as expiring_soon
-      FROM inventory_items
-    `);
-    res.json({ success: true, stats: result.rows[0] });
+    const businessId = req.user?.businessId || null;
+    const result = await pool.query(
+      `
+      SELECT
+        COUNT(*)::int AS total_batches,
+        COALESCE(SUM(i.quantity), 0) AS total_quantity,
+        COUNT(*) FILTER (WHERE (i.expected_expiry_date - CURRENT_DATE) <= 2)::int AS expiring_critical,
+        COUNT(*) FILTER (WHERE (i.expected_expiry_date - CURRENT_DATE) BETWEEN 3 AND 5)::int AS expiring_soon,
+        COUNT(*) FILTER (WHERE LOWER(COALESCE(i.current_condition,'')) IN ('poor','spoiled'))::int AS poor_condition
+      FROM inventory i
+      WHERE i.business_id = $1
+        AND COALESCE(LOWER(i.current_condition), '') <> 'spoiled'
+    `,
+      [businessId]
+    );
+    res.json({
+      success: true,
+      stats:
+        result.rows[0] || {
+          total_batches: 0,
+          total_quantity: 0,
+          expiring_critical: 0,
+          expiring_soon: 0,
+          poor_condition: 0
+        }
+    });
   } catch (err) {
-    console.error(err);
+    console.error("GET /api/inventory/stats error:", err);
     res.status(500).json({ success: false, message: "Database error" });
   }
 });
@@ -5649,4 +5699,3 @@ app.listen(port, () => {
 
 // KEEP ALIVE
 setInterval(() => { console.log("🟢 Server ping"); }, 60000);
-
