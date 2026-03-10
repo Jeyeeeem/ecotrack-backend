@@ -229,6 +229,51 @@ router.post("/logistics-manager/submit", authenticate, authorize('admin'), async
       JSON.stringify({ from_location: route.from_location, to_location: route.to_location, savings_co2: route.savings_co2 })
     ]);
     
+    // Mirror optimization snapshot for this route to keep dashboard/history in sync.
+    try {
+      const savingsKm = route.savings_km ?? (route.original_distance && route.optimized_distance ? Number(route.original_distance) - Number(route.optimized_distance) : null);
+      const savingsFuel = route.savings_fuel ?? (route.original_fuel && route.optimized_fuel ? Number(route.original_fuel) - Number(route.optimized_fuel) : null);
+      const savingsCo2 = route.savings_co2 ?? (route.original_co2 && route.optimized_co2 ? Number(route.original_co2) - Number(route.optimized_co2) : null);
+
+      await pool.query(`
+        WITH up AS (
+          UPDATE route_optimizations
+          SET original_distance = $2,
+              optimized_distance = $3,
+              original_fuel = $4,
+              optimized_fuel = $5,
+              original_co2 = $6,
+              optimized_co2 = $7,
+              savings_km = $8,
+              savings_fuel = $9,
+              savings_co2 = $10,
+              ai_recommendation = COALESCE($11, ai_recommendation),
+              status = 'pending',
+              updated_at = NOW()
+          WHERE route_id = $1
+          RETURNING 1
+        )
+        INSERT INTO route_optimizations 
+          (route_id, original_distance, optimized_distance, original_fuel, optimized_fuel, original_co2, optimized_co2, savings_km, savings_fuel, savings_co2, ai_recommendation, status)
+        SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending'
+        WHERE NOT EXISTS (SELECT 1 FROM up);
+      `, [
+        route_approval_id,
+        route.original_distance,
+        route.optimized_distance,
+        route.original_fuel,
+        route.optimized_fuel,
+        route.original_co2,
+        route.optimized_co2,
+        savingsKm,
+        savingsFuel,
+        savingsCo2,
+        route.ai_suggestion
+      ]);
+    } catch (err) {
+      console.warn("route_optimizations upsert skipped:", err.message);
+    }
+
     await pool.query(`UPDATE route_approvals SET status = 'awaiting_approval' WHERE id = $1`, [route_approval_id]);
     
     res.json({ success: true, message: "Submitted for logistics manager approval", approval: result.rows[0] });
@@ -260,6 +305,16 @@ router.post("/logistics-manager/decide", authenticate, authorize('logistics_mana
     // Update route_approvals status
     await pool.query(`UPDATE route_approvals SET status = $1, manager_comment = $2, approved_at = NOW() WHERE id = $3`, 
       [newStatus === 'approved' ? 'APPROVED' : 'DECLINED', comment, approval.related_record_id]);
+
+    // Keep route_optimizations status in sync for downstream dashboards
+    try {
+      await pool.query(
+        `UPDATE route_optimizations SET status = $1, updated_at = NOW() WHERE route_id = $2`,
+        [newStatus, approval.related_record_id]
+      );
+    } catch (err) {
+      console.warn("route_optimizations status sync skipped:", err.message);
+    }
     
     // Log to approval_history
     await pool.query(`
