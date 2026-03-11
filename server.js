@@ -2562,14 +2562,20 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     originalDistance: finalOriginalDistance,
     optimized_distance: finalOptimizedDistance,
     optimizedDistance: finalOptimizedDistance,
+    total_distance_km: finalOriginalDistance,
+    optimized_distance_km: finalOptimizedDistance,
     original_fuel: finalOriginalFuel,
     originalFuel: finalOriginalFuel,
     optimized_fuel: finalOptimizedFuel,
     optimizedFuel: finalOptimizedFuel,
+    estimated_fuel_consumption_liters: finalOriginalFuel,
+    optimized_fuel_liters: finalOptimizedFuel,
     original_co2: finalOriginalCO2,
     originalCO2: finalOriginalCO2,
     optimized_co2: finalOptimizedCO2,
     optimizedCO2: finalOptimizedCO2,
+    estimated_carbon_kg: finalOriginalCO2,
+    optimized_carbon_kg: finalOptimizedCO2,
     savings_km: finalSavingsKm,
     totalSavingsKm: finalSavingsKm,
     savings_fuel: finalSavingsFuel,
@@ -2577,6 +2583,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     savings_co2: finalSavingsCO2,
     totalSavingsCO2: finalSavingsCO2,
     ai_suggestion: aiSuggestion,
+    ai_recommendation: aiSuggestion,
     aiSuggestion,
     aiOptimization: {
       originalDistance,
@@ -2601,17 +2608,26 @@ async function buildLogisticsRoutePayload(row, options = {}) {
 }
 
 // Fetch driver monitor rows (shared by dashboard + standalone endpoint)
-const fetchDriverMonitorRows = async () => {
+const fetchDriverMonitorRows = async (businessId = null) => {
   let driverMonitorRows = [];
   try {
+    const usersColumns = await getTableColumns("users");
+    const hasBusinessColumn = usersColumns.has("business_id");
+    const usersParams = [];
+    const usersWhere = ["u.role = 'driver'"];
+    if (businessId && hasBusinessColumn) {
+      usersParams.push(businessId);
+      usersWhere.push(`u.business_id = $${usersParams.length}`);
+    }
     const usersResult = await pool.query(
       `SELECT
         u.user_id,
         COALESCE(NULLIF(u.full_name, ''), u.name, u.email) as full_name,
         u.email
        FROM users u
-       WHERE u.role = 'driver'
-       ORDER BY COALESCE(NULLIF(u.full_name, ''), u.name, u.email) ASC`
+       WHERE ${usersWhere.join(" AND ")}
+       ORDER BY COALESCE(NULLIF(u.full_name, ''), u.name, u.email) ASC`,
+      usersParams
     );
 
     const busyByDriver = new Map();
@@ -2635,6 +2651,7 @@ const fetchDriverMonitorRows = async () => {
         const deliveriesColumns = await getTableColumns("deliveries");
         const statusExpr = deliveriesColumns.has("status") ? "LOWER(COALESCE(status,''))" : "''";
         const hasDriverName = deliveriesColumns.has("driver_name");
+        const hasBusinessCol = deliveriesColumns.has("business_id");
         const routeNameExpr = deliveriesColumns.has("route_name")
           ? "route_name"
           : deliveriesColumns.has("from_location")
@@ -2649,6 +2666,14 @@ const fetchDriverMonitorRows = async () => {
           : null;
         const vehicleExpr = deliveriesColumns.has("vehicle_type") ? "vehicle_type" : "NULL::text";
         if (hasDriverName) {
+          const params = [];
+          const businessClause =
+            businessId && hasBusinessCol
+              ? (() => {
+                  params.push(businessId);
+                  return `AND business_id = $${params.length}`;
+                })()
+              : "";
           const liveDrivers = await pool.query(
             `
             SELECT
@@ -2662,9 +2687,11 @@ const fetchDriverMonitorRows = async () => {
               COALESCE(stops_total, 0) AS stops_total
             FROM deliveries
             WHERE ${statusExpr} NOT IN ('completed','cancelled','declined','rejected')
+              ${businessClause}
             ORDER BY departure_time DESC NULLS LAST, created_at DESC NULLS LAST
             LIMIT 50
-          `
+          `,
+            params
           );
           if (liveDrivers.rows.length > 0) {
             driverMonitorRows = liveDrivers.rows;
@@ -2680,6 +2707,8 @@ const fetchDriverMonitorRows = async () => {
       const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
       const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
       if (hasRouteApprovals) {
+        const routeColumns = await getTableColumns("route_approvals");
+        const hasBusinessCol = routeColumns.has("business_id");
         const busyRouteApprovals = await pool.query(
           `SELECT
             COALESCE(driver_name, '') AS driver_name,
@@ -2695,6 +2724,7 @@ const fetchDriverMonitorRows = async () => {
                OR LOWER(COALESCE(status, '')) LIKE '%review%'
                OR LOWER(COALESCE(status, '')) LIKE '%submit%'
              )
+             ${businessId && hasBusinessCol ? `AND business_id = ${Number(businessId)} ` : ""}
            ORDER BY COALESCE(submitted_at, approved_at) DESC NULLS LAST, id DESC
            LIMIT 50`
         );
@@ -2751,8 +2781,9 @@ const fetchRouteOptimizationStats = async () => {
   }
 };
 
-app.get("/api/logistics/dashboard", async (req, res) => {
+app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
   try {
+    const businessId = req.user?.businessId || req.user?.business_id || null;
     const pendingRouteStatusPredicate = `
       (
         UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g')) LIKE '%PEND%'
@@ -2790,21 +2821,37 @@ app.get("/api/logistics/dashboard", async (req, res) => {
     let statsResult;
 
     if (canUseManagerRouteData) {
+      const businessId = req.user?.businessId || req.user?.business_id || null;
+      const pendingParams = [];
+      let pendingWhere = `
+         ma.approval_type = 'route_optimization'
+         AND (
+           LOWER(COALESCE(ma.status, '')) IN ('pending', 'awaiting_approval', 'submitted', 'in_review', 'for_approval')
+           OR LOWER(COALESCE(ma.status, '')) LIKE '%pending%'
+           OR LOWER(COALESCE(ma.status, '')) LIKE '%await%'
+           OR LOWER(COALESCE(ma.status, '')) LIKE '%review%'
+           OR LOWER(COALESCE(ma.status, '')) LIKE '%submit%'
+         )
+      `;
+      if (businessId && managerColumns.has("business_id")) {
+        pendingParams.push(businessId);
+        pendingWhere += ` AND ma.business_id = $${pendingParams.length}`;
+      }
       pendingResult = await pool.query(
         `SELECT *
          FROM manager_approvals ma
-         WHERE ma.approval_type = 'route_optimization'
-           AND (
-             LOWER(COALESCE(ma.status, '')) IN ('pending', 'awaiting_approval', 'submitted', 'in_review', 'for_approval')
-             OR LOWER(COALESCE(ma.status, '')) LIKE '%pending%'
-             OR LOWER(COALESCE(ma.status, '')) LIKE '%await%'
-             OR LOWER(COALESCE(ma.status, '')) LIKE '%review%'
-             OR LOWER(COALESCE(ma.status, '')) LIKE '%submit%'
-           )
+         WHERE ${pendingWhere}
          ORDER BY ma.created_at DESC
-         LIMIT 20`
+         LIMIT 20`,
+        pendingParams
       );
 
+      const statsParams = [];
+      let statsWhere = `approval_type = 'route_optimization'`;
+      if (businessId && managerColumns.has("business_id")) {
+        statsParams.push(businessId);
+        statsWhere += ` AND business_id = $${statsParams.length}`;
+      }
       statsResult = await pool.query(
         `SELECT 
           COUNT(*) FILTER (WHERE LOWER(status) IN ('pending', 'awaiting_approval')) as pending_count,
@@ -2814,7 +2861,8 @@ app.get("/api/logistics/dashboard", async (req, res) => {
           0::numeric as total_co2_reduced,
           0::numeric as total_km_saved
         FROM manager_approvals
-        WHERE approval_type = 'route_optimization'`
+        WHERE ${statsWhere}`,
+        statsParams
       );
 
       // Fallback: some deployments have manager_approvals table but logistics rows only exist in route_approvals.
@@ -2962,7 +3010,7 @@ app.get("/api/logistics/dashboard", async (req, res) => {
       }
     }
 
-    const driverMonitorRows = await fetchDriverMonitorRows();
+    const driverMonitorRows = await fetchDriverMonitorRows(businessId);
 
     const stats = statsResult.rows[0] || {};
     const optStats = await fetchRouteOptimizationStats();
@@ -3097,9 +3145,10 @@ app.get("/api/logistics/dashboard", async (req, res) => {
   }
 });
 
-app.get("/api/logistics/driver-monitor", async (_req, res) => {
+app.get("/api/logistics/driver-monitor", optionalAuth, async (req, res) => {
   try {
-    const driverMonitorRows = await fetchDriverMonitorRows();
+    const businessId = req.user?.businessId || req.user?.business_id || null;
+    const driverMonitorRows = await fetchDriverMonitorRows(businessId);
     return res.json({ success: true, data: driverMonitorRows, message: null });
   } catch (err) {
     console.error("Logistics driver monitor endpoint error:", err);
