@@ -2876,6 +2876,45 @@ app.get("/api/logistics/dashboard", async (req, res) => {
       console.warn("Logistics driver monitor fallback:", driverErr.message);
     }
 
+    // Prefer live delivery assignments for driver monitor if available
+    let driverMonitorRows = (driversResult && driversResult.rows) || [];
+    try {
+      const deliveriesTableCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
+      const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
+      if (hasDeliveries) {
+        const deliveriesColumns = await getTableColumns("deliveries");
+        const statusExpr = deliveriesColumns.has("status") ? "LOWER(COALESCE(status,''))" : "''";
+        const hasDriverName = deliveriesColumns.has("driver_name");
+        const routeNameExpr = deliveriesColumns.has("route_name")
+          ? "route_name"
+          : deliveriesColumns.has("from_location")
+          ? "from_location"
+          : "NULL::text";
+        if (hasDriverName) {
+          const liveDrivers = await pool.query(
+            `
+            SELECT
+              driver_name AS full_name,
+              COALESCE(driver_email, '') AS email,
+              ${routeNameExpr} AS route_name,
+              ${statusExpr} AS route_status,
+              COALESCE(stops_completed, 0) AS stops_completed,
+              COALESCE(stops_total, 0) AS stops_total
+            FROM deliveries
+            WHERE ${statusExpr} NOT IN ('completed','cancelled','declined','rejected')
+            ORDER BY departure_time DESC NULLS LAST, created_at DESC NULLS LAST
+            LIMIT 30
+          `
+          );
+          if (liveDrivers.rows.length > 0) {
+            driverMonitorRows = liveDrivers.rows;
+          }
+        }
+      }
+    } catch (liveDriverErr) {
+      console.warn("Logistics driver monitor live-delivery lookup failed:", liveDriverErr.message);
+    }
+
     const stats = statsResult.rows[0] || {};
     let approvedCount = parseInt(stats.approved_count, 10) || 0;
     let declinedCount = parseInt(stats.declined_count, 10) || 0;
@@ -2982,7 +3021,7 @@ app.get("/api/logistics/dashboard", async (req, res) => {
         totalKmSaved: parseFloat(stats.total_km_saved) || 0
       },
       pendingRoutes: pendingRoutes,
-      driverMonitor: driversResult.rows,
+      driverMonitor: driverMonitorRows,
       message: null
     });
   } catch (err) {
