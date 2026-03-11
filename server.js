@@ -2598,6 +2598,9 @@ async function buildLogisticsRoutePayload(row, options = {}) {
       fuelSaved: totalSavingsFuel,
       co2Saved: totalSavingsCO2
     },
+    original_stops: stops,
+    optimized_stops: optimizationData.optimizedStops || optimization.optimizedStops || stops,
+    optimized_path: routePath,
     status: row.status || "PENDING",
     submitted_by: String(submittedBy),
     submittedBy: String(submittedBy),
