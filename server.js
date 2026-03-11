@@ -5803,6 +5803,100 @@ app.use('/api/tracking', trackingRoutes);
 const workflowRoutes = require('./routes/workflow.routes');
 app.use('/api/workflow', workflowRoutes);
 
+// ============================================================
+// SUPER ADMIN PARITY (system health, audit logs, EcoTrust config, catalog)
+// ============================================================
+
+app.get("/api/superadmin/system-health", authenticate, authorize("admin", "super_admin"), async (req, res) => {
+  try {
+    const [userCount, businessCount, routeCount] = await Promise.all([
+      pool.query("SELECT COUNT(*)::int AS count FROM users"),
+      pool.query("SELECT COUNT(*)::int AS count FROM business_profiles"),
+      pool.query("SELECT COUNT(*)::int AS count FROM route_approvals")
+    ]);
+    res.json({
+      success: true,
+      data: {
+        users: userCount.rows[0]?.count || 0,
+        businesses: businessCount.rows[0]?.count || 0,
+        routes: routeCount.rows[0]?.count || 0,
+        uptimeSeconds: Math.floor(process.uptime())
+      },
+      message: null
+    });
+  } catch (err) {
+    console.error("GET /api/superadmin/system-health error:", err);
+    res.status(500).json({ success: false, message: "Failed to fetch system health" });
+  }
+});
+
+app.get("/api/superadmin/audit-logs", authenticate, authorize("admin", "super_admin"), async (req, res) => {
+  try {
+    const auditCheck = await pool.query("SELECT to_regclass('public.audit_logs') AS tbl");
+    const useAudit = !!auditCheck.rows[0]?.tbl;
+    const query = useAudit
+      ? "SELECT * FROM audit_logs ORDER BY event_time DESC NULLS LAST LIMIT 200"
+      : "SELECT * FROM approval_history ORDER BY created_at DESC NULLS LAST LIMIT 200";
+    const rows = await pool.query(query);
+    res.json({ success: true, data: rows.rows, message: null });
+  } catch (err) {
+    console.error("GET /api/superadmin/audit-logs error:", err);
+    res.status(500).json({ success: false, message: "Failed to fetch audit logs" });
+  }
+});
+
+app.get("/api/superadmin/ecotrust/actions", authenticate, authorize("admin", "super_admin"), async (req, res) => {
+  try {
+    const result = await pool.query("SELECT * FROM sustainable_actions ORDER BY action_category, id");
+    res.json({ success: true, data: result.rows, message: null });
+  } catch (err) {
+    console.error("GET /api/superadmin/ecotrust/actions error:", err);
+    res.status(500).json({ success: false, message: "Failed to fetch EcoTrust actions" });
+  }
+});
+
+app.patch("/api/superadmin/ecotrust/actions/:id", authenticate, authorize("admin", "super_admin"), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { points_value, action_name, action_category, description } = req.body || {};
+    if (points_value === undefined) {
+      return res.status(400).json({ success: false, message: "points_value is required" });
+    }
+    const result = await pool.query(
+      `
+      UPDATE sustainable_actions
+      SET points_value    = $1,
+          action_name     = COALESCE($2, action_name),
+          action_category = COALESCE($3, action_category),
+          description     = COALESCE($4, description),
+          updated_at      = NOW()
+      WHERE id = $5
+      RETURNING *
+    `,
+      [points_value, action_name || null, action_category || null, description || null, id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Action not found" });
+    }
+    res.json({ success: true, data: result.rows[0], message: "Action updated" });
+  } catch (err) {
+    console.error("PATCH /api/superadmin/ecotrust/actions/:id error:", err);
+    res.status(500).json({ success: false, message: "Failed to update action" });
+  }
+});
+
+app.get("/api/superadmin/catalog", authenticate, authorize("admin", "super_admin"), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM products ORDER BY business_id NULLS FIRST, product_name ASC`
+    );
+    res.json({ success: true, data: result.rows, message: null });
+  } catch (err) {
+    console.error("GET /api/superadmin/catalog error:", err);
+    res.status(500).json({ success: false, message: "Failed to fetch catalog" });
+  }
+});
+
 
 // ============================================================
 // GLOBAL ERROR HANDLER
