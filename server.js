@@ -2600,6 +2600,157 @@ async function buildLogisticsRoutePayload(row, options = {}) {
   return payload;
 }
 
+// Fetch driver monitor rows (shared by dashboard + standalone endpoint)
+const fetchDriverMonitorRows = async () => {
+  let driverMonitorRows = [];
+  try {
+    const usersResult = await pool.query(
+      `SELECT
+        u.user_id,
+        COALESCE(NULLIF(u.full_name, ''), u.name, u.email) as full_name,
+        u.email
+       FROM users u
+       WHERE u.role = 'driver'
+       ORDER BY COALESCE(NULLIF(u.full_name, ''), u.name, u.email) ASC`
+    );
+
+    const busyByDriver = new Map();
+    const upsertBusy = (driverName, routeName, routeStatus, routeId = null, vehicleType = null) => {
+      const key = String(driverName || "").trim().toLowerCase();
+      if (!key) return;
+      if (busyByDriver.has(key)) return;
+      busyByDriver.set(key, {
+        route_name: routeName || null,
+        route_status: routeStatus || null,
+        route_id: routeId || null,
+        vehicle_type: vehicleType || null
+      });
+    };
+
+    // Active deliveries first
+    try {
+      const deliveriesTableCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
+      const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
+      if (hasDeliveries) {
+        const deliveriesColumns = await getTableColumns("deliveries");
+        const statusExpr = deliveriesColumns.has("status") ? "LOWER(COALESCE(status,''))" : "''";
+        const hasDriverName = deliveriesColumns.has("driver_name");
+        const routeNameExpr = deliveriesColumns.has("route_name")
+          ? "route_name"
+          : deliveriesColumns.has("from_location")
+          ? "from_location"
+          : "NULL::text";
+        const routeIdExpr = deliveriesColumns.has("route_id")
+          ? "route_id"
+          : deliveriesColumns.has("delivery_id")
+          ? "delivery_id"
+          : deliveriesColumns.has("id")
+          ? "id"
+          : null;
+        const vehicleExpr = deliveriesColumns.has("vehicle_type") ? "vehicle_type" : "NULL::text";
+        if (hasDriverName) {
+          const liveDrivers = await pool.query(
+            `
+            SELECT
+              driver_name AS full_name,
+              COALESCE(driver_email, '') AS email,
+              ${routeNameExpr} AS route_name,
+              ${statusExpr} AS route_status,
+              ${routeIdExpr || "NULL::text"} AS route_id,
+              ${vehicleExpr} AS vehicle_type,
+              COALESCE(stops_completed, 0) AS stops_completed,
+              COALESCE(stops_total, 0) AS stops_total
+            FROM deliveries
+            WHERE ${statusExpr} NOT IN ('completed','cancelled','declined','rejected')
+            ORDER BY departure_time DESC NULLS LAST, created_at DESC NULLS LAST
+            LIMIT 50
+          `
+          );
+          if (liveDrivers.rows.length > 0) {
+            driverMonitorRows = liveDrivers.rows;
+          }
+        }
+      }
+    } catch (liveDriverErr) {
+      console.warn("Logistics driver monitor live-delivery lookup failed:", liveDriverErr.message);
+    }
+
+    // Fallback busy drivers from route approvals
+    try {
+      const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
+      const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
+      if (hasRouteApprovals) {
+        const busyRouteApprovals = await pool.query(
+          `SELECT
+            COALESCE(driver_name, '') AS driver_name,
+            COALESCE(from_location, '') || ' → ' || COALESCE(to_location, '') AS route_name,
+            status AS route_status,
+            COALESCE(route_id, id) AS route_id
+           FROM route_approvals
+           WHERE COALESCE(driver_name, '') <> ''
+             AND (
+               LOWER(COALESCE(status, '')) IN ('pending', 'awaiting_approval', 'submitted', 'in_review', 'for_approval', 'assigned', 'accepted', 'in_progress')
+               OR LOWER(COALESCE(status, '')) LIKE '%pending%'
+               OR LOWER(COALESCE(status, '')) LIKE '%await%'
+               OR LOWER(COALESCE(status, '')) LIKE '%review%'
+               OR LOWER(COALESCE(status, '')) LIKE '%submit%'
+             )
+           ORDER BY COALESCE(submitted_at, approved_at) DESC NULLS LAST, id DESC
+           LIMIT 50`
+        );
+        for (const row of busyRouteApprovals.rows) {
+          upsertBusy(row.driver_name, row.route_name, row.route_status, row.route_id, null);
+        }
+      }
+    } catch (driverRouteErr) {
+      console.warn("Driver monitor route_approvals lookup fallback:", driverRouteErr.message);
+    }
+
+    // Base driver list mapped with busy overlay
+    if (driverMonitorRows.length === 0) {
+      driverMonitorRows = usersResult.rows.map((u) => {
+        const displayName = String(u.full_name || "").trim();
+        const busy = busyByDriver.get(displayName.toLowerCase());
+        return {
+          user_id: u.user_id,
+          full_name: displayName,
+          email: u.email,
+          route_name: busy?.route_name || null,
+          route_status: busy?.route_status || null,
+          route_id: busy?.route_id || null,
+          vehicle_type: busy?.vehicle_type || null,
+          stops_completed: 0,
+          stops_total: 2
+        };
+      });
+    }
+
+    return driverMonitorRows;
+  } catch (err) {
+    console.warn("Logistics driver monitor fallback:", err.message);
+    return [];
+  }
+};
+
+const fetchRouteOptimizationStats = async () => {
+  try {
+    const tableCheck = await pool.query(`SELECT to_regclass('public.route_optimizations') AS tbl`);
+    const hasRouteOptimizations = !!tableCheck.rows[0]?.tbl;
+    if (!hasRouteOptimizations) return { avg_savings_km: 0, avg_savings_fuel: 0, avg_savings_co2: 0 };
+    const { rows } = await pool.query(
+      `SELECT
+         ROUND(AVG(savings_km)::numeric,2)   AS avg_savings_km,
+         ROUND(AVG(savings_fuel)::numeric,2) AS avg_savings_fuel,
+         ROUND(AVG(savings_co2)::numeric,2)  AS avg_savings_co2
+       FROM route_optimizations`
+    );
+    return rows[0] || { avg_savings_km: 0, avg_savings_fuel: 0, avg_savings_co2: 0 };
+  } catch (err) {
+    console.warn("Route optimization stats fallback:", err.message);
+    return { avg_savings_km: 0, avg_savings_fuel: 0, avg_savings_co2: 0 };
+  }
+};
+
 app.get("/api/logistics/dashboard", async (req, res) => {
   try {
     const pendingRouteStatusPredicate = `
@@ -2811,135 +2962,10 @@ app.get("/api/logistics/dashboard", async (req, res) => {
       }
     }
 
-    let driversResult = { rows: [] };
-    try {
-      const usersResult = await pool.query(
-        `SELECT
-          u.user_id,
-          COALESCE(NULLIF(u.full_name, ''), u.name, u.email) as full_name,
-          u.email
-        FROM users u
-        WHERE u.role = 'driver'
-        ORDER BY COALESCE(NULLIF(u.full_name, ''), u.name, u.email) ASC`
-      );
-
-      const busyByDriver = new Map();
-      const upsertBusy = (driverName, routeName, routeStatus) => {
-        const key = String(driverName || "").trim().toLowerCase();
-        if (!key) return;
-        if (busyByDriver.has(key)) return;
-        busyByDriver.set(key, {
-          route_name: routeName || null,
-          route_status: routeStatus || null
-        });
-      };
-
-      try {
-        const deliveriesTableCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
-        const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
-        if (hasDeliveries) {
-          const busyDeliveries = await pool.query(
-            `SELECT
-              COALESCE(driver_name, '') AS driver_name,
-              COALESCE(from_location, '') || ' → ' || COALESCE(to_location, '') AS route_name,
-              status AS route_status
-             FROM deliveries
-             WHERE LOWER(COALESCE(status, '')) IN ('pending', 'assigned', 'accepted', 'in_progress')
-             ORDER BY COALESCE(updated_at, departure_time, created_at) DESC NULLS LAST`
-          );
-          for (const row of busyDeliveries.rows) {
-            upsertBusy(row.driver_name, row.route_name, row.route_status);
-          }
-        }
-      } catch (driverDeliveryErr) {
-        console.warn("Driver monitor deliveries lookup fallback:", driverDeliveryErr.message);
-      }
-
-      if (hasRouteApprovals) {
-        try {
-          const busyRouteApprovals = await pool.query(
-            `SELECT
-              COALESCE(driver_name, '') AS driver_name,
-              COALESCE(from_location, '') || ' → ' || COALESCE(to_location, '') AS route_name,
-              status AS route_status
-             FROM route_approvals
-             WHERE COALESCE(driver_name, '') <> ''
-               AND (
-                 LOWER(COALESCE(status, '')) IN ('pending', 'awaiting_approval', 'submitted', 'in_review', 'for_approval', 'assigned', 'accepted', 'in_progress')
-                 OR LOWER(COALESCE(status, '')) LIKE '%pending%'
-                 OR LOWER(COALESCE(status, '')) LIKE '%await%'
-                 OR LOWER(COALESCE(status, '')) LIKE '%review%'
-                 OR LOWER(COALESCE(status, '')) LIKE '%submit%'
-               )
-             ORDER BY COALESCE(submitted_at, approved_at) DESC NULLS LAST, id DESC`
-          );
-          for (const row of busyRouteApprovals.rows) {
-            upsertBusy(row.driver_name, row.route_name, row.route_status);
-          }
-        } catch (driverRouteErr) {
-          console.warn("Driver monitor route_approvals lookup fallback:", driverRouteErr.message);
-        }
-      }
-
-      driversResult = {
-        rows: usersResult.rows.map((u) => {
-          const displayName = String(u.full_name || "").trim();
-          const busy = busyByDriver.get(displayName.toLowerCase());
-          return {
-            user_id: u.user_id,
-            full_name: displayName,
-            email: u.email,
-            route_name: busy?.route_name || null,
-            route_status: busy?.route_status || null,
-            stops_completed: 0,
-            stops_total: 2
-          };
-        })
-      };
-    } catch (driverErr) {
-      console.warn("Logistics driver monitor fallback:", driverErr.message);
-    }
-
-    // Prefer live delivery assignments for driver monitor if available
-    let driverMonitorRows = (driversResult && driversResult.rows) || [];
-    try {
-      const deliveriesTableCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
-      const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
-      if (hasDeliveries) {
-        const deliveriesColumns = await getTableColumns("deliveries");
-        const statusExpr = deliveriesColumns.has("status") ? "LOWER(COALESCE(status,''))" : "''";
-        const hasDriverName = deliveriesColumns.has("driver_name");
-        const routeNameExpr = deliveriesColumns.has("route_name")
-          ? "route_name"
-          : deliveriesColumns.has("from_location")
-          ? "from_location"
-          : "NULL::text";
-        if (hasDriverName) {
-          const liveDrivers = await pool.query(
-            `
-            SELECT
-              driver_name AS full_name,
-              COALESCE(driver_email, '') AS email,
-              ${routeNameExpr} AS route_name,
-              ${statusExpr} AS route_status,
-              COALESCE(stops_completed, 0) AS stops_completed,
-              COALESCE(stops_total, 0) AS stops_total
-            FROM deliveries
-            WHERE ${statusExpr} NOT IN ('completed','cancelled','declined','rejected')
-            ORDER BY departure_time DESC NULLS LAST, created_at DESC NULLS LAST
-            LIMIT 30
-          `
-          );
-          if (liveDrivers.rows.length > 0) {
-            driverMonitorRows = liveDrivers.rows;
-          }
-        }
-      }
-    } catch (liveDriverErr) {
-      console.warn("Logistics driver monitor live-delivery lookup failed:", liveDriverErr.message);
-    }
+    const driverMonitorRows = await fetchDriverMonitorRows();
 
     const stats = statsResult.rows[0] || {};
+    const optStats = await fetchRouteOptimizationStats();
     let approvedCount = parseInt(stats.approved_count, 10) || 0;
     let declinedCount = parseInt(stats.declined_count, 10) || 0;
 
@@ -3041,6 +3067,8 @@ app.get("/api/logistics/dashboard", async (req, res) => {
         approvedToday: approvedCount,
         declined: declinedCount,
         avgCO2Saved: parseFloat(stats.avg_co2_saved) || 0,
+        avgFuelSaved: parseFloat(optStats.avg_savings_fuel) || 0,
+        avgKmSaved: parseFloat(optStats.avg_savings_km) || 0,
         totalCO2Reduced: parseFloat(stats.total_co2_reduced) || 0,
         totalKmSaved: parseFloat(stats.total_km_saved) || 0
       },
@@ -3057,6 +3085,8 @@ app.get("/api/logistics/dashboard", async (req, res) => {
         approvedToday: 0,
         declined: 0,
         avgCO2Saved: 0,
+        avgFuelSaved: 0,
+        avgKmSaved: 0,
         totalCO2Reduced: 0,
         totalKmSaved: 0
       },
@@ -3064,6 +3094,63 @@ app.get("/api/logistics/dashboard", async (req, res) => {
       driverMonitor: [],
       message: `Logistics data temporarily unavailable: ${err.message || 'unknown error'}`
     });
+  }
+});
+
+app.get("/api/logistics/driver-monitor", async (_req, res) => {
+  try {
+    const driverMonitorRows = await fetchDriverMonitorRows();
+    return res.json({ success: true, data: driverMonitorRows, message: null });
+  } catch (err) {
+    console.error("Logistics driver monitor endpoint error:", err);
+    return res.status(500).json({ success: false, data: [], message: "Driver monitor unavailable" });
+  }
+});
+
+app.get("/api/logistics/stats", async (_req, res) => {
+  try {
+    const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
+    const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
+    const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
+    const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
+    let countsRow = { pending: 0, approved: 0, declined: 0 };
+
+    if (hasManagerApprovals) {
+      const counts = await pool.query(
+        `SELECT
+           COUNT(*) FILTER (WHERE LOWER(COALESCE(status,'')) IN ('pending','awaiting_approval','submitted','in_review','for_approval')) AS pending,
+           COUNT(*) FILTER (WHERE LOWER(COALESCE(status,'')) = 'approved') AS approved,
+           COUNT(*) FILTER (WHERE LOWER(COALESCE(status,'')) IN ('declined','rejected','cancelled')) AS declined
+         FROM manager_approvals
+         WHERE approval_type = 'route_optimization'`
+      );
+      countsRow = counts.rows[0] || countsRow;
+    } else if (hasRouteApprovals) {
+      const counts = await pool.query(
+        `SELECT
+           COUNT(*) FILTER (WHERE LOWER(COALESCE(status,'')) IN ('pending','awaiting_approval','submitted','in_review','for_approval')) AS pending,
+           COUNT(*) FILTER (WHERE LOWER(COALESCE(status,'')) = 'approved') AS approved,
+           COUNT(*) FILTER (WHERE LOWER(COALESCE(status,'')) IN ('declined','rejected','cancelled')) AS declined
+         FROM route_approvals`
+      );
+      countsRow = counts.rows[0] || countsRow;
+    }
+
+    const optStats = await fetchRouteOptimizationStats();
+    return res.json({
+      success: true,
+      summary: {
+        pendingApprovals: parseInt(countsRow.pending, 10) || 0,
+        approved: parseInt(countsRow.approved, 10) || 0,
+        declined: parseInt(countsRow.declined, 10) || 0,
+        avgKmSaved: parseFloat(optStats.avg_savings_km) || 0,
+        avgFuelSaved: parseFloat(optStats.avg_savings_fuel) || 0,
+        avgCO2Saved: parseFloat(optStats.avg_savings_co2) || 0
+      }
+    });
+  } catch (err) {
+    console.error("Logistics stats endpoint error:", err);
+    return res.status(500).json({ success: false, summary: null, message: "Logistics stats unavailable" });
   }
 });
 
