@@ -1409,35 +1409,32 @@ app.post("/api/ai/inventory-insights", authenticate, async (req, res) => {
     // Build recommendations
     const urgentRecommendations = [];
     if (highRisk > 0) {
-      urgentRecommendations.push({
-        priority: "HIGH",
-        type: "Spoilage",
-        title: "Review high‑risk spoilage alerts",
-        description: `You have ${highRisk} high-risk items pending review.`,
-        actionRequired: "Open Inventory Approvals and resolve high-risk items first.",
-        estimatedImpact: { financial: "Reduce wastage costs", timeframe: "Today" }
-      });
-    }
-    if (expiringItems > 0) {
-      urgentRecommendations.push({
-        priority: "MEDIUM",
-        type: "Expiry",
-        title: "Items expiring soon",
-        description: `${expiringItems} batch(es) expire within 3 days.`,
-        actionRequired: "Prioritize dispatch or adjust storage for these batches.",
-        estimatedImpact: { financial: "Preserve margin", timeframe: "This week" }
-      });
-    }
-    if (urgentRecommendations.length === 0) {
-      urgentRecommendations.push({
-        priority: "LOW",
-        type: "Status",
-        title: "All clear",
-        description: "No urgent spoilage risks detected.",
-        actionRequired: "Monitor periodically.",
-        estimatedImpact: { financial: "Stable", timeframe: "Ongoing" }
-      });
-    }
+    urgentRecommendations.push({
+      priority: "HIGH",
+      type: "Spoilage",
+      title: "Review high‑risk spoilage alerts",
+      description: `You have ${highRisk} high-risk items pending review.`,
+      actionRequired: "Open Inventory Approvals and resolve high-risk items first."
+    });
+  }
+  if (expiringItems > 0) {
+    urgentRecommendations.push({
+      priority: "MEDIUM",
+      type: "Expiry",
+      title: "Items expiring soon",
+      description: `${expiringItems} batch(es) expire within 3 days.`,
+      actionRequired: "Prioritize dispatch or adjust storage for these batches."
+    });
+  }
+  if (urgentRecommendations.length === 0) {
+    urgentRecommendations.push({
+      priority: "LOW",
+      type: "Status",
+      title: "All clear",
+      description: "No urgent spoilage risks detected.",
+      actionRequired: "Monitor periodically."
+    });
+  }
 
     const todayOverview = {
       keyMetrics: [
