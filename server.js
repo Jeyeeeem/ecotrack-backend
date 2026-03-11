@@ -1966,8 +1966,14 @@ const buildRoadRoutePath = async (points) => {
   }
 };
 
-const getRouteOptimizationSnapshot = async (routeId) => {
-  if (!routeId) return null;
+const getRouteOptimizationSnapshot = async (routeIdOrCandidates) => {
+  const candidates = Array.isArray(routeIdOrCandidates)
+    ? routeIdOrCandidates
+        .map((c) => (c === undefined || c === null ? "" : String(c)))
+        .map((c) => c.trim())
+        .filter(Boolean)
+    : [String(routeIdOrCandidates || "")].filter(Boolean);
+  if (candidates.length === 0) return null;
   try {
     const tableCheck = await pool.query(`SELECT to_regclass('public.route_optimizations') AS tbl`);
     const hasRouteOptimizations = !!tableCheck.rows[0]?.tbl;
@@ -1984,11 +1990,16 @@ const getRouteOptimizationSnapshot = async (routeId) => {
       ? "id DESC"
       : "route_id DESC";
 
-    const result = await pool.query(
-      `SELECT * FROM route_optimizations WHERE route_id::text = $1 ORDER BY ${orderExpr} LIMIT 1`,
-      [String(routeId)]
-    );
-    return result.rows[0] || null;
+    for (const candidate of candidates) {
+      const result = await pool.query(
+        `SELECT * FROM route_optimizations WHERE route_id::text = $1 ORDER BY ${orderExpr} LIMIT 1`,
+        [candidate]
+      );
+      if (result.rows.length > 0) {
+        return result.rows[0];
+      }
+    }
+    return null;
   } catch (_) {
     return null;
   }
@@ -2019,7 +2030,16 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     requestData.route_id ||
     routeData.route_id;
   const routeId = String(routeIdRaw || "");
-  const routeOptimizationSnapshot = await getRouteOptimizationSnapshot(routeId);
+  const routeOptimizationSnapshot = await getRouteOptimizationSnapshot([
+    routeId,
+    row.route_id,
+    row.related_record_id,
+    row.delivery_id,
+    row.id,
+    row.approval_id,
+    requestData.route_id,
+    routeData.route_id
+  ]);
 
   // Some deployments store richer optimization data in manager_approvals.request_data/extra_data
   // while route_approvals can contain zeros. Merge manager payload as fallback source-of-truth.
@@ -2204,6 +2224,8 @@ async function buildLogisticsRoutePayload(row, options = {}) {
   if (!hasDetailedStoredPath && routePath.length >= 2) {
     routePath = await buildRoadRoutePath(routePath);
   }
+
+  const computedDistanceKm = computePathDistanceKm(routePath);
 
   const originalDistance = toFiniteNumberPreferNonZero(
     routeOptimizationSnapshot?.original_distance_km,
@@ -2461,6 +2483,8 @@ async function buildLogisticsRoutePayload(row, options = {}) {
   const finalOptimizedDistance =
     optimizedDistance > 0
       ? optimizedDistance
+      : computedDistanceKm > 0
+      ? Math.max(computedDistanceKm * 0.85, computedDistanceKm * 0.7)
       : finalOriginalDistance > 0
       ? Math.max(finalOriginalDistance * 0.85, finalOriginalDistance * 0.7)
       : 0;
