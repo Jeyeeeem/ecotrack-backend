@@ -4671,9 +4671,9 @@ app.get("/api/inventory/history", async (req, res) => {
           ma.created_at,
           ${decidedAtExpr} AS decided_at,
           COALESCE(ma.manager_comment, ma.review_notes, ma.decision_notes) AS manager_comment
-          ${hasAlertId && hasAlertsTable ? ", ma.alert_id, a.alert_type, a.temperature, a.humidity, a.product_name AS alert_product_name, a.risk_level AS alert_risk_level, a.location AS alert_location, a.quantity AS alert_quantity, a.days_left AS alert_days_left, a.details AS alert_details" : ""}
+          ${hasAlertId && hasAlertsTable ? ", ma.alert_id, a.alert_type, a.temperature, a.humidity, a.product_name AS alert_product_name, a.risk_level AS alert_risk_level, a.location AS alert_location, a.quantity AS alert_quantity, a.days_left AS alert_days_left, a.details AS alert_details, inv.batch_number" : ", inv.batch_number"}
         FROM manager_approvals ma
-        ${hasAlertId && hasAlertsTable ? "LEFT JOIN alerts a ON a.id = ma.alert_id" : ""}
+        ${hasAlertId && hasAlertsTable ? "LEFT JOIN alerts a ON a.id = ma.alert_id LEFT JOIN inventory inv ON inv.product_id = a.product_id" : "LEFT JOIN inventory inv ON inv.product_id = ma.product_id"}
         WHERE ma.approval_type = 'spoilage_action'
           AND LOWER(COALESCE(ma.status, '')) IN ('approved', 'resolved', 'declined', 'rejected')
         ORDER BY ${decidedAtExpr} DESC NULLS LAST, ma.created_at DESC NULLS LAST
@@ -4692,7 +4692,7 @@ app.get("/api/inventory/history", async (req, res) => {
           normalized === "approved" || normalized === "resolved" ? "APPROVED" : "DECLINED";
         return {
           id: parseInt(row.approval_id, 10) || 0,
-          itemNumber: `#${row.approval_id}`,
+          itemNumber: row.batch_number ? `Batch ${row.batch_number}` : `#${row.approval_id}`,
           priority: row.risk_level || row.alert_risk_level || "MEDIUM",
           productName: row.product_name || row.alert_product_name || "Unknown Product",
           location: row.location || row.alert_location || "Unknown",
