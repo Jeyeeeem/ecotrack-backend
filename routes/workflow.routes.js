@@ -478,8 +478,9 @@ router.post("/driver/complete-delivery", authenticate, authorize('driver'), asyn
     // Update delivery
     await pool.query(`
       UPDATE deliveries 
-      SET status = 'completed', arrival_time = NOW(), completed_at = NOW(), 
-          distance_km = $1, fuel_consumption = $2, carbon_emissions = $3, delivery_notes = $4
+      SET status = 'completed', arrival_time = NOW(), completed_at = NOW(),
+          distance_km = $1, fuel_consumption = $2, carbon_emissions = $3, delivery_notes = $4,
+          carbon_verification_status = 'pending'
       WHERE delivery_id = $5
     `, [actual_distance_km, actual_fuel_used_liters, actual_carbon_kg, notes, delivery_id]);
     

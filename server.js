@@ -2689,7 +2689,7 @@ const fetchDriverMonitorRows = async (businessId = null) => {
               COALESCE(stops_completed, 0) AS stops_completed,
               COALESCE(stops_total, 0) AS stops_total
             FROM deliveries
-            WHERE ${statusExpr} NOT IN ('completed','cancelled','declined','rejected')
+            WHERE ${statusExpr} NOT IN ('completed','cancelled','declined','rejected','pending','awaiting_approval','submitted')
               ${businessClause}
             ORDER BY departure_time DESC NULLS LAST, created_at DESC NULLS LAST
             LIMIT 50
@@ -2707,30 +2707,30 @@ const fetchDriverMonitorRows = async (businessId = null) => {
 
     // Fallback busy drivers from route approvals
     try {
-      const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
-      const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
-      if (hasRouteApprovals) {
-        const routeColumns = await getTableColumns("route_approvals");
-        const hasBusinessCol = routeColumns.has("business_id");
-        const busyRouteApprovals = await pool.query(
-          `SELECT
-            COALESCE(driver_name, '') AS driver_name,
-            COALESCE(from_location, '') || ' → ' || COALESCE(to_location, '') AS route_name,
-            status AS route_status,
-            COALESCE(route_id, id) AS route_id
-           FROM route_approvals
-           WHERE COALESCE(driver_name, '') <> ''
-             AND (
-               LOWER(COALESCE(status, '')) IN ('pending', 'awaiting_approval', 'submitted', 'in_review', 'for_approval', 'assigned', 'accepted', 'in_progress')
-               OR LOWER(COALESCE(status, '')) LIKE '%pending%'
-               OR LOWER(COALESCE(status, '')) LIKE '%await%'
-               OR LOWER(COALESCE(status, '')) LIKE '%review%'
-               OR LOWER(COALESCE(status, '')) LIKE '%submit%'
-             )
+        const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
+        const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
+        if (hasRouteApprovals) {
+          const routeColumns = await getTableColumns("route_approvals");
+          const hasBusinessCol = routeColumns.has("business_id");
+          const busyRouteApprovals = await pool.query(
+            `SELECT
+              COALESCE(driver_name, '') AS driver_name,
+              COALESCE(from_location, '') || ' → ' || COALESCE(to_location, '') AS route_name,
+              status AS route_status,
+              COALESCE(route_id, id) AS route_id
+            FROM route_approvals
+            WHERE COALESCE(driver_name, '') <> ''
+              AND (
+                LOWER(COALESCE(status, '')) IN ('pending', 'awaiting_approval', 'submitted', 'in_review', 'for_approval', 'assigned', 'accepted', 'in_progress')
+                OR LOWER(COALESCE(status, '')) LIKE '%pending%'
+                OR LOWER(COALESCE(status, '')) LIKE '%await%'
+                OR LOWER(COALESCE(status, '')) LIKE '%review%'
+                OR LOWER(COALESCE(status, '')) LIKE '%submit%'
+              )
              ${businessId && hasBusinessCol ? `AND business_id = ${Number(businessId)} ` : ""}
-           ORDER BY COALESCE(submitted_at, approved_at) DESC NULLS LAST, id DESC
-           LIMIT 50`
-        );
+            ORDER BY COALESCE(submitted_at, approved_at) DESC NULLS LAST, id DESC
+            LIMIT 50`
+          );
         for (const row of busyRouteApprovals.rows) {
           upsertBusy(row.driver_name, row.route_name, row.route_status, row.route_id, null);
         }
@@ -5666,7 +5666,8 @@ app.post("/api/driver/complete-delivery", authenticate, async (req, res) => {
     const updated = await pool.query(
       `UPDATE deliveries
        SET status = 'completed', arrival_time = NOW(), completed_at = NOW(),
-           fuel_consumption = $1, distance_km = $2, carbon_emissions = $3, delivery_notes = $4
+           fuel_consumption = $1, distance_km = $2, carbon_emissions = $3, delivery_notes = $4,
+           carbon_verification_status = 'pending'
        WHERE delivery_id = $5
          AND LOWER(COALESCE(driver_name, '')) = ANY($6)
        RETURNING delivery_id`,
