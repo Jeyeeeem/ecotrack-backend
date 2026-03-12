@@ -1,6 +1,6 @@
 // ============================================================
 // FILE: server.js
-// EcoTrack Backend - Complete REST API
+// EcoTrack Backend - Complete REST AP
 // ============================================================
 
 const express = require("express");
@@ -5481,6 +5481,14 @@ app.get("/api/driver/dashboard", authenticate, async (req, res) => {
     `, args);
 
 
+    const parseStops = (raw) => {
+      if (Array.isArray(raw)) return raw;
+      if (typeof raw === "string") {
+        try { return JSON.parse(raw); } catch (_) { return []; }
+      }
+      return [];
+    };
+
     const mapDelivery = (row) => ({
       deliveryId: row.delivery_id,
       routeId: row.route_id,
@@ -5496,15 +5504,13 @@ app.get("/api/driver/dashboard", authenticate, async (req, res) => {
       actualFuel: parseFloat(row.fuel_consumption) || 0,
       estimatedCO2: parseFloat(row.estimated_carbon_kg) || 0,
       actualCO2: parseFloat(row.carbon_emissions) || 0,
-      stops: Array.isArray(row.stops_json)
-        ? row.stops_json.map((stop, idx) => ({
-            stopName: stop.stopName || stop.location_name || stop.location || `Stop ${idx + 1}`,
-            address: stop.address || stop.location || "",
-            status: stop.status || "pending",
-            latitude: stop.latitude ?? null,
-            longitude: stop.longitude ?? null
-          }))
-        : [],
+      stops: parseStops(row.stops_json).map((stop, idx) => ({
+        stopName: stop.stopName || stop.location_name || stop.location || `Stop ${idx + 1}`,
+        address: stop.address || stop.location || "",
+        status: stop.status || "pending",
+        latitude: stop.latitude ?? null,
+        longitude: stop.longitude ?? null
+      })),
       items: Array.isArray(row.delivery_items_json)
         ? row.delivery_items_json.map(item => ({
             productName: item.productName || item.product_name || "Item",
@@ -5986,8 +5992,14 @@ app.post("/api/driver/confirm-stop", authenticate, async (req, res) => {
     }
 
     let stopsJsonUpdated = false;
-    if (Array.isArray(delivery.stops_json) && delivery.stops_json[normalizedStopIndex]) {
-      const updatedStops = [...delivery.stops_json];
+    const stopsFromDb = Array.isArray(delivery.stops_json)
+      ? delivery.stops_json
+      : typeof delivery.stops_json === "string"
+        ? JSON.parse(delivery.stops_json || "[]")
+        : [];
+
+    if (Array.isArray(stopsFromDb) && stopsFromDb[normalizedStopIndex]) {
+      const updatedStops = [...stopsFromDb];
       updatedStops[normalizedStopIndex] = {
         ...updatedStops[normalizedStopIndex],
         status: isArrival ? (shouldMarkCompleted ? "completed" : "arrived") : "completed"
