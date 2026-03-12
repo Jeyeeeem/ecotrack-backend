@@ -4095,17 +4095,17 @@ app.post("/api/logistics/approve", async (req, res) => {
     const routeApprovalUpdates = new Set();
 
     if (hasManagerApprovals) {
-      const managerMatchClauses = [`${managerPkCol}::text = $3`];
-      if (managerColumns.has("route_id")) managerMatchClauses.push(`COALESCE(route_id::text, '') = $3`);
-      if (managerColumns.has("related_record_id")) managerMatchClauses.push(`COALESCE(related_record_id::text, '') = $3`);
-      if (managerColumns.has("delivery_id")) managerMatchClauses.push(`COALESCE(delivery_id::text, '') = $3`);
+      const managerMatchClauses = [`${managerPkCol}::text = $1`];
+      if (managerColumns.has("route_id")) managerMatchClauses.push(`COALESCE(route_id::text, '') = $1`);
+      if (managerColumns.has("related_record_id")) managerMatchClauses.push(`COALESCE(related_record_id::text, '') = $1`);
+      if (managerColumns.has("delivery_id")) managerMatchClauses.push(`COALESCE(delivery_id::text, '') = $1`);
 
       const maResult = await pool.query(
         `SELECT * FROM manager_approvals
          WHERE approval_type = 'route_optimization'
            AND (${managerMatchClauses.join(" OR ")})
          LIMIT 1`,
-        [status, decisionComment, routeId]
+        [routeId]
       );
       if (maResult.rows.length > 0) {
         managerApprovalRow = maResult.rows[0];
