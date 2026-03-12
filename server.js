@@ -4153,6 +4153,7 @@ app.post("/api/logistics/approve", async (req, res) => {
       const hasUsers = !!usersTableCheck.rows[0]?.tbl;
       const usersColumns = hasUsers ? await getTableColumns("users") : new Set();
 
+      let matchedDriver = null;
       if (hasUsers) {
         const idCol = usersColumns.has("user_id")
           ? "user_id"
@@ -4171,8 +4172,6 @@ app.post("/api/logistics/approve", async (req, res) => {
         const rolePredicate = usersColumns.has("role")
           ? "LOWER(COALESCE(u.role, '')) = 'driver'"
           : "TRUE";
-
-        let matchedDriver = null;
 
         if (requestedDriverId && idCol) {
           const byId = await pool.query(
