@@ -2674,7 +2674,7 @@ const fetchDriverMonitorRows = async (businessId = null) => {
             businessId && hasBusinessCol
               ? (() => {
                   params.push(businessId);
-                  return `AND business_id = $${params.length}`;
+                  return `AND (business_id = $${params.length} OR business_id IS NULL)`;
                 })()
               : "";
           const liveDrivers = await pool.query(
@@ -2712,6 +2712,14 @@ const fetchDriverMonitorRows = async (businessId = null) => {
         if (hasRouteApprovals) {
           const routeColumns = await getTableColumns("route_approvals");
           const hasBusinessCol = routeColumns.has("business_id");
+          const params = [];
+          const businessClause =
+            businessId && hasBusinessCol
+              ? (() => {
+                  params.push(businessId);
+                  return `AND (business_id = $${params.length} OR business_id IS NULL)`;
+                })()
+              : "";
           const busyRouteApprovals = await pool.query(
             `SELECT
               COALESCE(driver_name, '') AS driver_name,
@@ -2727,9 +2735,10 @@ const fetchDriverMonitorRows = async (businessId = null) => {
                 OR LOWER(COALESCE(status, '')) LIKE '%review%'
                 OR LOWER(COALESCE(status, '')) LIKE '%submit%'
               )
-             ${businessId && hasBusinessCol ? `AND business_id = ${Number(businessId)} ` : ""}
+             ${businessClause}
             ORDER BY COALESCE(submitted_at, approved_at) DESC NULLS LAST, id DESC
-            LIMIT 50`
+            LIMIT 50`,
+            params
           );
         for (const row of busyRouteApprovals.rows) {
           upsertBusy(row.driver_name, row.route_name, row.route_status, row.route_id, null);
