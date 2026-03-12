@@ -2759,7 +2759,7 @@ const fetchDriverMonitorRows = async (businessId = null) => {
               COALESCE(d.stops_total, 0) AS stops_total
             FROM deliveries d
             LEFT JOIN users u ON ${driverIdExpr} = COALESCE(u.user_id, u.id)
-            WHERE ${statusExpr} NOT IN ('completed','cancelled','declined','rejected','pending','awaiting_approval','submitted')
+WHERE ${statusExpr} NOT IN ('completed','cancelled','declined','rejected')
               ${businessClause}
             ORDER BY d.departure_time DESC NULLS LAST, d.created_at DESC NULLS LAST
             LIMIT 50
