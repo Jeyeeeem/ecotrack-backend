@@ -5336,9 +5336,22 @@ app.get("/api/sustainability/history", async (req, res) => {
       WHERE d.carbon_verification_status IN ('verified', 'revision_requested') 
       ORDER BY d.carbon_verified_at DESC LIMIT 50
     `);
+    const rows = result.rows || [];
+    const totalVerified = rows.filter(r => String(r.carbon_verification_status || '').toLowerCase() === 'verified').length;
+    const totalRevisions = rows.filter(r => String(r.carbon_verification_status || '').toLowerCase() === 'revision_requested').length;
+    const totalCO2Verified = rows
+      .filter(r => String(r.carbon_verification_status || '').toLowerCase() === 'verified')
+      .reduce((sum, r) => sum + (parseFloat(r.carbon_emissions) || 0), 0);
+    const summary = {
+      verifiedToday: 0,
+      totalVerified,
+      totalRevisions,
+      totalCO2Verified,
+      ecoTrustPoints: totalVerified * 10
+    };
     res.json({ 
       success: true, 
-      history: result.rows.map(row => ({ 
+      history: rows.map(row => ({ 
         id: row.delivery_id, 
         route: `${row.from_location} → ${row.to_location}`, 
         driver: row.driver_name, 
@@ -5347,6 +5360,7 @@ app.get("/api/sustainability/history", async (req, res) => {
         actualCO2: parseFloat(row.carbon_emissions) || 0, 
         status: row.carbon_verification_status 
       })), 
+      summary,
       message: null 
     });
   } catch (err) { res.status(500).json({ success: false }); }
