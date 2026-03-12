@@ -5262,11 +5262,37 @@ app.patch("/api/approvals/:id/decision", async (req, res) => {
 
 app.get("/api/sustainability/dashboard", async (req, res) => {
   try {
+    const pendingResult = await pool.query(`
+      SELECT d.delivery_id, d.route_id, d.status as delivery_status, d.driver_name, d.vehicle_type, d.departure_time, 
+             d.arrival_time, d.from_location, d.to_location, d.distance_km, d.fuel_consumption, 
+             d.estimated_fuel_consumption_liters, d.carbon_emissions, d.estimated_carbon_kg, 
+             d.created_at as submitted_at, d.business_id, bp.business_name 
+      FROM deliveries d 
+      LEFT JOIN business_profiles bp ON d.business_id = bp.business_id 
+      WHERE d.carbon_verification_status = 'pending' OR d.carbon_verification_status IS NULL 
+      ORDER BY d.created_at DESC LIMIT 20
+    `);
+    const pendingItems = pendingResult.rows.map(row => ({ 
+      id: row.delivery_id, 
+      deliveryId: `DEL-${row.delivery_id}`, 
+      type: 'delivery', 
+      date: row.departure_time || row.created_at, 
+      route: `${row.from_location} → ${row.to_location}`, 
+      driver: row.driver_name, 
+      vehicle: row.vehicle_type, 
+      estimatedFuel: parseFloat(row.estimated_fuel_consumption_liters) || 0, 
+      actualFuel: parseFloat(row.fuel_consumption) || 0, 
+      estimatedCO2: parseFloat(row.estimated_carbon_kg) || 0, 
+      actualCO2: parseFloat(row.carbon_emissions) || 0, 
+      distance: parseFloat(row.distance_km) || 0, 
+      businessName: row.business_name, 
+      submittedAt: row.submitted_at, 
+      status: row.carbon_verification_status || 'pending' 
+    }));
     res.json({ 
       success: true, 
-      summary: { pendingVerifications: 0, verifiedToday: 0, totalCO2Verified: 0 }, 
-      pendingVerifications: [], 
-      impact: [], 
+      summary: { pendingVerifications: pendingItems.length, verifiedToday: 0, totalCO2Verified: 0 }, 
+      pendingVerifications: pendingItems, 
       message: null 
     });
   } catch (err) { res.status(500).json({ success: false }); }
@@ -5289,9 +5315,24 @@ app.post("/api/sustainability/verify", async (req, res) => {
 
 app.get("/api/sustainability/history", async (req, res) => {
   try {
+    const result = await pool.query(`
+      SELECT d.*, bp.business_name 
+      FROM deliveries d 
+      LEFT JOIN business_profiles bp ON d.business_id = bp.business_id 
+      WHERE d.carbon_verification_status IN ('verified', 'revision_requested') 
+      ORDER BY d.carbon_verified_at DESC LIMIT 50
+    `);
     res.json({ 
       success: true, 
-      history: [], 
+      history: result.rows.map(row => ({ 
+        id: row.delivery_id, 
+        route: `${row.from_location} → ${row.to_location}`, 
+        driver: row.driver_name, 
+        date: row.carbon_verified_at, 
+        estimatedCO2: parseFloat(row.estimated_carbon_kg) || 0, 
+        actualCO2: parseFloat(row.carbon_emissions) || 0, 
+        status: row.carbon_verification_status 
+      })), 
       message: null 
     });
   } catch (err) { res.status(500).json({ success: false }); }
