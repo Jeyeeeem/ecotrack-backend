@@ -5401,12 +5401,16 @@ app.get("/api/driver/dashboard", authenticate, async (req, res) => {
       args.push(driverAliases);
       filters.push(`LOWER(COALESCE(d.driver_name, '')) = ANY($${args.length})`);
     }
-    if (driverId) {
+    const deliveriesColumns = await getTableColumns("deliveries");
+    const idCol =
+      deliveriesColumns.has("driver_user_id") ? "driver_user_id" :
+      deliveriesColumns.has("driver_id") ? "driver_id" :
+      null;
+    if (driverId && idCol) {
       args.push(driverId);
-      filters.push(`COALESCE(d.driver_user_id, 0) = $${args.length}`);
+      filters.push(`COALESCE(d.${idCol}, 0) = $${args.length}`);
     }
     let clause = filters.length ? `AND (${filters.join(" OR ")})` : ``;
-    const deliveriesColumns = await getTableColumns("deliveries");
     const col = (name, fallbackSql) => deliveriesColumns.has(name) ? `d.${name}` : `${fallbackSql} as ${name}`;
     const orderByCreated = deliveriesColumns.has("created_at")
       ? "d.created_at DESC"
