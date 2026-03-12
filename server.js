@@ -4089,6 +4089,7 @@ app.post("/api/logistics/approve", async (req, res) => {
     const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
     let managerApprovalRow = null;
+    let originalManagerStatus = null;
     let resolvedRouteId = routeId;
     let routeRow = null;
     const routeApprovalUpdates = new Set();
@@ -4100,25 +4101,27 @@ app.post("/api/logistics/approve", async (req, res) => {
       if (managerColumns.has("delivery_id")) managerMatchClauses.push(`COALESCE(delivery_id::text, '') = $3`);
 
       const maResult = await pool.query(
-        `UPDATE manager_approvals
-         SET status = LOWER($1), manager_comment = $2, decision_notes = $2, reviewed_at = NOW()${managerUpdatedAtClause}
+        `SELECT * FROM manager_approvals
          WHERE approval_type = 'route_optimization'
            AND (${managerMatchClauses.join(" OR ")})
-         RETURNING *`,
+         LIMIT 1`,
         [status, decisionComment, routeId]
       );
       if (maResult.rows.length > 0) {
         managerApprovalRow = maResult.rows[0];
+        originalManagerStatus = managerApprovalRow.status;
       }
       if (hasRouteApprovals) {
-        if (maResult.rows.length > 0) {
+        if (managerApprovalRow) {
           const routeRef =
-            maResult.rows[0].route_id ||
-            maResult.rows[0].related_record_id ||
-            maResult.rows[0].delivery_id;
+            managerApprovalRow.route_id ||
+            managerApprovalRow.related_record_id ||
+            managerApprovalRow.delivery_id;
           if (routeRef) {
             resolvedRouteId = routeRef;
             routeApprovalUpdates.add(String(routeRef));
+          } else {
+            routeApprovalUpdates.add(String(routeId));
           }
         } else {
           routeApprovalUpdates.add(String(routeId));
@@ -4126,13 +4129,6 @@ app.post("/api/logistics/approve", async (req, res) => {
       }
     } else if (hasRouteApprovals) {
       routeApprovalUpdates.add(String(routeId));
-    } else {
-      await pool.query(
-        `UPDATE manager_approvals
-         SET status = LOWER($1), manager_comment = $2, decision_notes = $2, reviewed_at = NOW()${managerUpdatedAtClause}
-         WHERE ${managerPkCol} = $3`,
-        [status, decisionComment, routeId]
-      );
     }
 
     if (hasRouteApprovals) {
@@ -4520,7 +4516,22 @@ app.post("/api/logistics/approve", async (req, res) => {
       }
     }
 
-    // Apply pending route_approvals status updates only after all validations pass
+    // Persist status updates only after validations succeed
+    if (hasManagerApprovals && managerApprovalRow) {
+      const managerMatchClauses = [`${managerPkCol}::text = $3`];
+      if (managerColumns.has("route_id")) managerMatchClauses.push(`COALESCE(route_id::text, '') = $3`);
+      if (managerColumns.has("related_record_id")) managerMatchClauses.push(`COALESCE(related_record_id::text, '') = $3`);
+      if (managerColumns.has("delivery_id")) managerMatchClauses.push(`COALESCE(delivery_id::text, '') = $3`);
+
+      await pool.query(
+        `UPDATE manager_approvals
+         SET status = LOWER($1), manager_comment = $2, decision_notes = $2, reviewed_at = NOW()${managerUpdatedAtClause}
+         WHERE approval_type = 'route_optimization'
+           AND (${managerMatchClauses.join(" OR ")})`,
+        [status, decisionComment, routeId]
+      );
+    }
+
     if (hasRouteApprovals && routeApprovalUpdates.size > 0) {
       for (const raId of routeApprovalUpdates) {
         await pool.query(
@@ -4528,6 +4539,14 @@ app.post("/api/logistics/approve", async (req, res) => {
           [status, decisionComment, raId]
         );
       }
+    } else if (!hasManagerApprovals) {
+      // fallback: legacy manager_approvals table only
+      await pool.query(
+        `UPDATE manager_approvals
+         SET status = LOWER($1), manager_comment = $2, decision_notes = $2, reviewed_at = NOW()${managerUpdatedAtClause}
+         WHERE ${managerPkCol} = $3`,
+        [status, decisionComment, routeId]
+      );
     }
 
     res.json({
