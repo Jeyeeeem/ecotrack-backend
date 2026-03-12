@@ -5998,15 +5998,21 @@ app.post("/api/driver/confirm-stop", authenticate, async (req, res) => {
         ? JSON.parse(delivery.stops_json || "[]")
         : [];
 
-    if (Array.isArray(stopsFromDb) && stopsFromDb[normalizedStopIndex]) {
-      const updatedStops = [...stopsFromDb];
-      updatedStops[normalizedStopIndex] = {
-        ...updatedStops[normalizedStopIndex],
-        status: isArrival ? (shouldMarkCompleted ? "completed" : "arrived") : "completed"
-      };
-      await pool.query(`UPDATE deliveries SET stops_json = $1 WHERE delivery_id = $2`, [JSON.stringify(updatedStops), normalizedDeliveryId]);
-      stopsJsonUpdated = true;
+    // Ensure we can always write a status even if stops_json was null/short.
+    const updatedStops = Array.isArray(stopsFromDb) ? [...stopsFromDb] : [];
+    while (updatedStops.length <= normalizedStopIndex) {
+      updatedStops.push({
+        stopName: `Stop ${updatedStops.length + 1}`,
+        address: "",
+        status: "pending"
+      });
     }
+    updatedStops[normalizedStopIndex] = {
+      ...updatedStops[normalizedStopIndex],
+      status: isArrival ? (shouldMarkCompleted ? "completed" : "arrived") : "completed"
+    };
+    await pool.query(`UPDATE deliveries SET stops_json = $1 WHERE delivery_id = $2`, [JSON.stringify(updatedStops), normalizedDeliveryId]);
+    stopsJsonUpdated = true;
 
     // Ensure delivery transitions from accepted -> in_progress upon first arrival confirmation.
     if (isArrival && String(delivery.status || "").toLowerCase() === "accepted") {
