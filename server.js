@@ -2684,12 +2684,11 @@ const fetchDriverMonitorRows = async (businessId = null) => {
     };
 
     const driverBusyPayload = (routeName, routeStatus, routeId, vehicleType) => ({
-        route_name: routeName || null,
-        route_status: routeStatus || null,
-        route_id: routeId || null,
-        vehicle_type: vehicleType || null
-      });
-    };
+      route_name: routeName || null,
+      route_status: routeStatus || null,
+      route_id: routeId || null,
+      vehicle_type: vehicleType || null
+    });
 
     // Active deliveries first
     try {
