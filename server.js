@@ -3369,9 +3369,17 @@ app.get("/api/logistics/pending", async (req, res) => {
       managerColumns.has("approval_type") &&
       managerColumns.has("status");
     const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
+    const businessId =
+      (req.user && (req.user.businessId || req.user.business_id)) || null;
     let result;
     let usedManagerRows = false;
     if (canUseManagerRouteData) {
+      const managerParams = [];
+      let managerBusinessClause = "";
+      if (managerColumns.has("business_id") && businessId) {
+        managerParams.push(businessId);
+        managerBusinessClause = `AND ma.business_id = $${managerParams.length}`;
+      }
       result = await pool.query(`
         SELECT *
         FROM manager_approvals ma
@@ -3383,12 +3391,19 @@ app.get("/api/logistics/pending", async (req, res) => {
             OR LOWER(COALESCE(ma.status, '')) LIKE '%review%'
             OR LOWER(COALESCE(ma.status, '')) LIKE '%submit%'
           )
+          ${managerBusinessClause}
         ORDER BY ma.created_at DESC
-      `);
+      `, managerParams);
       usedManagerRows = true;
 
       // Fallback to route_approvals when manager_approvals has no logistics records.
       if (result.rows.length === 0 && hasRouteApprovals) {
+        const routeParams = [];
+        let routeBusinessClause = "";
+        if (businessId) {
+          routeParams.push(businessId);
+          routeBusinessClause = `AND (business_id = $${routeParams.length} OR business = $${routeParams.length})`;
+        }
         result = await pool.query(`
           SELECT id, route_type as product_name, from_location as location, driver_name, vehicle_type, departure_time, 
                  original_distance as total_distance_km, optimized_distance, original_fuel as estimated_fuel_consumption_liters, 
@@ -3397,11 +3412,18 @@ app.get("/api/logistics/pending", async (req, res) => {
                  submitted_by, submitted_at as created_at 
           FROM route_approvals
           WHERE ${pendingRouteStatusPredicate}
+          ${routeBusinessClause}
           ORDER BY submitted_at DESC
-        `);
+        `, routeParams);
         usedManagerRows = false;
       }
     } else if (hasRouteApprovals) {
+      const routeParams = [];
+      let routeBusinessClause = "";
+      if (businessId) {
+        routeParams.push(businessId);
+        routeBusinessClause = `AND (business_id = $${routeParams.length} OR business = $${routeParams.length})`;
+      }
       result = await pool.query(`
         SELECT id, route_type as product_name, from_location as location, driver_name, vehicle_type, departure_time, 
                original_distance as total_distance_km, optimized_distance, original_fuel as estimated_fuel_consumption_liters, 
@@ -3410,8 +3432,9 @@ app.get("/api/logistics/pending", async (req, res) => {
                submitted_by, submitted_at as created_at 
         FROM route_approvals
         WHERE ${pendingRouteStatusPredicate}
+        ${routeBusinessClause}
         ORDER BY submitted_at DESC
-      `);
+      `, routeParams);
     } else {
       result = { rows: [] };
     }
