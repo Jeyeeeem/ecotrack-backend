@@ -4074,6 +4074,19 @@ app.post("/api/logistics/approve", async (req, res) => {
         routeData.driver_name ||
         null;
 
+      const selectedDriverId =
+        matchedDriver?.user_id ||
+        requestedDriverId ||
+        routeRow?.driver_user_id ||
+        routeRow?.driver_id ||
+        managerApprovalRow?.driver_user_id ||
+        managerApprovalRow?.driver_id ||
+        requestData.driver_user_id ||
+        requestData.driver_id ||
+        routeData.driver_user_id ||
+        routeData.driver_id ||
+        null;
+
       if (!assignedDriver) {
         return res.status(400).json({
           success: false,
@@ -4097,6 +4110,14 @@ app.post("/api/logistics/approve", async (req, res) => {
         }
       }
 
+      const resolvedBusinessId =
+        routeRow?.business_id ||
+        managerApprovalRow?.business_id ||
+        requestData.business_id ||
+        routeData.business_id ||
+        req.user?.businessId ||
+        null;
+
       const deliveriesTableCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
       const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
 
@@ -4106,15 +4127,35 @@ app.post("/api/logistics/approve", async (req, res) => {
 
         if (hasDeliveries) {
           const deliveriesColumns = await getTableColumns("deliveries");
-          if (deliveriesColumns.has("driver_name") && deliveriesColumns.has("status")) {
+          const driverIdCol = ["driver_user_id", "driver_id", "user_id"].find((c) => deliveriesColumns.has(c));
+          const businessCol = deliveriesColumns.has("business_id") ? "business_id" : null;
+          const params = [];
+          let whereDriver = "";
+
+          if (driverIdCol && selectedDriverId) {
+            params.push(selectedDriverId);
+            whereDriver = `${driverIdCol} = $${params.length}`;
+          } else if (deliveriesColumns.has("driver_name")) {
+            params.push(assignedDriver);
+            whereDriver = `LOWER(COALESCE(driver_name, '')) = LOWER($${params.length})`;
+          }
+
+          if (whereDriver && deliveriesColumns.has("status")) {
+            params.push(String(resolvedRouteId || ""));
+            const routeParam = params.length;
+            let businessClause = "";
+            if (businessCol && resolvedBusinessId) {
+              params.push(resolvedBusinessId);
+              businessClause = ` AND COALESCE(${businessCol}::text, '') = $${params.length}`;
+            }
             const deliveryBusy = await pool.query(
               `SELECT 1
                FROM deliveries
-               WHERE LOWER(COALESCE(driver_name, '')) = LOWER($1)
+               WHERE ${whereDriver}
                  AND LOWER(COALESCE(status, '')) IN ('pending', 'assigned', 'accepted', 'in_progress')
-                 AND COALESCE(route_id::text, '') <> $2
+                 AND COALESCE(route_id::text, '') <> $${routeParam}${businessClause}
                LIMIT 1`,
-              [assignedDriver, String(resolvedRouteId || "")]
+              params
             );
             hasBlockingWork = hasBlockingWork || deliveryBusy.rows.length > 0;
           }
@@ -4122,11 +4163,31 @@ app.post("/api/logistics/approve", async (req, res) => {
 
         if (!hasBlockingWork && hasRouteApprovals) {
           const routeApprovalColumns = await getTableColumns("route_approvals");
-          if (routeApprovalColumns.has("driver_name") && routeApprovalColumns.has("status")) {
+          const driverIdCol = ["driver_user_id", "driver_id", "user_id"].find((c) => routeApprovalColumns.has(c));
+          const businessCol = routeApprovalColumns.has("business_id") ? "business_id" : null;
+          const params = [];
+          let whereDriver = "";
+
+          if (driverIdCol && selectedDriverId) {
+            params.push(selectedDriverId);
+            whereDriver = `${driverIdCol} = $${params.length}`;
+          } else if (routeApprovalColumns.has("driver_name")) {
+            params.push(assignedDriver);
+            whereDriver = `LOWER(COALESCE(driver_name, '')) = LOWER($${params.length})`;
+          }
+
+          if (whereDriver && routeApprovalColumns.has("status")) {
+            params.push(String(resolvedRouteId || ""));
+            const routeParam = params.length;
+            let businessClause = "";
+            if (businessCol && resolvedBusinessId) {
+              params.push(resolvedBusinessId);
+              businessClause = ` AND COALESCE(${businessCol}::text, '') = $${params.length}`;
+            }
             const routeBusy = await pool.query(
               `SELECT 1
                FROM route_approvals
-               WHERE LOWER(COALESCE(driver_name, '')) = LOWER($1)
+               WHERE ${whereDriver}
                  AND (
                    LOWER(COALESCE(status, '')) IN ('pending', 'awaiting_approval', 'submitted', 'in_review', 'for_approval', 'assigned', 'accepted', 'in_progress')
                    OR LOWER(COALESCE(status, '')) LIKE '%pending%'
@@ -4134,10 +4195,10 @@ app.post("/api/logistics/approve", async (req, res) => {
                    OR LOWER(COALESCE(status, '')) LIKE '%review%'
                    OR LOWER(COALESCE(status, '')) LIKE '%submit%'
                  )
-                 AND COALESCE(id::text, '') <> $2
-                 AND COALESCE(route_id::text, '') <> $2
+                 AND COALESCE(id::text, '') <> $${routeParam}
+                 AND COALESCE(route_id::text, '') <> $${routeParam}${businessClause}
                LIMIT 1`,
-              [assignedDriver, String(resolvedRouteId || "")]
+              params
             );
             hasBlockingWork = hasBlockingWork || routeBusy.rows.length > 0;
           }
