@@ -2622,14 +2622,31 @@ const fetchDriverMonitorRows = async (businessId = null) => {
       usersParams.push(businessId);
       usersWhere.push(`u.business_id = $${usersParams.length}`);
     }
+    const idExpr = usersColumns.has("user_id")
+      ? "u.user_id"
+      : usersColumns.has("id")
+      ? "u.id"
+      : "NULL::int";
+    const nameExpr = usersColumns.has("full_name")
+      ? "NULLIF(u.full_name, '')"
+      : usersColumns.has("name")
+      ? "NULLIF(u.name, '')"
+      : "NULL";
+    const usernameExpr = usersColumns.has("username")
+      ? "NULLIF(u.username, '')"
+      : "NULL";
+    const emailExpr = usersColumns.has("email")
+      ? "NULLIF(u.email, '')"
+      : "NULL";
     const usersResult = await pool.query(
       `SELECT
-        u.user_id,
-        COALESCE(NULLIF(u.full_name, ''), u.name, u.email) as full_name,
-        u.email
+        ${idExpr} AS user_id,
+        ${nameExpr} AS full_name,
+        ${emailExpr} AS email,
+        ${usernameExpr} AS username
        FROM users u
        WHERE ${usersWhere.join(" AND ")}
-       ORDER BY COALESCE(NULLIF(u.full_name, ''), u.name, u.email) ASC`,
+       ORDER BY COALESCE(${nameExpr}, ${usernameExpr}, ${emailExpr}) ASC`,
       usersParams
     );
 
@@ -2807,11 +2824,15 @@ const fetchDriverMonitorRows = async (businessId = null) => {
     // Base driver list mapped with busy overlay
     if (driverMonitorRows.length === 0) {
       driverMonitorRows = usersResult.rows.map((u) => {
-        const displayName = String(u.full_name || "").trim();
-        const busy = getBusyForDriver(displayName, u.user_id);
+        const fallbackName =
+          String(u.full_name || "").trim() ||
+          String(u.username || "").trim() ||
+          String(u.email || "").split("@")[0] ||
+          "Driver";
+        const busy = getBusyForDriver(fallbackName, u.user_id);
         return {
           user_id: u.user_id,
-          full_name: displayName,
+          full_name: fallbackName,
           email: u.email,
           route_name: busy?.route_name || null,
           route_status: busy?.route_status || null,
