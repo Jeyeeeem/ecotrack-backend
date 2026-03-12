@@ -2924,6 +2924,7 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
 
     const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
+    const routeApprovalColumnsApprove = hasRouteApprovals ? await getTableColumns("route_approvals") : new Set();
     const routeApprovalColumns = hasRouteApprovals ? await getTableColumns("route_approvals") : new Set();
     const routeApprovalRefExpr = routeApprovalColumns.has("route_id")
       ? "COALESCE(ra.route_id, ra.id)"
@@ -4444,9 +4445,12 @@ app.post("/api/logistics/approve", async (req, res) => {
     }
 
     if (hasRouteApprovals && routeApprovalUpdates.size > 0) {
+      const whereClause = routeApprovalColumnsApprove.has("route_id")
+        ? "id::text = $3 OR COALESCE(route_id::text, '') = $3"
+        : "id::text = $3";
       for (const raId of routeApprovalUpdates) {
         await pool.query(
-          `UPDATE route_approvals SET status = $1, manager_comment = $2, approved_at = CASE WHEN $1 = 'APPROVED' THEN NOW() ELSE approved_at END WHERE id::text = $3 OR COALESCE(route_id::text, '') = $3`,
+          `UPDATE route_approvals SET status = $1, manager_comment = $2, approved_at = CASE WHEN $1 = 'APPROVED' THEN NOW() ELSE approved_at END WHERE ${whereClause}`,
           [status, decisionComment, String(raId)]
         );
       }
