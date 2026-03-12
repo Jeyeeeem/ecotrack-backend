@@ -4287,16 +4287,44 @@ app.post("/api/logistics/approve", async (req, res) => {
                 managerApprovalRow?.business_id ||
                 requestData.business_id ||
                 routeData.business_id ||
+                req.user?.businessId ||
                 null;
+              const driverUserIdPayload =
+                selectedDriverId ||
+                routeRow?.driver_user_id ||
+                routeRow?.driver_id ||
+                managerApprovalRow?.driver_user_id ||
+                managerApprovalRow?.driver_id ||
+                requestData.driver_user_id ||
+                requestData.driver_id ||
+                routeData.driver_user_id ||
+                routeData.driver_id ||
+                null;
+              const fromLocation =
+                routeRow?.from_location ||
+                managerApprovalRow?.from_location ||
+                requestData.from_location ||
+                routeData.origin_location?.address ||
+                managerApprovalRow?.location ||
+                "Warehouse";
+              const toLocation =
+                routeRow?.to_location ||
+                managerApprovalRow?.to_location ||
+                requestData.to_location ||
+                routeData.destination_location?.address ||
+                null;
+              const routeNameFallback = `${fromLocation || "Origin"} → ${toLocation || "Destination"}`;
               const deliveryPayload = {
                 route_id: numericRouteId,
                 business_id: businessId,
                 driver_name: assignedDriver,
+                driver_user_id: driverUserIdPayload,
+                route_name: routeRow?.route_name || requestData.route_name || routeNameFallback,
                 status: 'assigned',
                 vehicle_type: routeRow?.vehicle_type || managerApprovalRow?.vehicle_type || requestData.vehicle_type || routeData.vehicle_type || "Van",
                 departure_time: routeRow?.departure_time || managerApprovalRow?.departure_time || routeData.created_at || managerApprovalRow?.created_at || new Date().toISOString(),
-                from_location: routeRow?.from_location || managerApprovalRow?.from_location || requestData.from_location || routeData.origin_location?.address || managerApprovalRow?.location || "Warehouse",
-                to_location: routeRow?.to_location || managerApprovalRow?.to_location || requestData.to_location || routeData.destination_location?.address || null,
+                from_location: fromLocation,
+                to_location: toLocation,
                 distance_km: routeDistance || 0,
                 estimated_fuel_consumption_liters: routeFuel || 0,
                 estimated_carbon_kg: routeCO2 || 0
@@ -4322,7 +4350,9 @@ app.post("/api/logistics/approve", async (req, res) => {
                 };
 
                 pushUpdate("driver_name", deliveryPayload.driver_name);
+                pushUpdate("driver_user_id", deliveryPayload.driver_user_id);
                 pushUpdate("business_id", deliveryPayload.business_id);
+                pushUpdate("route_name", deliveryPayload.route_name);
                 pushUpdate("vehicle_type", deliveryPayload.vehicle_type);
                 pushUpdate("departure_time", deliveryPayload.departure_time);
                 pushUpdate("from_location", deliveryPayload.from_location);
@@ -4352,6 +4382,8 @@ app.post("/api/logistics/approve", async (req, res) => {
                 pushInsert("route_id", deliveryPayload.route_id);
                 pushInsert("business_id", deliveryPayload.business_id);
                 pushInsert("driver_name", deliveryPayload.driver_name);
+                pushInsert("driver_user_id", deliveryPayload.driver_user_id);
+                pushInsert("route_name", deliveryPayload.route_name);
                 pushInsert("status", deliveryPayload.status);
                 pushInsert("vehicle_type", deliveryPayload.vehicle_type);
                 pushInsert("departure_time", deliveryPayload.departure_time);
