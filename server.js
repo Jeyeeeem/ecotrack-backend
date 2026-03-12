@@ -2634,11 +2634,56 @@ const fetchDriverMonitorRows = async (businessId = null) => {
     );
 
     const busyByDriver = new Map();
-    const upsertBusy = (driverName, routeName, routeStatus, routeId = null, vehicleType = null) => {
-      const key = String(driverName || "").trim().toLowerCase();
-      if (!key) return;
-      if (busyByDriver.has(key)) return;
-      busyByDriver.set(key, {
+    const upsertBusy = (driverName, routeName, routeStatus, routeId = null, vehicleType = null, driverUserId = null) => {
+      const keyName = String(driverName || "").trim().toLowerCase();
+      const keyId = driverUserId && Number.isFinite(Number(driverUserId)) ? `id:${Number(driverUserId)}` : null;
+      const register = (key) => {
+        if (!key) return;
+        if (busyByDriver.has(key)) return;
+        busyByDriver.set(key, {
+          route_name: routeName || null,
+          route_status: routeStatus || null,
+          route_id: routeId || null,
+          vehicle_type: vehicleType || null
+        });
+      };
+      register(keyName);
+      register(keyId);
+      // also register composite for redundancy
+      if (keyName && keyId) register(`${keyName}|${keyId}`);
+    };
+
+    const getBusyForDriver = (name, id = null) => {
+      const keyName = String(name || "").trim().toLowerCase();
+      const keyId = id && Number.isFinite(Number(id)) ? `id:${Number(id)}` : null;
+      return (
+        busyByDriver.get(keyName) ||
+        (keyId ? busyByDriver.get(keyId) : null) ||
+        (keyName && keyId ? busyByDriver.get(`${keyName}|${keyId}`) : null)
+      );
+    };
+
+    const setBusyForDriver = (name, id, data) => {
+      const keyName = String(name || "").trim().toLowerCase();
+      const keyId = id && Number.isFinite(Number(id)) ? `id:${Number(id)}` : null;
+      if (keyName) busyByDriver.set(keyName, data);
+      if (keyId) busyByDriver.set(keyId, data);
+      if (keyName && keyId) busyByDriver.set(`${keyName}|${keyId}`, data);
+    };
+
+    const ensureBusyDefaults = () => {}; // placeholder to avoid unused warnings
+
+    const mergeBusy = (driverName, driverUserId, data) => {
+      const existing = getBusyForDriver(driverName, driverUserId);
+      if (existing) {
+        const merged = { ...existing, ...data };
+        setBusyForDriver(driverName, driverUserId, merged);
+      } else {
+        setBusyForDriver(driverName, driverUserId, data);
+      }
+    };
+
+    const driverBusyPayload = (routeName, routeStatus, routeId, vehicleType) => ({
         route_name: routeName || null,
         route_status: routeStatus || null,
         route_id: routeId || null,
@@ -2655,7 +2700,7 @@ const fetchDriverMonitorRows = async (businessId = null) => {
         const statusExpr = deliveriesColumns.has("status") ? "LOWER(COALESCE(status,''))" : "''";
         const hasDriverName = deliveriesColumns.has("driver_name");
         const hasBusinessCol = deliveriesColumns.has("business_id");
-        const routeNameExpr = deliveriesColumns.has("route_name")
+            const routeNameExpr = deliveriesColumns.has("route_name")
           ? "route_name"
           : deliveriesColumns.has("from_location")
           ? "from_location"
@@ -2667,7 +2712,12 @@ const fetchDriverMonitorRows = async (businessId = null) => {
           : deliveriesColumns.has("id")
           ? "id"
           : null;
-        const vehicleExpr = deliveriesColumns.has("vehicle_type") ? "vehicle_type" : "NULL::text";
+          const vehicleExpr = deliveriesColumns.has("vehicle_type") ? "vehicle_type" : "NULL::text";
+        const driverIdExpr = deliveriesColumns.has("driver_user_id")
+          ? "driver_user_id"
+          : deliveriesColumns.has("driver_id")
+          ? "driver_id"
+          : "NULL::int";
         if (hasDriverName) {
           const params = [];
           const businessClause =
@@ -2686,6 +2736,7 @@ const fetchDriverMonitorRows = async (businessId = null) => {
               ${statusExpr} AS route_status,
               ${routeIdExpr || "NULL::text"} AS route_id,
               ${vehicleExpr} AS vehicle_type,
+              ${driverIdExpr} AS driver_user_id,
               COALESCE(stops_completed, 0) AS stops_completed,
               COALESCE(stops_total, 0) AS stops_total
             FROM deliveries
@@ -2720,9 +2771,15 @@ const fetchDriverMonitorRows = async (businessId = null) => {
                   return `AND (business_id = $${params.length} OR business_id IS NULL)`;
                 })()
               : "";
+          const driverIdExpr = routeColumns.has("driver_user_id")
+            ? "driver_user_id"
+            : routeColumns.has("driver_id")
+            ? "driver_id"
+            : "NULL::int";
           const busyRouteApprovals = await pool.query(
             `SELECT
               COALESCE(driver_name, '') AS driver_name,
+              ${driverIdExpr} AS driver_user_id,
               COALESCE(from_location, '') || ' → ' || COALESCE(to_location, '') AS route_name,
               status AS route_status,
               COALESCE(route_id, id) AS route_id
@@ -2741,7 +2798,7 @@ const fetchDriverMonitorRows = async (businessId = null) => {
             params
           );
         for (const row of busyRouteApprovals.rows) {
-          upsertBusy(row.driver_name, row.route_name, row.route_status, row.route_id, null);
+          upsertBusy(row.driver_name, row.route_name, row.route_status, row.route_id, null, row.driver_user_id);
         }
       }
     } catch (driverRouteErr) {
@@ -2752,7 +2809,7 @@ const fetchDriverMonitorRows = async (businessId = null) => {
     if (driverMonitorRows.length === 0) {
       driverMonitorRows = usersResult.rows.map((u) => {
         const displayName = String(u.full_name || "").trim();
-        const busy = busyByDriver.get(displayName.toLowerCase());
+        const busy = getBusyForDriver(displayName, u.user_id);
         return {
           user_id: u.user_id,
           full_name: displayName,
@@ -5328,12 +5385,22 @@ app.get("/api/driver/dashboard", authenticate, async (req, res) => {
   try {
     const { driver_name } = req.query;
     const driverAliases = await resolveDriverFilterAliases({ queryDriverName: driver_name, user: req.user });
+    const driverId = Number(req.user?.userId || req.user?.id || 0) || null;
     const hasDriverFilter = driverAliases.length > 0;
-    if (!hasDriverFilter) {
+    if (!hasDriverFilter && !driverId) {
       return res.status(400).json({ success: false, message: "Driver context missing" });
     }
-    const args = hasDriverFilter ? [driverAliases] : [];
-    const clause = hasDriverFilter ? `AND LOWER(COALESCE(d.driver_name, '')) = ANY($1)` : ``;
+    const args = [];
+    const filters = [];
+    if (hasDriverFilter) {
+      args.push(driverAliases);
+      filters.push(`LOWER(COALESCE(d.driver_name, '')) = ANY($${args.length})`);
+    }
+    if (driverId) {
+      args.push(driverId);
+      filters.push(`COALESCE(d.driver_user_id, 0) = $${args.length}`);
+    }
+    const clause = filters.length ? `AND (${filters.join(" OR ")})` : ``;
     const deliveriesColumns = await getTableColumns("deliveries");
     const col = (name, fallbackSql) => deliveriesColumns.has(name) ? `d.${name}` : `${fallbackSql} as ${name}`;
     const orderByCreated = deliveriesColumns.has("created_at")
