@@ -5266,12 +5266,22 @@ app.get("/api/sustainability/dashboard", async (req, res) => {
       SELECT d.delivery_id, d.route_id, d.status as delivery_status, d.driver_name, d.vehicle_type, d.departure_time, 
              d.arrival_time, d.from_location, d.to_location, d.distance_km, d.fuel_consumption, 
              d.estimated_fuel_consumption_liters, d.carbon_emissions, d.estimated_carbon_kg, 
-             d.created_at as submitted_at, d.business_id, bp.business_name 
+             d.created_at as submitted_at, d.business_id, bp.business_name, d.carbon_verification_status 
       FROM deliveries d 
       LEFT JOIN business_profiles bp ON d.business_id = bp.business_id 
       WHERE d.carbon_verification_status = 'pending' OR d.carbon_verification_status IS NULL 
       ORDER BY d.created_at DESC LIMIT 20
     `);
+    const countsResult = await pool.query(`
+      SELECT
+        COUNT(*) FILTER (WHERE carbon_verification_status IS NULL OR carbon_verification_status = 'pending') AS pending_count,
+        COUNT(*) FILTER (WHERE carbon_verification_status = 'verified') AS verified_count,
+        COUNT(*) FILTER (WHERE carbon_verification_status = 'revision_requested') AS revision_count,
+        COUNT(*) FILTER (WHERE carbon_verification_status = 'verified' AND carbon_verified_at::date = CURRENT_DATE) AS verified_today,
+        COALESCE(SUM(carbon_emissions) FILTER (WHERE carbon_verification_status = 'verified'), 0) AS total_co2_verified
+      FROM deliveries;
+    `);
+    const counts = countsResult.rows[0] || {};
     const pendingItems = pendingResult.rows.map(row => ({ 
       id: row.delivery_id, 
       deliveryId: `DEL-${row.delivery_id}`, 
@@ -5291,7 +5301,11 @@ app.get("/api/sustainability/dashboard", async (req, res) => {
     }));
     res.json({ 
       success: true, 
-      summary: { pendingVerifications: pendingItems.length, verifiedToday: 0, totalCO2Verified: 0 }, 
+      summary: { 
+        pendingVerifications: parseInt(counts.pending_count, 10) || pendingItems.length, 
+        verifiedToday: parseInt(counts.verified_today, 10) || 0, 
+        totalCO2Verified: parseFloat(counts.total_co2_verified) || 0 
+      }, 
       pendingVerifications: pendingItems, 
       message: null 
     });
