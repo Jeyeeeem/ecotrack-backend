@@ -3378,7 +3378,8 @@ app.get("/api/logistics/pending", async (req, res) => {
       let managerBusinessClause = "";
       if (managerColumns.has("business_id") && businessId) {
         managerParams.push(businessId);
-        managerBusinessClause = `AND ma.business_id = $${managerParams.length}`;
+        // Include rows targeted to this business or global (NULL business_id).
+        managerBusinessClause = `AND (ma.business_id = $${managerParams.length} OR ma.business_id IS NULL)`;
       }
       result = await pool.query(`
         SELECT *
@@ -3402,7 +3403,8 @@ app.get("/api/logistics/pending", async (req, res) => {
         let routeBusinessClause = "";
         if (businessId) {
           routeParams.push(businessId);
-          routeBusinessClause = `AND (business_id = $${routeParams.length} OR business = $${routeParams.length})`;
+          // Allow global (NULL) routes plus matching business.
+          routeBusinessClause = `AND (business_id = $${routeParams.length} OR business = $${routeParams.length} OR business_id IS NULL)`;
         }
         result = await pool.query(`
           SELECT id, route_type as product_name, from_location as location, driver_name, vehicle_type, departure_time, 
@@ -3422,7 +3424,7 @@ app.get("/api/logistics/pending", async (req, res) => {
       let routeBusinessClause = "";
       if (businessId) {
         routeParams.push(businessId);
-        routeBusinessClause = `AND (business_id = $${routeParams.length} OR business = $${routeParams.length})`;
+        routeBusinessClause = `AND (business_id = $${routeParams.length} OR business = $${routeParams.length} OR business_id IS NULL)`;
       }
       result = await pool.query(`
         SELECT id, route_type as product_name, from_location as location, driver_name, vehicle_type, departure_time, 
