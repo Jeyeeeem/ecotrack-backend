@@ -4035,6 +4035,17 @@ app.post("/api/logistics/approve", async (req, res) => {
         message: "Decline reason is required before returning route to admin"
       });
     }
+    // Enforce driver assignment details on approve (per system design: driver must be selected)
+    if (status === 'APPROVED') {
+      const deliveriesColumns = await getTableColumns("deliveries");
+      const requiresDriverId = deliveriesColumns.has("driver_user_id") || deliveriesColumns.has("driver_id");
+      if (requiresDriverId && !driverUserId) {
+        return res.status(400).json({
+          success: false,
+          message: "Select a driver before approval (driver_user_id missing)"
+        });
+      }
+    }
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
     const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
