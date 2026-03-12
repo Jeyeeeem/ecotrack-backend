@@ -4095,7 +4095,8 @@ app.post("/api/logistics/approve", async (req, res) => {
     const routeApprovalUpdates = new Set();
 
     if (hasManagerApprovals) {
-      const managerMatchClauses = [`${managerPkCol}::text = $1`];
+      const routeIdParam = String(routeId || "");
+      const managerMatchClauses = [`COALESCE(${managerPkCol}::text, '') = $1`];
       if (managerColumns.has("route_id")) managerMatchClauses.push(`COALESCE(route_id::text, '') = $1`);
       if (managerColumns.has("related_record_id")) managerMatchClauses.push(`COALESCE(related_record_id::text, '') = $1`);
       if (managerColumns.has("delivery_id")) managerMatchClauses.push(`COALESCE(delivery_id::text, '') = $1`);
@@ -4105,7 +4106,7 @@ app.post("/api/logistics/approve", async (req, res) => {
          WHERE approval_type = 'route_optimization'
            AND (${managerMatchClauses.join(" OR ")})
          LIMIT 1`,
-        [routeId]
+        [routeIdParam]
       );
       if (maResult.rows.length > 0) {
         managerApprovalRow = maResult.rows[0];
@@ -4432,20 +4433,21 @@ app.post("/api/logistics/approve", async (req, res) => {
       if (managerColumns.has("related_record_id")) managerMatchClauses.push(`COALESCE(related_record_id::text, '') = $3`);
       if (managerColumns.has("delivery_id")) managerMatchClauses.push(`COALESCE(delivery_id::text, '') = $3`);
 
+      const routeIdParam = String(routeId || "");
       await pool.query(
         `UPDATE manager_approvals
          SET status = LOWER($1), manager_comment = $2, decision_notes = $2, reviewed_at = NOW()${managerUpdatedAtClause}
          WHERE approval_type = 'route_optimization'
            AND (${managerMatchClauses.join(" OR ")})`,
-        [status, decisionComment, routeId]
+        [status, decisionComment, routeIdParam]
       );
     }
 
     if (hasRouteApprovals && routeApprovalUpdates.size > 0) {
       for (const raId of routeApprovalUpdates) {
         await pool.query(
-          `UPDATE route_approvals SET status = $1, manager_comment = $2, approved_at = CASE WHEN $1 = 'APPROVED' THEN NOW() ELSE approved_at END WHERE id = $3`,
-          [status, decisionComment, raId]
+          `UPDATE route_approvals SET status = $1, manager_comment = $2, approved_at = CASE WHEN $1 = 'APPROVED' THEN NOW() ELSE approved_at END WHERE id::text = $3 OR COALESCE(route_id::text, '') = $3`,
+          [status, decisionComment, String(raId)]
         );
       }
     } else if (!hasManagerApprovals) {
