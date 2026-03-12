@@ -2658,6 +2658,7 @@ const fetchDriverMonitorRows = async (businessId = null) => {
         if (!key) return;
         if (busyByDriver.has(key)) return;
         busyByDriver.set(key, {
+          driver_name: driverName || null,
           route_name: routeName || null,
           route_status: routeStatus || null,
           route_id: routeId || null,
@@ -2713,52 +2714,54 @@ const fetchDriverMonitorRows = async (businessId = null) => {
       const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
       if (hasDeliveries) {
         const deliveriesColumns = await getTableColumns("deliveries");
-        const statusExpr = deliveriesColumns.has("status") ? "LOWER(COALESCE(status,''))" : "''";
+        const statusExpr = deliveriesColumns.has("status") ? "LOWER(COALESCE(d.status,''))" : "''";
         const hasDriverName = deliveriesColumns.has("driver_name");
         const hasBusinessCol = deliveriesColumns.has("business_id");
-            const routeNameExpr = deliveriesColumns.has("route_name")
-          ? "route_name"
+        const routeNameExpr = deliveriesColumns.has("route_name")
+          ? "d.route_name"
           : deliveriesColumns.has("from_location")
-          ? "from_location"
+          ? "d.from_location"
           : "NULL::text";
         const routeIdExpr = deliveriesColumns.has("route_id")
-          ? "route_id"
+          ? "d.route_id"
           : deliveriesColumns.has("delivery_id")
-          ? "delivery_id"
+          ? "d.delivery_id"
           : deliveriesColumns.has("id")
-          ? "id"
+          ? "d.id"
           : null;
-          const vehicleExpr = deliveriesColumns.has("vehicle_type") ? "vehicle_type" : "NULL::text";
+        const vehicleExpr = deliveriesColumns.has("vehicle_type") ? "d.vehicle_type" : "NULL::text";
         const driverIdExpr = deliveriesColumns.has("driver_user_id")
-          ? "driver_user_id"
+          ? "d.driver_user_id"
           : deliveriesColumns.has("driver_id")
-          ? "driver_id"
+          ? "d.driver_id"
           : "NULL::int";
-        if (hasDriverName) {
+        if (hasDriverName || deliveriesColumns.has("driver_user_id")) {
           const params = [];
           const businessClause =
             businessId && hasBusinessCol
               ? (() => {
                   params.push(businessId);
-                  return `AND (business_id = $${params.length} OR business_id IS NULL)`;
+                  return `AND (d.business_id = $${params.length} OR d.business_id IS NULL)`;
                 })()
               : "";
           const liveDrivers = await pool.query(
             `
             SELECT
-              driver_name AS full_name,
-              COALESCE(driver_email, '') AS email,
+              COALESCE(d.driver_name, u.full_name, u.username, u.email, 'Driver') AS full_name,
+              COALESCE(d.driver_email, u.email, '') AS email,
               ${routeNameExpr} AS route_name,
               ${statusExpr} AS route_status,
               ${routeIdExpr || "NULL::text"} AS route_id,
               ${vehicleExpr} AS vehicle_type,
               ${driverIdExpr} AS driver_user_id,
-              COALESCE(stops_completed, 0) AS stops_completed,
-              COALESCE(stops_total, 0) AS stops_total
-            FROM deliveries
+              ${driverIdExpr} AS user_id,
+              COALESCE(d.stops_completed, 0) AS stops_completed,
+              COALESCE(d.stops_total, 0) AS stops_total
+            FROM deliveries d
+            LEFT JOIN users u ON ${driverIdExpr} = COALESCE(u.user_id, u.id)
             WHERE ${statusExpr} NOT IN ('completed','cancelled','declined','rejected','pending','awaiting_approval','submitted')
               ${businessClause}
-            ORDER BY departure_time DESC NULLS LAST, created_at DESC NULLS LAST
+            ORDER BY d.departure_time DESC NULLS LAST, d.created_at DESC NULLS LAST
             LIMIT 50
           `,
             params
@@ -2819,6 +2822,38 @@ const fetchDriverMonitorRows = async (businessId = null) => {
       }
     } catch (driverRouteErr) {
       console.warn("Driver monitor route_approvals lookup fallback:", driverRouteErr.message);
+    }
+
+    // Merge busy overlay into existing live-driver rows and add missing busy drivers
+    if (driverMonitorRows.length > 0 && busyByDriver.size > 0) {
+      const seenKeys = new Set();
+      driverMonitorRows = driverMonitorRows.map((row) => {
+        const busy = getBusyForDriver(row.full_name, row.user_id || row.driver_user_id);
+        if (busy) {
+          if (row.full_name) seenKeys.add(String(row.full_name).trim().toLowerCase());
+          if (row.user_id || row.driver_user_id)
+            seenKeys.add(`id:${row.user_id || row.driver_user_id}`);
+          return { ...row, ...busy };
+        }
+        return row;
+      });
+
+      // add busy drivers not present in live list (e.g., pending assignments)
+      for (const [key, busy] of busyByDriver.entries()) {
+        if (seenKeys.has(key)) continue;
+        const fallbackName = busy.driver_name || key.replace(/^id:/, "") || "Driver";
+        driverMonitorRows.push({
+          user_id: null,
+          full_name: fallbackName,
+          email: "",
+          route_name: busy.route_name,
+          route_status: busy.route_status,
+          route_id: busy.route_id,
+          vehicle_type: busy.vehicle_type,
+          stops_completed: 0,
+          stops_total: 0
+        });
+      }
     }
 
     // Base driver list mapped with busy overlay
@@ -4056,6 +4091,7 @@ app.post("/api/logistics/approve", async (req, res) => {
     let managerApprovalRow = null;
     let resolvedRouteId = routeId;
     let routeRow = null;
+    const routeApprovalUpdates = new Set();
 
     if (hasManagerApprovals) {
       const managerMatchClauses = [`${managerPkCol}::text = $3`];
@@ -4082,14 +4118,14 @@ app.post("/api/logistics/approve", async (req, res) => {
             maResult.rows[0].delivery_id;
           if (routeRef) {
             resolvedRouteId = routeRef;
-            await pool.query(`UPDATE route_approvals SET status = $1, manager_comment = $2, approved_at = NOW() WHERE id = $3`, [status, decisionComment, routeRef]);
+            routeApprovalUpdates.add(String(routeRef));
           }
         } else {
-          await pool.query(`UPDATE route_approvals SET status = $1, manager_comment = $2, approved_at = NOW() WHERE id = $3`, [status, decisionComment, routeId]);
+          routeApprovalUpdates.add(String(routeId));
         }
       }
     } else if (hasRouteApprovals) {
-      await pool.query(`UPDATE route_approvals SET status = $1, manager_comment = $2, approved_at = NOW() WHERE id = $3`, [status, decisionComment, routeId]);
+      routeApprovalUpdates.add(String(routeId));
     } else {
       await pool.query(
         `UPDATE manager_approvals
@@ -4481,6 +4517,16 @@ app.post("/api/logistics/approve", async (req, res) => {
         } catch (assignmentErr) {
           console.error("Delivery assignment failed after route approval:", assignmentErr.message);
         }
+      }
+    }
+
+    // Apply pending route_approvals status updates only after all validations pass
+    if (hasRouteApprovals && routeApprovalUpdates.size > 0) {
+      for (const raId of routeApprovalUpdates) {
+        await pool.query(
+          `UPDATE route_approvals SET status = $1, manager_comment = $2, approved_at = CASE WHEN $1 = 'APPROVED' THEN NOW() ELSE approved_at END WHERE id = $3`,
+          [status, decisionComment, raId]
+        );
       }
     }
 
