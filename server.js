@@ -5937,8 +5937,10 @@ app.get("/api/driver/delivery/:id", authenticate, async (req, res) => {
 
     const setIfMissing = (stopObj, latVal, lngVal) => {
       if (!stopObj) return;
-      if ((stopObj.latitude == null || Number.isNaN(stopObj.latitude)) && latVal != null) stopObj.latitude = latVal;
-      if ((stopObj.longitude == null || Number.isNaN(stopObj.longitude)) && lngVal != null) stopObj.longitude = lngVal;
+      const latBad = stopObj.latitude == null || Number.isNaN(stopObj.latitude) || stopObj.latitude === 0;
+      const lngBad = stopObj.longitude == null || Number.isNaN(stopObj.longitude) || stopObj.longitude === 0;
+      if (latBad && latVal != null && latVal !== 0) stopObj.latitude = latVal;
+      if (lngBad && lngVal != null && lngVal !== 0) stopObj.longitude = lngVal;
     };
     if (stops.length > 0) setIfMissing(stops[0], originLat, originLng);
     if (stops.length > 1) setIfMissing(stops[stops.length - 1], destLat, destLng);
@@ -5973,15 +5975,19 @@ app.get("/api/driver/delivery/:id", authenticate, async (req, res) => {
           if (stops.length > 0) setIfMissing(stops[0], raOriginLat, raOriginLng);
           if (stops.length > 1) setIfMissing(stops[stops.length - 1], raDestLat, raDestLng);
 
-          // Fill intermediate stops from raStops if available
+          // Fill ALL stops from raStops — force overwrite zeros
           stops.forEach((s, idx) => {
-            if (s.latitude && s.longitude && s.latitude !== 0 && s.longitude !== 0) return;
             const raStop = raStops[idx];
             if (raStop) {
               const { latitude: rLat, longitude: rLng } = normalizeStopLatLng(raStop);
-              setIfMissing(s, rLat, rLng);
+              if (rLat && rLat !== 0) s.latitude = rLat;
+              if (rLng && rLng !== 0) s.longitude = rLng;
             }
           });
+
+          // Final fallback: use origin for first stop, dest for last if still zero
+          if (stops.length > 0) setIfMissing(stops[0], raOriginLat, raOriginLng);
+          if (stops.length > 1) setIfMissing(stops[stops.length - 1], raDestLat, raDestLng);
         }
       } catch (raErr) {
         console.warn("route_approvals coordinate enrichment fallback:", raErr.message);
