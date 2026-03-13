@@ -5956,8 +5956,10 @@ app.post("/api/driver/confirm-stop", authenticate, async (req, res) => {
     const stopSequence = normalizedStopIndex + 1;
     const isArrival = String(confirmationType || "").toLowerCase() === "arrival";
     const isAcceptedNotStarted = String(delivery.status || "").toLowerCase() === "accepted";
-    const shouldMarkCompleted = !isArrival || !isAcceptedNotStarted || stopSequence !== 1;
     let routeStopsUpdated = false;
+
+    const projectedTotalStops = Math.max(totalStops, normalizedStopIndex + 1);
+    const projectedIsLastStop = normalizedStopIndex >= projectedTotalStops - 1;
 
     try {
       const routeStopsTableCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
@@ -5967,9 +5969,12 @@ app.post("/api/driver/confirm-stop", authenticate, async (req, res) => {
         const canMatchRouteStop = routeStopsColumns.has("route_id") && routeStopsColumns.has("stop_sequence");
         if (canMatchRouteStop) {
           const setClauses = [];
+          const routeStopStatus = isArrival ? (projectedIsLastStop ? "completed" : "arrived") : "completed";
           if (isArrival) {
             if (routeStopsColumns.has("actual_arrival_time")) setClauses.push("actual_arrival_time = NOW()");
-            if (routeStopsColumns.has("status")) setClauses.push(`status = '${shouldMarkCompleted ? "completed" : "arrived"}'`);
+            if (routeStopsColumns.has("status")) {
+              setClauses.push(`status = '${routeStopStatus}'`);
+            }
           } else {
             if (routeStopsColumns.has("actual_departure_time")) setClauses.push("actual_departure_time = NOW()");
             if (routeStopsColumns.has("status")) setClauses.push(`status = 'completed'`);
@@ -5997,6 +6002,7 @@ app.post("/api/driver/confirm-stop", authenticate, async (req, res) => {
       : typeof delivery.stops_json === "string"
         ? JSON.parse(delivery.stops_json || "[]")
         : [];
+    let totalStops = Array.isArray(stopsFromDb) ? stopsFromDb.length : 0;
 
     // Ensure we can always write a status even if stops_json was null/short.
     const updatedStops = Array.isArray(stopsFromDb) ? [...stopsFromDb] : [];
@@ -6007,9 +6013,12 @@ app.post("/api/driver/confirm-stop", authenticate, async (req, res) => {
         status: "pending"
       });
     }
+    totalStops = updatedStops.length;
+    const isLastStop = normalizedStopIndex >= totalStops - 1;
+    const stopStatus = isArrival ? (isLastStop ? "completed" : "arrived") : "completed";
     updatedStops[normalizedStopIndex] = {
       ...updatedStops[normalizedStopIndex],
-      status: isArrival ? (shouldMarkCompleted ? "completed" : "arrived") : "completed"
+      status: stopStatus
     };
     await pool.query(`UPDATE deliveries SET stops_json = $1 WHERE delivery_id = $2`, [JSON.stringify(updatedStops), normalizedDeliveryId]);
     stopsJsonUpdated = true;
