@@ -5869,18 +5869,26 @@ app.get("/api/driver/delivery/:id", authenticate, async (req, res) => {
       });
     }
 
-    // Enrich missing lat/lng using origin/destination from route_approvals if available.
+    // Enrich missing lat/lng using origin/destination and route_path if available.
     const originLat = toFiniteNumber(row.origin_latitude, row.originLatitude, row.origin_lat, row.originLat);
     const originLng = toFiniteNumber(row.origin_longitude, row.originLongitude, row.origin_lng, row.originLon);
     const destLat = toFiniteNumber(row.destination_latitude, row.destinationLatitude, row.dest_latitude, row.destinationLat);
     const destLng = toFiniteNumber(row.destination_longitude, row.destinationLongitude, row.dest_longitude, row.destinationLon);
+    const rawPath = Array.isArray(row.route_path) ? row.route_path : Array.isArray(row.routePath) ? row.routePath : [];
+    const routePathPoints = Array.isArray(rawPath) ? rawPath.map(normalizeStopLatLng) : [];
+
     const setIfMissing = (stopObj, latVal, lngVal) => {
       if (!stopObj) return;
-      if (stopObj.latitude == null && latVal != null) stopObj.latitude = latVal;
-      if (stopObj.longitude == null && lngVal != null) stopObj.longitude = lngVal;
+      if ((stopObj.latitude == null || Number.isNaN(stopObj.latitude)) && latVal != null) stopObj.latitude = latVal;
+      if ((stopObj.longitude == null || Number.isNaN(stopObj.longitude)) && lngVal != null) stopObj.longitude = lngVal;
     };
     if (stops.length > 0) setIfMissing(stops[0], originLat, originLng);
     if (stops.length > 1) setIfMissing(stops[stops.length - 1], destLat, destLng);
+    // Fill intermediates from route path if missing.
+    stops.forEach((s, idx) => {
+      const fallback = routePathPoints[Math.min(idx, Math.max(routePathPoints.length - 1, 0))];
+      if (fallback) setIfMissing(s, fallback.latitude, fallback.longitude);
+    });
 
     res.json({
       success: true,
