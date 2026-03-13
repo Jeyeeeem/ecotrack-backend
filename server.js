@@ -5958,6 +5958,12 @@ app.post("/api/driver/confirm-stop", authenticate, async (req, res) => {
     const isAcceptedNotStarted = String(delivery.status || "").toLowerCase() === "accepted";
     let routeStopsUpdated = false;
 
+    const stopsFromDbPre = Array.isArray(delivery.stops_json)
+      ? delivery.stops_json
+      : typeof delivery.stops_json === "string"
+        ? JSON.parse(delivery.stops_json || "[]")
+        : [];
+    let totalStops = Array.isArray(stopsFromDbPre) ? stopsFromDbPre.length : 0;
     const projectedTotalStops = Math.max(totalStops, normalizedStopIndex + 1);
     const projectedIsLastStop = normalizedStopIndex >= projectedTotalStops - 1;
 
@@ -5997,12 +6003,7 @@ app.post("/api/driver/confirm-stop", authenticate, async (req, res) => {
     }
 
     let stopsJsonUpdated = false;
-    const stopsFromDb = Array.isArray(delivery.stops_json)
-      ? delivery.stops_json
-      : typeof delivery.stops_json === "string"
-        ? JSON.parse(delivery.stops_json || "[]")
-        : [];
-    let totalStops = Array.isArray(stopsFromDb) ? stopsFromDb.length : 0;
+    const stopsFromDb = stopsFromDbPre;
 
     // Ensure we can always write a status even if stops_json was null/short.
     const updatedStops = Array.isArray(stopsFromDb) ? [...stopsFromDb] : [];
