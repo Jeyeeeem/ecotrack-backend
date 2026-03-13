@@ -5948,6 +5948,46 @@ app.get("/api/driver/delivery/:id", authenticate, async (req, res) => {
       if (fallback) setIfMissing(s, fallback.latitude, fallback.longitude);
     });
 
+    // If stops still have missing coordinates, fetch from route_approvals directly
+    const stillMissingCoords = stops.some(s => !s.latitude || !s.longitude || s.latitude === 0 || s.longitude === 0);
+    if (stillMissingCoords && row.route_id) {
+      try {
+        const raResult = await pool.query(
+          `SELECT origin_latitude, origin_longitude, destination_latitude, destination_longitude, stops
+           FROM route_approvals WHERE id = $1 LIMIT 1`,
+          [row.route_id]
+        );
+        if (raResult.rows.length > 0) {
+          const ra = raResult.rows[0];
+          const raOriginLat = toFiniteNumber(ra.origin_latitude);
+          const raOriginLng = toFiniteNumber(ra.origin_longitude);
+          const raDestLat = toFiniteNumber(ra.destination_latitude);
+          const raDestLng = toFiniteNumber(ra.destination_longitude);
+
+          // Try to get intermediate stop coords from route_approvals.stops JSON
+          let raStops = [];
+          try {
+            raStops = typeof ra.stops === 'string' ? JSON.parse(ra.stops) : (Array.isArray(ra.stops) ? ra.stops : []);
+          } catch (_) {}
+
+          if (stops.length > 0) setIfMissing(stops[0], raOriginLat, raOriginLng);
+          if (stops.length > 1) setIfMissing(stops[stops.length - 1], raDestLat, raDestLng);
+
+          // Fill intermediate stops from raStops if available
+          stops.forEach((s, idx) => {
+            if (s.latitude && s.longitude && s.latitude !== 0 && s.longitude !== 0) return;
+            const raStop = raStops[idx];
+            if (raStop) {
+              const { latitude: rLat, longitude: rLng } = normalizeStopLatLng(raStop);
+              setIfMissing(s, rLat, rLng);
+            }
+          });
+        }
+      } catch (raErr) {
+        console.warn("route_approvals coordinate enrichment fallback:", raErr.message);
+      }
+    }
+
     res.json({
       success: true,
       delivery: {
