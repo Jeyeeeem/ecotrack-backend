@@ -5967,6 +5967,20 @@ app.post("/api/driver/confirm-stop", authenticate, async (req, res) => {
     const projectedTotalStops = Math.max(totalStopsPre, normalizedStopIndex + 1);
     const projectedIsLastStop = normalizedStopIndex >= projectedTotalStops - 1;
 
+    // Idempotency: if this stop is already marked arrived/completed, short-circuit.
+    const existingStatus = Array.isArray(stopsFromDbPre) && stopsFromDbPre[normalizedStopIndex]
+      ? String(stopsFromDbPre[normalizedStopIndex].status || "").toLowerCase()
+      : "";
+    const isAlreadyConfirmed = existingStatus === "arrived" || existingStatus === "completed";
+    if (isArrival && isAlreadyConfirmed) {
+      return res.json({
+        success: true,
+        message: "Stop already confirmed",
+        routeStopsUpdated: false,
+        stopsJsonUpdated: false
+      });
+    }
+
     try {
       const routeStopsTableCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
       const hasRouteStops = !!routeStopsTableCheck.rows[0]?.tbl;
