@@ -5858,6 +5858,17 @@ app.get("/api/driver/delivery/:id", authenticate, async (req, res) => {
       ];
     }
 
+    // Overlay statuses from stops_json onto any source, so latest confirmations always win.
+    if (Array.isArray(stopsJsonArray) && stopsJsonArray.length) {
+      stops = stops.map((s, idx) => {
+        const overrideStatus = stopsJsonArray[idx]?.status;
+        if (overrideStatus) {
+          return { ...s, status: String(overrideStatus).trim() || s.status };
+        }
+        return s;
+      });
+    }
+
     // Enrich missing lat/lng using origin/destination from route_approvals if available.
     const originLat = toFiniteNumber(row.origin_latitude, row.originLatitude, row.origin_lat, row.originLat);
     const originLng = toFiniteNumber(row.origin_longitude, row.originLongitude, row.origin_lng, row.originLon);
