@@ -5858,6 +5858,19 @@ app.get("/api/driver/delivery/:id", authenticate, async (req, res) => {
       ];
     }
 
+    // Enrich missing lat/lng using origin/destination from route_approvals if available.
+    const originLat = toFiniteNumber(row.origin_latitude, row.originLatitude, row.origin_lat, row.originLat);
+    const originLng = toFiniteNumber(row.origin_longitude, row.originLongitude, row.origin_lng, row.originLon);
+    const destLat = toFiniteNumber(row.destination_latitude, row.destinationLatitude, row.dest_latitude, row.destinationLat);
+    const destLng = toFiniteNumber(row.destination_longitude, row.destinationLongitude, row.dest_longitude, row.destinationLon);
+    const setIfMissing = (stopObj, latVal, lngVal) => {
+      if (!stopObj) return;
+      if (stopObj.latitude == null && latVal != null) stopObj.latitude = latVal;
+      if (stopObj.longitude == null && lngVal != null) stopObj.longitude = lngVal;
+    };
+    if (stops.length > 0) setIfMissing(stops[0], originLat, originLng);
+    if (stops.length > 1) setIfMissing(stops[stops.length - 1], destLat, destLng);
+
     res.json({
       success: true,
       delivery: {
