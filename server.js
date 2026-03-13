@@ -3793,15 +3793,44 @@ app.patch("/api/logistics/:id/approve", async (req, res) => {
         );
         
         if (existingDelivery.rows.length === 0) {
+          // Copy route stops (with coordinates) into the delivery so geofence/arrival logic has real points.
+          let stopsJson = null;
+          try {
+            const rsCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
+            if (rsCheck.rows[0]?.tbl) {
+              const rs = await pool.query(
+                `SELECT stop_sequence, location_name, address, latitude, longitude
+                 FROM route_stops
+                 WHERE route_id = $1
+                 ORDER BY stop_sequence ASC`,
+                [id]
+              );
+              if (rs.rows.length) {
+                stopsJson = rs.rows.map((s, idx) => ({
+                  stopId: s.stop_sequence ?? idx + 1,
+                  sequence: s.stop_sequence ?? idx + 1,
+                  stopName: s.location_name || s.address || `Stop ${idx + 1}`,
+                  address: s.address || s.location_name || "",
+                  latitude: toFiniteNumber(s.latitude),
+                  longitude: toFiniteNumber(s.longitude),
+                  status: "pending"
+                }));
+              }
+            }
+          } catch (routeStopsErr) {
+            console.warn("delivery insert route_stops fetch failed:", routeStopsErr.message);
+          }
+
           // Create a new delivery record
           await pool.query(
             `INSERT INTO deliveries 
               (route_id, status, driver_name, vehicle_type, departure_time, from_location, to_location,
-               distance_km, estimated_fuel_consumption_liters, estimated_carbon_kg)
-             VALUES ($1, 'assigned', $2, $3, $4, $5, $6, $7, $8, $9)`,
+               distance_km, estimated_fuel_consumption_liters, estimated_carbon_kg, stops_json)
+             VALUES ($1, 'assigned', $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
             [id, driverName, route.vehicle_type, route.departure_time, route.from_location, 
              route.to_location, route.optimized_distance || route.original_distance,
-             route.optimized_fuel || route.original_fuel, route.optimized_co2 || route.original_co2]
+             route.optimized_fuel || route.original_fuel, route.optimized_co2 || route.original_co2,
+             stopsJson]
           );
         }
       }
@@ -4389,6 +4418,34 @@ app.post("/api/logistics/approve", async (req, res) => {
                   );
                 }
               } else {
+                // Build stops_json from route_stops so deliveries always carry coordinates/status scaffolding.
+                let stopsJson = null;
+                try {
+                  const rsCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
+                  if (rsCheck.rows[0]?.tbl && deliveryPayload.route_id != null) {
+                    const rs = await pool.query(
+                      `SELECT stop_sequence, location_name, address, latitude, longitude
+                       FROM route_stops
+                       WHERE route_id = $1
+                       ORDER BY stop_sequence ASC`,
+                      [deliveryPayload.route_id]
+                    );
+                    if (rs.rows.length) {
+                      stopsJson = rs.rows.map((s, idx) => ({
+                        stopId: s.stop_sequence ?? idx + 1,
+                        sequence: s.stop_sequence ?? idx + 1,
+                        stopName: s.location_name || s.address || `Stop ${idx + 1}`,
+                        address: s.address || s.location_name || "",
+                        latitude: toFiniteNumber(s.latitude),
+                        longitude: toFiniteNumber(s.longitude),
+                        status: "pending"
+                      }));
+                    }
+                  }
+                } catch (routeStopsErr) {
+                  console.warn("delivery insert route_stops fetch failed:", routeStopsErr.message);
+                }
+
                 const insertColumns = [];
                 const insertValues = [];
                 const pushInsert = (column, value) => {
@@ -4410,6 +4467,7 @@ app.post("/api/logistics/approve", async (req, res) => {
                 pushInsert("distance_km", deliveryPayload.distance_km);
                 pushInsert("estimated_fuel_consumption_liters", deliveryPayload.estimated_fuel_consumption_liters);
                 pushInsert("estimated_carbon_kg", deliveryPayload.estimated_carbon_kg);
+                pushInsert("stops_json", stopsJson);
 
                 if (insertColumns.length > 0) {
                   const placeholders = insertColumns.map((_, idx) => `$${idx + 1}`).join(", ");
