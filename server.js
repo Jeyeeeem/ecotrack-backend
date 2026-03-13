@@ -5963,8 +5963,8 @@ app.post("/api/driver/confirm-stop", authenticate, async (req, res) => {
       : typeof delivery.stops_json === "string"
         ? JSON.parse(delivery.stops_json || "[]")
         : [];
-    let totalStops = Array.isArray(stopsFromDbPre) ? stopsFromDbPre.length : 0;
-    const projectedTotalStops = Math.max(totalStops, normalizedStopIndex + 1);
+    const totalStopsPre = Array.isArray(stopsFromDbPre) ? stopsFromDbPre.length : 0;
+    const projectedTotalStops = Math.max(totalStopsPre, normalizedStopIndex + 1);
     const projectedIsLastStop = normalizedStopIndex >= projectedTotalStops - 1;
 
     try {
@@ -6014,8 +6014,8 @@ app.post("/api/driver/confirm-stop", authenticate, async (req, res) => {
         status: "pending"
       });
     }
-    totalStops = updatedStops.length;
-    const isLastStop = normalizedStopIndex >= totalStops - 1;
+    const totalStopsAfter = updatedStops.length;
+    const isLastStop = normalizedStopIndex >= totalStopsAfter - 1;
     const stopStatus = isArrival ? (isLastStop ? "completed" : "arrived") : "completed";
     updatedStops[normalizedStopIndex] = {
       ...updatedStops[normalizedStopIndex],
