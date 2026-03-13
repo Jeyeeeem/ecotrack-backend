@@ -5819,33 +5819,38 @@ app.get("/api/driver/delivery/:id", authenticate, async (req, res) => {
       console.warn("Driver delivery stops query fallback:", stopsErr.message);
     }
 
-    if (stopsRows.length > 0) {
-      const stopsJsonStatuses = Array.isArray(row.stops_json)
-        ? row.stops_json.map((s) => String(s?.status || "").trim())
-        : [];
-      stops = stopsRows.map(stop => ({
-        ...normalizeStopLatLng(stop),
-        stopId: stop.stop_sequence,
-        sequence: stop.stop_sequence,
-        stopName: stop.location_name || `Stop ${stop.stop_sequence}`,
-        address: normalizeStopAddress(stop.address || stop.location_name),
-        status: (() => {
-          const statusFromRouteStops = String(stop.status || "").trim();
-          if (routeStopsHasStatusColumn && statusFromRouteStops) return statusFromRouteStops;
-          const idx = Math.max(0, Number(stop.stop_sequence || 1) - 1);
-          const statusFromDelivery = stopsJsonStatuses[idx];
-          return statusFromDelivery || statusFromRouteStops || "pending";
-        })()
-      }));
-    } else if (Array.isArray(row.stops_json)) {
-      stops = row.stops_json.map((stop, idx) => ({
+    const stopsJsonArray = Array.isArray(row.stops_json) ? row.stops_json : null;
+    const shouldPreferStopsJson =
+      stopsJsonArray && stopsJsonArray.length >= stopsRows.length && stopsJsonArray.length > 0;
+
+    if (shouldPreferStopsJson) {
+      stops = stopsJsonArray.map((stop, idx) => ({
         ...normalizeStopLatLng(stop),
         stopId: idx + 1,
         sequence: idx + 1,
         stopName: stop.stopName || stop.location_name || stop.location || `Stop ${idx + 1}`,
         address: normalizeStopAddress(stop.address || stop.location),
-        status: stop.status || "pending"
+        status: (stop.status || "").toString().trim() || "pending"
       }));
+    } else if (stopsRows.length > 0) {
+      const stopsJsonStatuses = stopsJsonArray
+        ? stopsJsonArray.map((s) => String(s?.status || "").trim())
+        : [];
+      stops = stopsRows.map(stop => {
+        const idx = Math.max(0, Number(stop.stop_sequence || 1) - 1);
+        const statusFromDelivery = stopsJsonStatuses[idx];
+        const statusFromRouteStops = String(stop.status || "").trim();
+        const resolvedStatus =
+          statusFromDelivery || (routeStopsHasStatusColumn ? statusFromRouteStops : "") || "pending";
+        return ({
+          ...normalizeStopLatLng(stop),
+          stopId: stop.stop_sequence,
+          sequence: stop.stop_sequence,
+          stopName: stop.location_name || `Stop ${stop.stop_sequence}`,
+          address: normalizeStopAddress(stop.address || stop.location_name),
+          status: resolvedStatus
+        });
+      });
     } else {
       stops = [
         { stopId: 1, sequence: 1, stopName: row.from_location || "Warehouse", address: row.from_location || "", status: "completed" },
