@@ -3454,9 +3454,15 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
     }
     const routeStopsTableCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
     const hasRouteStops = !!routeStopsTableCheck.rows[0]?.tbl;
-    const mappedPendingRoutes = await Promise.all(
-      pendingResult.rows.map((row) => buildLogisticsRoutePayload(row, { hasRouteStops }))
-    );
+    const mappedPendingRoutes = [];
+    for (const row of pendingResult.rows) {
+      try {
+        const route = await buildLogisticsRoutePayload(row, { hasRouteStops });
+        if (route) mappedPendingRoutes.push(route);
+      } catch (mapErr) {
+        console.error("Logistics payload build error for row", row?.route_id || row?.id || "unknown", mapErr.message);
+      }
+    }
     const pendingRouteMap = new Map();
     for (const route of mappedPendingRoutes) {
       const key = `${route.routeId || route.route_id}`;
