@@ -4193,6 +4193,60 @@ app.get("/api/logistics/route/:routeId", async (req, res) => {
     }
 
     const route = await buildLogisticsRoutePayload(row, { routeIdFromParams: routeId, hasRouteStops });
+
+    // Ensure cargo is populated directly from delivery_items for this route_id
+    try {
+      const ridInt = parseInt(route.routeId || route.route_id || routeId, 10);
+      if (Number.isFinite(ridInt) && ridInt > 0) {
+        const cargoRes = await pool.query(
+          `SELECT di.delivery_item_id,
+                  di.quantity_to_deliver,
+                  di.inventory_id,
+                  inv.unit_of_measure,
+                  inv.quantity,
+                  inv.product_id,
+                  inv.unit_price_at_entry,
+                  inv.total_value,
+                  inv.batch_number,
+                  inv.expected_expiry_date,
+                  p.name AS product_name,
+                  p.storage_category,
+                  p.perishable,
+                  p.image_url
+           FROM delivery_items di
+           LEFT JOIN inventory inv ON inv.inventory_id = di.inventory_id
+           LEFT JOIN products p ON p.product_id = inv.product_id
+           WHERE di.route_id = $1
+           ORDER BY di.delivery_item_id ASC`,
+          [ridInt]
+        );
+        const cargoMapped = cargoRes.rows.map((item) => ({
+          delivery_item_id: item.delivery_item_id || null,
+          inventory_id: item.inventory_id || null,
+          product_id: item.product_id || null,
+          product_name: item.product_name || "Item",
+          quantity: toFiniteNumber(item.quantity_to_deliver, item.quantity) || null,
+          unit: item.unit_of_measure || "kg",
+          storage_category: item.storage_category || null,
+          perishable: !!item.perishable,
+          image_url: item.image_url || null,
+          value: toFiniteNumber(item.total_value) || null,
+          unit_price: toFiniteNumber(item.unit_price_at_entry) || null,
+          batch_number: item.batch_number || null,
+          expected_expiry_date: item.expected_expiry_date || null
+        }));
+        if (cargoMapped.length > 0) {
+          route.cargo = cargoMapped;
+          route.cargo_total_quantity = cargoMapped.reduce(
+            (sum, c) => sum + (toFiniteNumber(c.quantity) || 0),
+            0
+          );
+        }
+      }
+    } catch (cargoErr) {
+      console.warn("Route details cargo fetch failed:", cargoErr.message);
+    }
+
     return res.json({ success: true, route, message: null });
   } catch (err) {
     console.error("Logistics route details error:", err);
