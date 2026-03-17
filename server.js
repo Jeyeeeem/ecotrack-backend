@@ -179,7 +179,7 @@ const normalizeRouteIdCandidates = (routeId, extras = []) => {
 
 // Pull authoritative logistics data directly from core tables (no schema change)
 async function getLogisticsDbSnapshot(routeIdOrCandidates) {
-  const snapshot = { route: null, stops: [], cargo: [], deliveryLog: null, driverLocations: [] };
+  const snapshot = { route: null, stops: [], cargo: [], deliveryLog: null, driverLocations: [], routeApproval: null };
   const candidates = normalizeRouteIdCandidates(routeIdOrCandidates, []);
   if (candidates.length === 0) return snapshot;
 
@@ -194,6 +194,23 @@ async function getLogisticsDbSnapshot(routeIdOrCandidates) {
       if (routeRes.rows.length > 0) {
         snapshot.route = routeRes.rows[0];
         break;
+      }
+    }
+  } catch (_) {}
+
+  // Pull a matching route_approvals row to capture request/extra data and route_path.
+  try {
+    const tableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
+    if (tableCheck.rows[0]?.tbl) {
+      for (const candidate of candidates) {
+        const raRes = await pool.query(
+          `SELECT * FROM route_approvals WHERE route_id::text = $1 OR id::text = $1 ORDER BY created_at DESC LIMIT 1`,
+          [candidate]
+        );
+        if (raRes.rows.length > 0) {
+          snapshot.routeApproval = raRes.rows[0];
+          break;
+        }
       }
     }
   } catch (_) {}
@@ -2180,6 +2197,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
   let cargoFromDb = Array.isArray(dbSnapshot.cargo) ? dbSnapshot.cargo : [];
   const deliveryLog = dbSnapshot.deliveryLog || null;
   const driverLocations = Array.isArray(dbSnapshot.driverLocations) ? dbSnapshot.driverLocations : [];
+  const routeApprovalSnapshot = dbSnapshot.routeApproval || null;
 
   const routeIdCandidates = [...baseRouteIdCandidates, deliveryRoute?.route_id]
     .map((v) => (v === undefined || v === null ? "" : String(v)))
@@ -2193,6 +2211,29 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     routeId = String(deliveryRoute.route_id);
   }
   const routeOptimizationSnapshot = await getRouteOptimizationSnapshot(routeIdCandidates);
+
+  // If the source row lacks request/extra data (e.g., came from delivery_routes),
+  // hydrate from a matching route_approvals row so dashboard cards get real metrics.
+  if ((!requestData || Object.keys(requestData).length === 0) && routeApprovalSnapshot?.request_data) {
+    requestData = parseMaybeJsonObject(routeApprovalSnapshot.request_data);
+  }
+  if ((!extraData || Object.keys(extraData).length === 0) && routeApprovalSnapshot?.extra_data) {
+    extraData = parseMaybeJsonObject(routeApprovalSnapshot.extra_data);
+  }
+  if ((!routeData || Object.keys(routeData).length === 0) && routeApprovalSnapshot) {
+    // route_approvals often stores route_path and distance fields directly.
+    routeData = {
+      route_path: routeApprovalSnapshot.route_path,
+      routePath: routeApprovalSnapshot.route_path,
+      original_distance: routeApprovalSnapshot.original_distance,
+      optimized_distance: routeApprovalSnapshot.optimized_distance,
+      original_fuel: routeApprovalSnapshot.original_fuel,
+      optimized_fuel: routeApprovalSnapshot.optimized_fuel,
+      original_co2: routeApprovalSnapshot.original_co2,
+      optimized_co2: routeApprovalSnapshot.optimized_co2,
+      ...routeData
+    };
+  }
 
   // Cargo sometimes arrives via delivery_items even when the initial snapshot missed it; refetch by route_id if needed.
   if (cargoFromDb.length === 0 && routeId) {
