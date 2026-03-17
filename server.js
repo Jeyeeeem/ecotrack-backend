@@ -3335,7 +3335,23 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
     // Final fallback to delivery_routes when no approvals are present
     if ((!pendingResult || pendingResult.rows.length === 0) && (await tableExists("delivery_routes"))) {
       pendingResult = await pool.query(
-        `SELECT *
+        `SELECT 
+            route_id,
+            route_name,
+            route_type,
+            status,
+            driver_name,
+            vehicle_type,
+            created_at,
+            departure_time,
+            from_location,
+            to_location,
+            origin_location,
+            destination_location,
+            total_distance_km,
+            estimated_duration_minutes,
+            estimated_fuel_consumption_liters,
+            estimated_carbon_kg
          FROM delivery_routes
          WHERE ${deliveryRouteStatusPredicate}
          ORDER BY created_at DESC
@@ -3405,7 +3421,23 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
     // Fallback: delivery_routes when approvals tables are empty or missing required columns
     if ((!pendingResult || pendingResult.rows.length === 0) && (await tableExists("delivery_routes"))) {
       pendingResult = await pool.query(
-        `SELECT *
+        `SELECT 
+            route_id,
+            route_name,
+            route_type,
+            status,
+            driver_name,
+            vehicle_type,
+            created_at,
+            departure_time,
+            from_location,
+            to_location,
+            origin_location,
+            destination_location,
+            total_distance_km,
+            estimated_duration_minutes,
+            estimated_fuel_consumption_liters,
+            estimated_carbon_kg
          FROM delivery_routes
          WHERE ${deliveryRouteStatusPredicate}
          ORDER BY created_at DESC
