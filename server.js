@@ -3942,45 +3942,48 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
           }
         }
 
-        // As a definitive fallback, override with the most recent delivery_routes (any status).
-        const recentDelivery = await pool.query(
-          `SELECT 
-              route_id AS route_id,
-              route_name,
-              route_type,
-              status,
-              driver_name,
-              vehicle_type,
-              created_at,
-              origin_location,
-              destination_location,
-              total_distance_km,
-              estimated_duration_minutes,
-              estimated_fuel_consumption_liters,
-              estimated_carbon_kg
-           FROM delivery_routes
-           ORDER BY created_at DESC
-           LIMIT 20`
-        );
-        if (recentDelivery.rows.length > 0) {
-          pendingRoutes = recentDelivery.rows.map((row) => ({
-            route_id: row.route_id,
-            routeId: row.route_id,
-            route_number: row.route_id,
-            route_code: row.route_name || (row.route_id ? `Route-${row.route_id}` : null),
-            route_name: row.route_name,
-            routeType: row.route_type || "STANDARD",
-            route_type: row.route_type || "STANDARD",
-            status: row.status || "pending",
-            from: parseMaybeJsonObject(row.origin_location)?.address || "Origin",
-            to: parseMaybeJsonObject(row.destination_location)?.address || null,
-            driver: row.driver_name || "Driver Not Assigned",
-            vehicle: row.vehicle_type || "van",
-            departureTime: row.created_at || null,
-            stops: [],
-            route_path: [],
-            routePath: []
-          }));
+        // As a definitive fallback, override with the most recent delivery_routes (any status)
+        // only when we still have nothing to show.
+        if (pendingRoutes.length === 0) {
+          const recentDelivery = await pool.query(
+            `SELECT 
+                route_id AS route_id,
+                route_name,
+                route_type,
+                status,
+                driver_name,
+                vehicle_type,
+                created_at,
+                origin_location,
+                destination_location,
+                total_distance_km,
+                estimated_duration_minutes,
+                estimated_fuel_consumption_liters,
+                estimated_carbon_kg
+             FROM delivery_routes
+             ORDER BY created_at DESC
+             LIMIT 20`
+          );
+          if (recentDelivery.rows.length > 0) {
+            pendingRoutes = recentDelivery.rows.map((row) => ({
+              route_id: row.route_id,
+              routeId: row.route_id,
+              route_number: row.route_id,
+              route_code: row.route_name || (row.route_id ? `Route-${row.route_id}` : null),
+              route_name: row.route_name,
+              routeType: row.route_type || "STANDARD",
+              route_type: row.route_type || "STANDARD",
+              status: row.status || "pending",
+              from: parseMaybeJsonObject(row.origin_location)?.address || "Origin",
+              to: parseMaybeJsonObject(row.destination_location)?.address || null,
+              driver: row.driver_name || "Driver Not Assigned",
+              vehicle: row.vehicle_type || "van",
+              departureTime: row.created_at || null,
+              stops: [],
+              route_path: [],
+              routePath: []
+            }));
+          }
         }
       }
     } catch (mergeErrOuter) {
