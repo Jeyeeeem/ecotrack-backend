@@ -230,7 +230,7 @@ async function getLogisticsDbSnapshot(routeIdOrCandidates) {
                 inv.expected_expiry_date,
                 p.product_name AS product_name,
                 p.storage_category,
-                p.perishable,
+                  NULL::boolean AS perishable,
                 p.image_url
          FROM delivery_items di
          LEFT JOIN inventory inv ON inv.inventory_id = di.inventory_id
@@ -2227,7 +2227,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
                   inv.expected_expiry_date,
                   p.product_name AS product_name,
                   p.storage_category,
-                  p.perishable,
+                  NULL::boolean AS perishable,
                   p.image_url
            FROM delivery_items di
            LEFT JOIN inventory inv ON inv.inventory_id = di.inventory_id
@@ -2836,7 +2836,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
                   inv.expected_expiry_date,
                   p.product_name AS product_name,
                   p.storage_category,
-                  p.perishable,
+                  NULL::boolean AS perishable,
                   p.image_url
            FROM delivery_items di
            LEFT JOIN inventory inv ON inv.inventory_id = di.inventory_id
@@ -4211,7 +4211,7 @@ app.get("/api/logistics/route/:routeId", async (req, res) => {
                   inv.expected_expiry_date,
                   p.product_name AS product_name,
                   p.storage_category,
-                  p.perishable,
+                  NULL::boolean AS perishable,
                   p.image_url
            FROM delivery_items di
            LEFT JOIN inventory inv ON inv.inventory_id = di.inventory_id
