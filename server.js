@@ -2180,8 +2180,11 @@ async function buildLogisticsRoutePayload(row, options = {}) {
   let optimizationSavings = parseMaybeJsonObject(optimization.savings);
   let requestOptimizationSavings = parseMaybeJsonObject(requestOptimization.savings);
   let optimizationDataSavings = parseMaybeJsonObject(optimizationData.savings);
+  const numericFromParams =
+    routeIdFromParams && String(routeIdFromParams).match(/\\d+/) ? String(routeIdFromParams).match(/\\d+/)[0] : null;
   const baseRouteIdCandidates = [
     routeIdFromParams,
+    numericFromParams,
     row.route_id,
     row.route_name,
     row.related_record_id,
@@ -4178,6 +4181,10 @@ app.get("/api/logistics/route/:routeId", async (req, res) => {
     const hasDeliveryRoutes = true; // attempt delivery_routes even if to_regclass fails
 
     let row = null;
+    const numericRouteId = (() => {
+      const m = String(routeId || "").match(/\\d+/);
+      return m && m[0] ? m[0] : null;
+    })();
     if (hasDeliveryRoutes) {
       const deliveryResult = await pool.query(
         `SELECT *
@@ -4188,6 +4195,19 @@ app.get("/api/logistics/route/:routeId", async (req, res) => {
         [routeId]
       );
       row = deliveryResult.rows[0] || null;
+
+      // Fallback: match numeric portion against route_id
+      if (!row && numericRouteId) {
+        const deliveryNumResult = await pool.query(
+          `SELECT *
+           FROM delivery_routes
+           WHERE route_id = $1
+           ORDER BY created_at DESC NULLS LAST
+           LIMIT 1`,
+          [numericRouteId]
+        );
+        row = deliveryNumResult.rows[0] || null;
+      }
     }
 
     if (!row && canUseManagerRouteData) {
@@ -4230,6 +4250,18 @@ app.get("/api/logistics/route/:routeId", async (req, res) => {
         [routeId]
       );
       row = routeResult.rows[0] || null;
+
+      if (!row && numericRouteId && routeApprovalColumns.has("route_id")) {
+        const routeNumResult = await pool.query(
+          `SELECT *
+           FROM route_approvals ra
+           WHERE ra.route_id = $1
+           ORDER BY ra.id DESC
+           LIMIT 1`,
+          [numericRouteId]
+        );
+        row = routeNumResult.rows[0] || null;
+      }
     }
 
     if (!row) {
