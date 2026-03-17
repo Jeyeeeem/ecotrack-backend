@@ -4220,6 +4220,7 @@ app.get("/api/logistics/route/:routeId", async (req, res) => {
            ORDER BY di.delivery_item_id ASC`,
           [ridInt]
         );
+        console.log("Cargo query for route", ridInt, "rows:", cargoRes.rowCount);
         const cargoMapped = cargoRes.rows.map((item) => ({
           delivery_item_id: item.delivery_item_id || null,
           inventory_id: item.inventory_id || null,
@@ -4241,6 +4242,8 @@ app.get("/api/logistics/route/:routeId", async (req, res) => {
             (sum, c) => sum + (toFiniteNumber(c.quantity) || 0),
             0
           );
+        } else {
+          console.log("Cargo mapped empty for route", ridInt);
         }
       }
     } catch (cargoErr) {
