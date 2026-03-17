@@ -4272,7 +4272,14 @@ app.get("/api/logistics/route/:routeId", async (req, res) => {
 
     // Ensure cargo is populated directly from delivery_items for this route_id
     try {
-      const ridInt = parseInt(route.routeId || route.route_id || routeId, 10);
+      const ridInt = (() => {
+        const candidates = [route.routeId, route.route_id, routeId];
+        for (const c of candidates) {
+          const m = String(c || "").match(/\\d+/);
+          if (m && Number.isFinite(parseInt(m[0], 10))) return parseInt(m[0], 10);
+        }
+        return NaN;
+      })();
       if (Number.isFinite(ridInt) && ridInt > 0) {
         const cargoRes = await pool.query(
           `SELECT di.delivery_item_id,
