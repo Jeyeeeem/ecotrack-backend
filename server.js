@@ -2179,21 +2179,23 @@ async function buildLogisticsRoutePayload(row, options = {}) {
   const deliveryLog = dbSnapshot.deliveryLog || null;
   const driverLocations = Array.isArray(dbSnapshot.driverLocations) ? dbSnapshot.driverLocations : [];
 
-    const routeIdCandidates = [
-      routeIdFromParams,
-      row.route_id,
-      row.related_record_id,
-      row.delivery_id,
-      row.id,
-      row.approval_id,
-      requestData.route_id,
-      routeData.route_id,
-      deliveryRoute?.route_id
-    ]
-      .map((v) => (v === undefined || v === null ? "" : String(v)))
-      .filter((v) => v.trim() !== "");
-    const routeIdRaw = routeIdCandidates.find((v) => v !== undefined && v !== null) || "";
-    const routeId = String(routeIdRaw || "");
+  const routeIdCandidates = [
+    routeIdFromParams,
+    row.route_id,
+    row.related_record_id,
+    row.delivery_id,
+    row.id,
+    row.approval_id,
+    requestData.route_id,
+    routeData.route_id,
+    deliveryRoute?.route_id
+  ]
+    .map((v) => (v === undefined || v === null ? "" : String(v)))
+    .filter((v) => v.trim() !== "");
+  let routeId = String(routeIdCandidates.find((v) => v) || "");
+  if (!routeId && deliveryRoute?.route_id != null) {
+    routeId = String(deliveryRoute.route_id);
+  }
   const routeOptimizationSnapshot = await getRouteOptimizationSnapshot(routeIdCandidates);
 
   // Some deployments store richer optimization data in manager_approvals.request_data/extra_data
@@ -3476,9 +3478,12 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
         "Logistics dashboard: payload mapping produced 0 routes; using minimal fallback from delivery_routes"
       );
       for (const row of pendingResult.rows) {
+        const rid = row.route_id ?? row.id ?? null;
         mappedPendingRoutes.push({
-          route_id: row.route_id || row.id || null,
-          routeId: row.route_id || row.id || null,
+          route_id: rid,
+          routeId: rid,
+          route_number: rid,
+          route_code: row.route_name || (rid ? `Route-${rid}` : null),
           route_name: row.route_name || null,
           routeType: row.route_type || "STANDARD",
           route_type: row.route_type || "STANDARD",
