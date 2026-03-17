@@ -3312,6 +3312,27 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
       };
     }
 
+    // Final fallback to delivery_routes when no approvals are present
+    if ((!pendingResult || pendingResult.rows.length === 0) && (await tableExists("delivery_routes"))) {
+      pendingResult = await pool.query(
+        `SELECT *
+         FROM delivery_routes
+         WHERE ${pendingRouteStatusPredicate}
+         ORDER BY created_at DESC
+         LIMIT 20`
+      );
+      statsResult = await pool.query(
+        `SELECT 
+          (SELECT COUNT(*) FROM delivery_routes WHERE ${pendingRouteStatusPredicate}) as pending_count,
+          (SELECT COUNT(*) FROM delivery_routes WHERE UPPER(COALESCE(status, '')) = 'APPROVED') as approved_count,
+          (SELECT COUNT(*) FROM delivery_routes WHERE UPPER(COALESCE(status, '')) = 'DECLINED') as declined_count,
+          COALESCE(AVG(estimated_carbon_kg), 0) as avg_co2_saved,
+          COALESCE(SUM(estimated_carbon_kg), 0) as total_co2_reduced,
+          COALESCE(SUM(total_distance_km), 0) as total_km_saved
+        FROM delivery_routes`
+      );
+    }
+
     // Keep route_approvals for aggregate counters, but preserve manager_approvals
     // rows when available so dashboard cards use the same optimization payload
     // that admin submitted.
@@ -3358,6 +3379,29 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
       statsResult = routeStatsResult;
       if (!canUseManagerRouteData || pendingResult.rows.length === 0) {
         pendingResult = routePendingResult;
+      }
+    }
+
+    // Fallback: delivery_routes when approvals tables are empty or missing required columns
+    if ((!pendingResult || pendingResult.rows.length === 0) && (await tableExists("delivery_routes"))) {
+      pendingResult = await pool.query(
+        `SELECT *
+         FROM delivery_routes
+         WHERE ${pendingRouteStatusPredicate}
+         ORDER BY created_at DESC
+         LIMIT 20`
+      );
+      if (!statsResult) {
+        statsResult = await pool.query(
+          `SELECT 
+            (SELECT COUNT(*) FROM delivery_routes WHERE ${pendingRouteStatusPredicate}) as pending_count,
+            (SELECT COUNT(*) FROM delivery_routes WHERE UPPER(COALESCE(status, '')) = 'APPROVED') as approved_count,
+            (SELECT COUNT(*) FROM delivery_routes WHERE UPPER(COALESCE(status, '')) = 'DECLINED') as declined_count,
+            COALESCE(AVG(estimated_carbon_kg), 0) as avg_co2_saved,
+            COALESCE(SUM(estimated_carbon_kg), 0) as total_co2_reduced,
+            COALESCE(SUM(total_distance_km), 0) as total_km_saved
+           FROM delivery_routes`
+        );
       }
     }
 
