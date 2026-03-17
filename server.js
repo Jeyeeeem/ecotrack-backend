@@ -140,6 +140,111 @@ async function getManagerApprovalsPkColumn() {
   }
 }
 
+// Lightweight table existence check with memoization
+const tableExistsCache = new Map();
+const TABLE_EXISTS_TTL_MS = 5 * 60 * 1000;
+async function tableExists(tableName) {
+  const key = String(tableName || "").toLowerCase();
+  const cached = tableExistsCache.get(key);
+  const now = Date.now();
+  if (cached && now - cached.checkedAt < TABLE_EXISTS_TTL_MS) return cached.exists;
+  try {
+    const result = await pool.query(`SELECT to_regclass($1) AS tbl`, [`public.${key}`]);
+    const exists = !!result.rows[0]?.tbl;
+    tableExistsCache.set(key, { exists, checkedAt: now });
+    return exists;
+  } catch (e) {
+    tableExistsCache.set(key, { exists: false, checkedAt: now });
+    return false;
+  }
+}
+
+// Pull authoritative logistics data directly from core tables (no schema change)
+async function getLogisticsDbSnapshot(routeId) {
+  const snapshot = { route: null, stops: [], cargo: [], deliveryLog: null, driverLocations: [] };
+  if (!routeId) return snapshot;
+
+  try {
+    if (await tableExists("delivery_routes")) {
+      const routeRes = await pool.query(
+        `SELECT * FROM delivery_routes WHERE route_id::text = $1 LIMIT 1`,
+        [routeId]
+      );
+      snapshot.route = routeRes.rows[0] || null;
+    }
+  } catch (_) {}
+
+  try {
+    if (await tableExists("route_stops")) {
+      const stopsRes = await pool.query(
+        `SELECT stop_id, stop_sequence, location, location_name, address, latitude, longitude,
+                planned_arrival_time, actual_arrival_time, planned_departure_time, actual_departure_time, notes
+         FROM route_stops
+         WHERE route_id::text = $1
+         ORDER BY stop_sequence ASC`,
+        [routeId]
+      );
+      snapshot.stops = stopsRes.rows || [];
+    }
+  } catch (_) {}
+
+  try {
+    if (await tableExists("delivery_items")) {
+      const cargoRes = await pool.query(
+        `SELECT di.delivery_item_id,
+                di.quantity_to_deliver,
+                di.inventory_id,
+                inv.unit_of_measure,
+                inv.quantity,
+                inv.product_id,
+                inv.unit_price_at_entry,
+                inv.total_value,
+                p.name AS product_name,
+                p.storage_category,
+                p.perishable,
+                p.image_url
+         FROM delivery_items di
+         LEFT JOIN inventory inv ON inv.inventory_id = di.inventory_id
+         LEFT JOIN products p ON p.product_id = inv.product_id
+         WHERE di.route_id::text = $1
+         ORDER BY di.delivery_item_id ASC`,
+        [routeId]
+      );
+      snapshot.cargo = cargoRes.rows || [];
+    }
+  } catch (_) {}
+
+  try {
+    if (await tableExists("delivery_logs")) {
+      const logRes = await pool.query(
+        `SELECT *
+         FROM delivery_logs
+         WHERE route_id::text = $1
+         ORDER BY delivery_date DESC NULLS LAST, created_at DESC NULLS LAST
+         LIMIT 1`,
+        [routeId]
+      );
+      snapshot.deliveryLog = logRes.rows[0] || null;
+    }
+  } catch (_) {}
+
+  try {
+    if (await tableExists("driver_locations")) {
+      const locRes = await pool.query(
+        `SELECT latitude, longitude, accuracy_m, speed_kmh, recorded_at
+         FROM driver_locations
+         WHERE route_id::text = $1
+         ORDER BY recorded_at DESC
+         LIMIT 50`,
+        [routeId]
+      );
+      snapshot.driverLocations = locRes.rows || [];
+    }
+  } catch (_) {}
+
+  return snapshot;
+}
+
 // ============================================================
 // AUTH ROUTES
 // ============================================================
@@ -2040,6 +2145,14 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     requestData.route_id,
     routeData.route_id
   ]);
+  const dbSnapshot = routeId
+    ? await getLogisticsDbSnapshot(routeId)
+    : { route: null, stops: [], cargo: [], deliveryLog: null, driverLocations: [] };
+  const deliveryRoute = dbSnapshot.route || null;
+  const routeStopsFromDb = Array.isArray(dbSnapshot.stops) ? dbSnapshot.stops : [];
+  const cargoFromDb = Array.isArray(dbSnapshot.cargo) ? dbSnapshot.cargo : [];
+  const deliveryLog = dbSnapshot.deliveryLog || null;
+  const driverLocations = Array.isArray(dbSnapshot.driverLocations) ? dbSnapshot.driverLocations : [];
 
   // Some deployments store richer optimization data in manager_approvals.request_data/extra_data
   // while route_approvals can contain zeros. Merge manager payload as fallback source-of-truth.
@@ -2108,6 +2221,22 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     optimizationDataSavings = { ...fallbackOptimizationDataSavings, ...optimizationDataSavings };
   }
 
+  // Enrich with authoritative delivery_routes data when present
+  if (deliveryRoute) {
+    const dbOriginLoc = parseMaybeJsonObject(deliveryRoute.origin_location);
+    const dbDestLoc = parseMaybeJsonObject(deliveryRoute.destination_location);
+    routeData = { ...deliveryRoute, ...routeData };
+    requestData = { ...routeData, ...requestData };
+    if (dbOriginLoc) {
+      requestData.origin_location = requestData.origin_location || dbOriginLoc;
+      routeData.origin_location = routeData.origin_location || dbOriginLoc;
+    }
+    if (dbDestLoc) {
+      requestData.destination_location = requestData.destination_location || dbDestLoc;
+      routeData.destination_location = routeData.destination_location || dbDestLoc;
+    }
+  }
+
   const fromLocation =
     row.from_location ||
     requestData.from_location ||
@@ -2140,6 +2269,12 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     stops = row.stops_json.map((stop, index) => {
       const base = normalizeLogisticsStop(stop, index);
       const point = extractLatLng(stop);
+      return point ? { ...base, latitude: point.latitude, longitude: point.longitude } : base;
+    });
+  } else if (Array.isArray(routeStopsFromDb) && routeStopsFromDb.length > 0) {
+    stops = routeStopsFromDb.map((stop, index) => {
+      const base = normalizeLogisticsStop(stop, index);
+      const point = extractLatLng(stop.location, stop);
       return point ? { ...base, latitude: point.latitude, longitude: point.longitude } : base;
     });
   } else if (Array.isArray(requestData.stops) && requestData.stops.length > 0) {
@@ -2531,10 +2666,51 @@ async function buildLogisticsRoutePayload(row, options = {}) {
       ? totalSavingsCO2
       : Math.max(finalOriginalCO2 - finalOptimizedCO2, 0);
 
+  const actualDistanceKm = toFiniteNumber(
+    deliveryLog?.actual_distance_km,
+    deliveryLog?.actual_distance
+  );
+  const actualDurationMinutes = toFiniteNumber(deliveryLog?.actual_duration_minutes);
+  const actualFuelLiters = toFiniteNumber(deliveryLog?.actual_fuel_used_liters);
+  const actualCarbonKg = toFiniteNumber(deliveryLog?.actual_carbon_kg);
+  const deliveryDate = deliveryLog?.delivery_date || null;
+
+  const cargoManifest = cargoFromDb.map((item) => {
+    const qty = toFiniteNumber(item.quantity_to_deliver, item.quantity);
+    return {
+      delivery_item_id: item.delivery_item_id || null,
+      inventory_id: item.inventory_id || null,
+      product_id: item.product_id || null,
+      product_name: item.product_name || "Unknown",
+      quantity: qty,
+      unit: item.unit_of_measure || "kg",
+      storage_category: item.storage_category || null,
+      perishable: !!item.perishable,
+      image_url: item.image_url || null,
+      value: toFiniteNumber(item.total_value) || null,
+      unit_price: toFiniteNumber(item.unit_price_at_entry) || null
+    };
+  });
+  const cargoTotalQty = cargoManifest.reduce(
+    (sum, item) => sum + (toFiniteNumber(item.quantity) || 0),
+    0
+  );
+
+  const routeName =
+    routeData.route_name ||
+    routeData.routeName ||
+    deliveryRoute?.route_name ||
+    (routeId ? `Route-${routeId}` : null);
+  const displayRouteCode = routeId ? `Route-${routeId}` : routeName;
+
   const submittedBy = row.submitted_by || row.requested_by || row.reviewed_by || "System";
   const payload = {
     route_id: routeId,
     routeId,
+    route_number: routeId,
+    route_code: displayRouteCode,
+    route_name: routeName,
+    routeName,
     route_type: row.route_type || requestData.route_type || routeData.route_type || row.product_name || "STANDARD",
     routeType: row.route_type || requestData.route_type || routeData.route_type || row.product_name || "STANDARD",
     from_location: fromLocation,
@@ -2601,11 +2777,19 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     original_stops: stops,
     optimized_stops: optimizationData.optimizedStops || optimization.optimizedStops || stops,
     optimized_path: routePath,
-    status: row.status || "PENDING",
+    status: row.status || deliveryRoute?.status || "PENDING",
     submitted_by: String(submittedBy),
     submittedBy: String(submittedBy),
     submitted_at: row.submitted_at || row.created_at || null,
-    submittedTime: row.submitted_at || row.created_at || null
+    submittedTime: row.submitted_at || row.created_at || null,
+    actual_distance_km: actualDistanceKm,
+    actual_duration_minutes: actualDurationMinutes,
+    actual_fuel_used_liters: actualFuelLiters,
+    actual_carbon_kg: actualCarbonKg,
+    delivery_date: deliveryDate,
+    cargo: cargoManifest,
+    cargo_total_quantity: cargoTotalQty,
+    driver_locations: driverLocations
   };
   return payload;
 }
