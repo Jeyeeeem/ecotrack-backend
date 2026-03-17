@@ -3213,7 +3213,7 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
       }
       pendingResult = await pool.query(
         `SELECT 
-            COALESCE(route_id, id) AS route_id,
+            route_id AS route_id,
             route_name,
             route_type,
             status,
@@ -3406,7 +3406,7 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
     if ((!pendingResult || pendingResult.rows.length === 0) && (await tableExists("delivery_routes"))) {
       pendingResult = await pool.query(
         `SELECT 
-            COALESCE(route_id, id) AS route_id,
+            route_id AS route_id,
             route_name,
             route_type,
             status,
@@ -3492,11 +3492,11 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
     if ((!pendingResult || pendingResult.rows.length === 0) && (await tableExists("delivery_routes"))) {
       pendingResult = await pool.query(
         `SELECT 
-            COALESCE(route_id, id) AS route_id,
-            route_name,
-            route_type,
-            status,
-            driver_name,
+          route_id AS route_id,
+          route_name,
+          route_type,
+          status,
+          driver_name,
             vehicle_type,
             created_at,
             departure_time,
