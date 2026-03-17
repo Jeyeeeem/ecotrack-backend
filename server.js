@@ -3173,10 +3173,17 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
     const managerColumns = hasManagerApprovals ? await getManagerApprovalsColumns() : new Set();
+    const managerHasRouteKeys =
+      managerColumns.has("route_id") ||
+      managerColumns.has("related_record_id") ||
+      managerColumns.has("delivery_id") ||
+      managerColumns.has("request_data") ||
+      managerColumns.has("extra_data");
     const canUseManagerRouteData =
       hasManagerApprovals &&
       managerColumns.has("approval_type") &&
-      managerColumns.has("status");
+      managerColumns.has("status") &&
+      managerHasRouteKeys;
     const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
 
     let pendingResult;
@@ -3712,10 +3719,17 @@ app.get("/api/logistics/route/:routeId", async (req, res) => {
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
     const managerColumns = hasManagerApprovals ? await getManagerApprovalsColumns() : new Set();
+    const managerHasRouteKeys =
+      managerColumns.has("route_id") ||
+      managerColumns.has("related_record_id") ||
+      managerColumns.has("delivery_id") ||
+      managerColumns.has("request_data") ||
+      managerColumns.has("extra_data");
     const canUseManagerRouteData =
       hasManagerApprovals &&
       managerColumns.has("approval_type") &&
-      managerColumns.has("status");
+      managerColumns.has("status") &&
+      managerHasRouteKeys;
     const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
     const routeApprovalColumns = hasRouteApprovals ? await getTableColumns("route_approvals") : new Set();
     const routeStopsTableCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
