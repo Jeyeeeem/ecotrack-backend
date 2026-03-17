@@ -3196,6 +3196,20 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
     let pendingResult;
     let statsResult;
 
+    const managerRowHasRoutePointer = (row) => {
+      if (!row) return false;
+      const requestData = row.request_data && typeof row.request_data === "object" ? row.request_data : {};
+      const extraData = row.extra_data && typeof row.extra_data === "object" ? row.extra_data : {};
+      const routeData = extraData.route && typeof extraData.route === "object" ? extraData.route : {};
+      return Boolean(
+        row.route_id ||
+        row.related_record_id ||
+        row.delivery_id ||
+        requestData.route_id ||
+        routeData.route_id
+      );
+    };
+
     if (canUseManagerRouteData) {
       const businessId = req.user?.businessId || req.user?.business_id || null;
       const pendingParams = [];
@@ -3240,6 +3254,16 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
         WHERE ${statsWhere}`,
         statsParams
       );
+
+      // Manager rows that do not point to a specific route confuse the dashboard; drop them so we can fall back.
+      if (pendingResult?.rows?.length) {
+        const filteredManagerRows = pendingResult.rows.filter(managerRowHasRoutePointer);
+        if (filteredManagerRows.length === 0) {
+          pendingResult = { rows: [] };
+        } else {
+          pendingResult.rows = filteredManagerRows;
+        }
+      }
 
       // Fallback: some deployments have manager_approvals table but logistics rows only exist in route_approvals.
       if (pendingResult.rows.length === 0 && hasRouteApprovals) {
@@ -3867,6 +3891,19 @@ app.get("/api/logistics/pending", async (req, res) => {
     let result;
     let usedManagerRows = false;
     if (canUseManagerRouteData) {
+      const managerRowHasRoutePointer = (row) => {
+        if (!row) return false;
+        const requestData = row.request_data && typeof row.request_data === "object" ? row.request_data : {};
+        const extraData = row.extra_data && typeof row.extra_data === "object" ? row.extra_data : {};
+        const routeData = extraData.route && typeof extraData.route === "object" ? extraData.route : {};
+        return Boolean(
+          row.route_id ||
+          row.related_record_id ||
+          row.delivery_id ||
+          requestData.route_id ||
+          routeData.route_id
+        );
+      };
       // Relax business scoping to avoid missing admin-submitted routes.
       const managerParams = [];
       let managerBusinessClause = "";
@@ -3885,6 +3922,17 @@ app.get("/api/logistics/pending", async (req, res) => {
         ORDER BY ma.created_at DESC
       `, managerParams);
       usedManagerRows = true;
+
+      // Manager rows must reference a route; otherwise force fallback to route_approvals.
+      if (result?.rows?.length) {
+        const filteredManagerRows = result.rows.filter(managerRowHasRoutePointer);
+        if (filteredManagerRows.length === 0) {
+          result = { rows: [] };
+          usedManagerRows = false;
+        } else {
+          result.rows = filteredManagerRows;
+        }
+      }
 
       // Fallback to route_approvals when manager_approvals has no logistics records.
       if (result.rows.length === 0 && hasRouteApprovals) {
