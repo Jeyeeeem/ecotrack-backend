@@ -2716,15 +2716,6 @@ async function buildLogisticsRoutePayload(row, options = {}) {
       ? totalSavingsCO2
       : Math.max(finalOriginalCO2 - finalOptimizedCO2, 0);
 
-  const actualDistanceKm = toFiniteNumber(
-    deliveryLog?.actual_distance_km,
-    deliveryLog?.actual_distance
-  );
-  const actualDurationMinutes = toFiniteNumber(deliveryLog?.actual_duration_minutes);
-  const actualFuelLiters = toFiniteNumber(deliveryLog?.actual_fuel_used_liters);
-  const actualCarbonKg = toFiniteNumber(deliveryLog?.actual_carbon_kg);
-  const deliveryDate = deliveryLog?.delivery_date || null;
-
   const cargoManifest = cargoFromDb.map((item) => {
     const qty = toFiniteNumber(item.quantity_to_deliver, item.quantity);
     return {
@@ -2834,11 +2825,6 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     submittedBy: String(submittedBy),
     submitted_at: row.submitted_at || row.created_at || null,
     submittedTime: row.submitted_at || row.created_at || null,
-    actual_distance_km: actualDistanceKm,
-    actual_duration_minutes: actualDurationMinutes,
-    actual_fuel_used_liters: actualFuelLiters,
-    actual_carbon_kg: actualCarbonKg,
-    delivery_date: deliveryDate,
     cargo: cargoManifest,
     cargo_total_quantity: cargoTotalQty,
     driver_locations: driverLocations
