@@ -159,86 +159,134 @@ async function tableExists(tableName) {
   }
 }
 
+const normalizeRouteIdCandidates = (routeId, extras = []) => {
+  const pushAll = (set, val) => {
+    if (val === undefined || val === null) return;
+    const s = String(val).trim();
+    if (s) set.add(s);
+  };
+  const candidates = new Set();
+  pushAll(candidates, routeId);
+  extras.forEach((v) => pushAll(candidates, v));
+  const expanded = new Set();
+  candidates.forEach((c) => {
+    pushAll(expanded, c);
+    pushAll(expanded, c.replace(/^(route[-_#:]*|rte[-_#:]*)/i, ""));
+    pushAll(expanded, c.replace(/\D+/g, ""));
+  });
+  return Array.from(expanded).filter(Boolean);
+};
+
 // Pull authoritative logistics data directly from core tables (no schema change)
-async function getLogisticsDbSnapshot(routeId) {
+async function getLogisticsDbSnapshot(routeIdOrCandidates) {
   const snapshot = { route: null, stops: [], cargo: [], deliveryLog: null, driverLocations: [] };
-  if (!routeId) return snapshot;
+  const candidates = normalizeRouteIdCandidates(routeIdOrCandidates, []);
+  if (candidates.length === 0) return snapshot;
 
   try {
     if (await tableExists("delivery_routes")) {
-      const routeRes = await pool.query(
-        `SELECT * FROM delivery_routes WHERE route_id::text = $1 LIMIT 1`,
-        [routeId]
-      );
-      snapshot.route = routeRes.rows[0] || null;
+      for (const candidate of candidates) {
+        const routeRes = await pool.query(
+          `SELECT * FROM delivery_routes 
+           WHERE route_id::text = $1 OR route_id = NULLIF($2, 0)
+           LIMIT 1`,
+          [candidate, Number(candidate) || 0]
+        );
+        if (routeRes.rows.length > 0) {
+          snapshot.route = routeRes.rows[0];
+          break;
+        }
+      }
     }
   } catch (_) {}
 
   try {
     if (await tableExists("route_stops")) {
-      const stopsRes = await pool.query(
-        `SELECT stop_id, stop_sequence, location, location_name, address, latitude, longitude,
-                planned_arrival_time, actual_arrival_time, planned_departure_time, actual_departure_time, notes
-         FROM route_stops
-         WHERE route_id::text = $1
-         ORDER BY stop_sequence ASC`,
-        [routeId]
-      );
-      snapshot.stops = stopsRes.rows || [];
+      for (const candidate of candidates) {
+        const stopsRes = await pool.query(
+          `SELECT stop_id, stop_sequence, location, location_name, address, latitude, longitude,
+                  planned_arrival_time, actual_arrival_time, planned_departure_time, actual_departure_time, notes
+           FROM route_stops
+           WHERE route_id::text = $1 OR route_id = NULLIF($2, 0)
+           ORDER BY stop_sequence ASC`,
+          [candidate, Number(candidate) || 0]
+        );
+        if (stopsRes.rows.length > 0) {
+          snapshot.stops = stopsRes.rows;
+          break;
+        }
+      }
     }
   } catch (_) {}
 
   try {
     if (await tableExists("delivery_items")) {
-      const cargoRes = await pool.query(
-        `SELECT di.delivery_item_id,
-                di.quantity_to_deliver,
-                di.inventory_id,
-                inv.unit_of_measure,
-                inv.quantity,
-                inv.product_id,
-                inv.unit_price_at_entry,
-                inv.total_value,
-                p.name AS product_name,
-                p.storage_category,
-                p.perishable,
-                p.image_url
-         FROM delivery_items di
-         LEFT JOIN inventory inv ON inv.inventory_id = di.inventory_id
-         LEFT JOIN products p ON p.product_id = inv.product_id
-         WHERE di.route_id::text = $1
-         ORDER BY di.delivery_item_id ASC`,
-        [routeId]
-      );
-      snapshot.cargo = cargoRes.rows || [];
+      for (const candidate of candidates) {
+        const cargoRes = await pool.query(
+          `SELECT di.delivery_item_id,
+                  di.quantity_to_deliver,
+                  di.inventory_id,
+                  inv.unit_of_measure,
+                  inv.quantity,
+                  inv.product_id,
+                  inv.unit_price_at_entry,
+                  inv.total_value,
+                  inv.batch_number,
+                  inv.expected_expiry_date,
+                  p.name AS product_name,
+                  p.storage_category,
+                  p.perishable,
+                  p.image_url
+           FROM delivery_items di
+           LEFT JOIN inventory inv ON inv.inventory_id = di.inventory_id
+           LEFT JOIN products p ON p.product_id = inv.product_id
+           WHERE di.route_id::text = $1 OR di.route_id = NULLIF($2, 0)
+           ORDER BY di.delivery_item_id ASC`,
+          [candidate, Number(candidate) || 0]
+        );
+        if (cargoRes.rows.length > 0) {
+          snapshot.cargo = cargoRes.rows;
+          break;
+        }
+      }
     }
   } catch (_) {}
 
   try {
     if (await tableExists("delivery_logs")) {
-      const logRes = await pool.query(
-        `SELECT *
-         FROM delivery_logs
-         WHERE route_id::text = $1
-         ORDER BY delivery_date DESC NULLS LAST, created_at DESC NULLS LAST
-         LIMIT 1`,
-        [routeId]
-      );
-      snapshot.deliveryLog = logRes.rows[0] || null;
+      for (const candidate of candidates) {
+        const logRes = await pool.query(
+          `SELECT *
+           FROM delivery_logs
+           WHERE route_id::text = $1 OR route_id = NULLIF($2, 0)
+           ORDER BY delivery_date DESC NULLS LAST, created_at DESC NULLS LAST
+           LIMIT 1`,
+          [candidate, Number(candidate) || 0]
+        );
+        if (logRes.rows.length > 0) {
+          snapshot.deliveryLog = logRes.rows[0];
+          break;
+        }
+      }
     }
   } catch (_) {}
 
   try {
     if (await tableExists("driver_locations")) {
-      const locRes = await pool.query(
-        `SELECT latitude, longitude, accuracy_m, speed_kmh, recorded_at
-         FROM driver_locations
-         WHERE route_id::text = $1
-         ORDER BY recorded_at DESC
-         LIMIT 50`,
-        [routeId]
-      );
-      snapshot.driverLocations = locRes.rows || [];
+      for (const candidate of candidates) {
+        const locRes = await pool.query(
+          `SELECT latitude, longitude, accuracy_m, speed_kmh, recorded_at
+           FROM driver_locations
+           WHERE route_id::text = $1 OR route_id = NULLIF($2, 0)
+           ORDER BY recorded_at DESC
+           LIMIT 50`,
+          [candidate, Number(candidate) || 0]
+        );
+        if (locRes.rows.length > 0) {
+          snapshot.driverLocations = locRes.rows;
+          break;
+        }
+      }
     }
   } catch (_) {}
 
@@ -2125,18 +2173,9 @@ async function buildLogisticsRoutePayload(row, options = {}) {
   let optimizationSavings = parseMaybeJsonObject(optimization.savings);
   let requestOptimizationSavings = parseMaybeJsonObject(requestOptimization.savings);
   let optimizationDataSavings = parseMaybeJsonObject(optimizationData.savings);
-  const routeIdRaw =
-    routeIdFromParams ||
-    row.route_id ||
-    row.related_record_id ||
-    row.delivery_id ||
-    row.id ||
-    row.approval_id ||
-    requestData.route_id ||
-    routeData.route_id;
-  const routeId = String(routeIdRaw || "");
-  const routeOptimizationSnapshot = await getRouteOptimizationSnapshot([
-    routeId,
+  const routeIdCandidates = [
+    deliveryRoute?.route_id,
+    routeIdFromParams,
     row.route_id,
     row.related_record_id,
     row.delivery_id,
@@ -2144,10 +2183,14 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     row.approval_id,
     requestData.route_id,
     routeData.route_id
-  ]);
-  const dbSnapshot = routeId
-    ? await getLogisticsDbSnapshot(routeId)
-    : { route: null, stops: [], cargo: [], deliveryLog: null, driverLocations: [] };
+  ].filter((v) => v !== undefined && v !== null && String(v).trim() !== "");
+  const routeIdRaw = routeIdCandidates.find((v) => v !== undefined && v !== null) || "";
+  const routeId = String(routeIdRaw || "");
+  const routeOptimizationSnapshot = await getRouteOptimizationSnapshot(routeIdCandidates);
+  const dbSnapshot =
+    routeIdCandidates.length > 0
+      ? await getLogisticsDbSnapshot(routeIdCandidates)
+      : { route: null, stops: [], cargo: [], deliveryLog: null, driverLocations: [] };
   const deliveryRoute = dbSnapshot.route || null;
   const routeStopsFromDb = Array.isArray(dbSnapshot.stops) ? dbSnapshot.stops : [];
   const cargoFromDb = Array.isArray(dbSnapshot.cargo) ? dbSnapshot.cargo : [];
@@ -2688,7 +2731,9 @@ async function buildLogisticsRoutePayload(row, options = {}) {
       perishable: !!item.perishable,
       image_url: item.image_url || null,
       value: toFiniteNumber(item.total_value) || null,
-      unit_price: toFiniteNumber(item.unit_price_at_entry) || null
+      unit_price: toFiniteNumber(item.unit_price_at_entry) || null,
+      batch_number: item.batch_number || null,
+      expected_expiry_date: item.expected_expiry_date || null
     };
   });
   const cargoTotalQty = cargoManifest.reduce(
