@@ -3108,6 +3108,8 @@ const fetchDriverMonitorRows = async (businessId = null) => {
     try {
       const deliveriesTableCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
       const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
+      const deliveryRoutesTableCheck = await pool.query(`SELECT to_regclass('public.delivery_routes') AS tbl`);
+      const hasDeliveryRoutes = !!deliveryRoutesTableCheck.rows[0]?.tbl;
       if (hasDeliveries) {
         const deliveriesColumns = await getTableColumns("deliveries");
         const statusExpr = deliveriesColumns.has("status") ? "LOWER(COALESCE(d.status,''))" : "''";
@@ -3690,6 +3692,23 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
 
     // Fallback: count delivery assignments as approved progress for logistics dashboard.
     try {
+      // Keep delivery_routes in sync so the route drops out of pending and shows as approved/assigned
+      if (hasDeliveryRoutes && resolvedRouteId) {
+        try {
+          await pool.query(
+            `UPDATE delivery_routes
+             SET status = 'approved',
+                 driver_name = COALESCE($1, driver_name),
+                 driver_user_id = COALESCE($2, driver_user_id),
+                 updated_at = NOW()
+             WHERE route_id::text = $3`,
+            [assignedDriver, selectedDriverId, String(resolvedRouteId)]
+          );
+        } catch (deliveryRouteErr) {
+          console.warn("delivery_routes sync after approve failed:", deliveryRouteErr.message);
+        }
+      }
+
       const deliveriesTableCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
       const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
       if (hasDeliveries) {
