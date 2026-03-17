@@ -2216,6 +2216,44 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     }
   }
 
+  // One more direct cargo fetch using any numeric route id candidate.
+  if (cargoFromDb.length === 0 && routeIdCandidates.length > 0 && (await tableExists("delivery_items"))) {
+    try {
+      const numericIds = routeIdCandidates
+        .map((c) => parseInt(String(c).replace(/\D+/g, ""), 10))
+        .filter((n) => Number.isFinite(n) && n > 0);
+      if (numericIds.length > 0) {
+        const placeholders = numericIds.map((_, idx) => `$${idx + 1}`).join(", ");
+        const cargoRes = await pool.query(
+          `SELECT di.delivery_item_id,
+                  di.quantity_to_deliver,
+                  di.inventory_id,
+                  inv.unit_of_measure,
+                  inv.quantity,
+                  inv.product_id,
+                  inv.unit_price_at_entry,
+                  inv.total_value,
+                  inv.batch_number,
+                  inv.expected_expiry_date,
+                  p.name AS product_name,
+                  p.storage_category,
+                  p.perishable,
+                  p.image_url
+           FROM delivery_items di
+           LEFT JOIN inventory inv ON inv.inventory_id = di.inventory_id
+           LEFT JOIN products p ON p.product_id = inv.product_id
+           WHERE di.route_id = ANY(ARRAY[${placeholders}]::int[])`,
+          numericIds
+        );
+        if (cargoRes.rows.length > 0) {
+          cargoFromDb = cargoRes.rows;
+        }
+      }
+    } catch (cargoErr) {
+      console.warn("Logistics cargo direct fetch failed:", cargoErr.message);
+    }
+  }
+
   // Some deployments store richer optimization data in manager_approvals.request_data/extra_data
   // while route_approvals can contain zeros. Merge manager payload as fallback source-of-truth.
   let managerFallbackRow = null;
