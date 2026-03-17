@@ -5472,7 +5472,7 @@ app.post("/api/logistics/approve", async (req, res) => {
       const routeIdParam = String(routeId || "");
       await pool.query(
         `UPDATE manager_approvals
-         SET status = LOWER($1), manager_comment = $2, decision_notes = $2, reviewed_at = NOW()${managerUpdatedAtClause}
+         SET status = LOWER($1::text), manager_comment = $2, decision_notes = $2, reviewed_at = NOW()${managerUpdatedAtClause}
          WHERE approval_type = 'route_optimization'
            AND (${managerMatchClauses.join(" OR ")})`,
         [status, decisionComment, routeIdParam]
@@ -5485,7 +5485,7 @@ app.post("/api/logistics/approve", async (req, res) => {
         : "id::text = $3";
       for (const raId of routeApprovalUpdates) {
         await pool.query(
-          `UPDATE route_approvals SET status = $1, manager_comment = $2, approved_at = CASE WHEN $1 = 'APPROVED' THEN NOW() ELSE approved_at END WHERE ${whereClause}`,
+          `UPDATE route_approvals SET status = $1::text, manager_comment = $2, approved_at = CASE WHEN $1 = 'APPROVED' THEN NOW() ELSE approved_at END WHERE ${whereClause}`,
           [status, decisionComment, String(raId)]
         );
       }
@@ -5493,7 +5493,7 @@ app.post("/api/logistics/approve", async (req, res) => {
       // fallback: legacy manager_approvals table only
       await pool.query(
         `UPDATE manager_approvals
-         SET status = LOWER($1), manager_comment = $2, decision_notes = $2, reviewed_at = NOW()${managerUpdatedAtClause}
+         SET status = LOWER($1::text), manager_comment = $2, decision_notes = $2, reviewed_at = NOW()${managerUpdatedAtClause}
          WHERE ${managerPkCol} = $3`,
         [status, decisionComment, routeId]
       );
