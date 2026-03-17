@@ -4321,6 +4321,25 @@ app.get("/api/logistics/route/:routeId", async (req, res) => {
         } else {
           console.log("Cargo mapped empty for route", ridInt);
         }
+
+        // Refresh stops directly from route_stops to avoid missing waypoints on details screen
+        const rsCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
+        if (rsCheck.rows[0]?.tbl) {
+          const stopsRes = await pool.query(
+            `SELECT stop_sequence, location_name, address, latitude, longitude
+             FROM route_stops
+             WHERE route_id = $1
+             ORDER BY stop_sequence ASC`,
+            [ridInt]
+          );
+          if (stopsRes.rows.length > 0) {
+            route.stops = stopsRes.rows.map((stop, index) => {
+              const base = normalizeLogisticsStop(stop, index);
+              const point = extractLatLng(stop);
+              return point ? { ...base, latitude: point.latitude, longitude: point.longitude } : base;
+            });
+          }
+        }
       }
     } catch (cargoErr) {
       console.warn("Route details cargo fetch failed:", cargoErr.message);
