@@ -3463,6 +3463,30 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
         console.error("Logistics payload build error for row", row?.route_id || row?.id || "unknown", mapErr.message);
       }
     }
+    // If mapping failed for all rows, provide a minimal fallback so UI still shows pending items.
+    if (mappedPendingRoutes.length === 0 && pendingResult.rows.length > 0) {
+      console.warn(
+        "Logistics dashboard: payload mapping produced 0 routes; using minimal fallback from delivery_routes"
+      );
+      for (const row of pendingResult.rows) {
+        mappedPendingRoutes.push({
+          route_id: row.route_id || row.id || null,
+          routeId: row.route_id || row.id || null,
+          route_name: row.route_name || null,
+          routeType: row.route_type || "STANDARD",
+          route_type: row.route_type || "STANDARD",
+          status: row.status || "pending",
+          from: row.from_location || "Origin",
+          to: row.to_location || null,
+          driver: row.driver_name || "Unassigned",
+          vehicle: row.vehicle_type || "Van",
+          departureTime: row.departure_time || row.created_at || null,
+          stops: [],
+          route_path: [],
+          routePath: []
+        });
+      }
+    }
     const pendingRouteMap = new Map();
     for (const route of mappedPendingRoutes) {
       const key = `${route.routeId || route.route_id}`;
