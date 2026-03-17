@@ -3528,7 +3528,28 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
     for (const row of pendingResult.rows) {
       try {
         const route = await buildLogisticsRoutePayload(row, { hasRouteStops });
-        if (route) mappedPendingRoutes.push(route);
+        if (route) {
+          // Ensure a usable route identifier even when source tables miss route_id.
+          let rid =
+            route.routeId ||
+            route.route_id ||
+            row.route_id ||
+            row.id ||
+            row.approval_id ||
+            row.delivery_id ||
+            null;
+          if (!rid && (route.route_name || row.route_name)) {
+            const m = String(route.route_name || row.route_name).match(/(\d[\d-]*)$/);
+            if (m && m[1]) rid = m[1].replace(/[^0-9]/g, "");
+          }
+          if (rid) {
+            route.routeId = rid;
+            route.route_id = rid;
+            route.route_number = route.route_number || rid;
+            route.route_code = route.route_code || route.route_name || (rid ? `Route-${rid}` : null);
+          }
+          mappedPendingRoutes.push(route);
+        }
       } catch (mapErr) {
         console.error("Logistics payload build error for row", row?.route_id || row?.id || "unknown", mapErr.message);
       }
