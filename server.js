@@ -2182,6 +2182,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
   const routeIdCandidates = [
     routeIdFromParams,
     row.route_id,
+    row.route_name,
     row.related_record_id,
     row.delivery_id,
     row.id,
@@ -2193,6 +2194,10 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     .map((v) => (v === undefined || v === null ? "" : String(v)))
     .filter((v) => v.trim() !== "");
   let routeId = String(routeIdCandidates.find((v) => v) || "");
+  if (!routeId && row.route_name) {
+    const m = String(row.route_name).match(/(\d[\d-]*)$/);
+    if (m && m[1]) routeId = m[1].replace(/[^0-9]/g, "");
+  }
   if (!routeId && deliveryRoute?.route_id != null) {
     routeId = String(deliveryRoute.route_id);
   }
@@ -3510,7 +3515,11 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
         "Logistics dashboard: payload mapping produced 0 routes; using minimal fallback from delivery_routes"
       );
       for (const row of pendingResult.rows) {
-        const rid = row.route_id ?? row.id ?? null;
+        let rid = row.route_id ?? row.id ?? null;
+        if (!rid && row.route_name) {
+          const m = String(row.route_name).match(/(\d[\d-]*)$/);
+          if (m && m[1]) rid = m[1].replace(/[^0-9]/g, "");
+        }
         mappedPendingRoutes.push({
           route_id: rid,
           routeId: rid,
