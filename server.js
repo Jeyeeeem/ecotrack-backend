@@ -5304,7 +5304,10 @@ app.post("/api/logistics/approve", async (req, res) => {
               optimizationData.optimizedCarbon
             );
 
-            const numericRouteId = Number(resolvedRouteId);
+            const numericRouteId = (() => {
+              const m = String(resolvedRouteId || "").match(/\\d+/);
+              return m ? Number(m[0]) : NaN;
+            })();
             if (!Number.isNaN(numericRouteId)) {
               const businessId =
                 routeRow?.business_id ||
