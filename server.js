@@ -2173,8 +2173,13 @@ async function buildLogisticsRoutePayload(row, options = {}) {
   let optimizationSavings = parseMaybeJsonObject(optimization.savings);
   let requestOptimizationSavings = parseMaybeJsonObject(requestOptimization.savings);
   let optimizationDataSavings = parseMaybeJsonObject(optimizationData.savings);
+  const deliveryRoute = dbSnapshot.route || null;
+  const routeStopsFromDb = Array.isArray(dbSnapshot.stops) ? dbSnapshot.stops : [];
+  const cargoFromDb = Array.isArray(dbSnapshot.cargo) ? dbSnapshot.cargo : [];
+  const deliveryLog = dbSnapshot.deliveryLog || null;
+  const driverLocations = Array.isArray(dbSnapshot.driverLocations) ? dbSnapshot.driverLocations : [];
+
   const routeIdCandidates = [
-    deliveryRoute?.route_id,
     routeIdFromParams,
     row.route_id,
     row.related_record_id,
@@ -2182,20 +2187,12 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     row.id,
     row.approval_id,
     requestData.route_id,
-    routeData.route_id
+    routeData.route_id,
+    deliveryRoute?.route_id
   ].filter((v) => v !== undefined && v !== null && String(v).trim() !== "");
   const routeIdRaw = routeIdCandidates.find((v) => v !== undefined && v !== null) || "";
   const routeId = String(routeIdRaw || "");
   const routeOptimizationSnapshot = await getRouteOptimizationSnapshot(routeIdCandidates);
-  const dbSnapshot =
-    routeIdCandidates.length > 0
-      ? await getLogisticsDbSnapshot(routeIdCandidates)
-      : { route: null, stops: [], cargo: [], deliveryLog: null, driverLocations: [] };
-  const deliveryRoute = dbSnapshot.route || null;
-  const routeStopsFromDb = Array.isArray(dbSnapshot.stops) ? dbSnapshot.stops : [];
-  const cargoFromDb = Array.isArray(dbSnapshot.cargo) ? dbSnapshot.cargo : [];
-  const deliveryLog = dbSnapshot.deliveryLog || null;
-  const driverLocations = Array.isArray(dbSnapshot.driverLocations) ? dbSnapshot.driverLocations : [];
 
   // Some deployments store richer optimization data in manager_approvals.request_data/extra_data
   // while route_approvals can contain zeros. Merge manager payload as fallback source-of-truth.
