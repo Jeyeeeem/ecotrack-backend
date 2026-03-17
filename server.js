@@ -3640,6 +3640,22 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
       }
     }
 
+    // Final guard: never return null route ids to the client.
+    pendingRoutes = pendingRoutes.map((route, idx) => {
+      let rid =
+        route.routeId ||
+        route.route_id ||
+        route.route_number ||
+        route.route_code ||
+        (route.departureTime ? `pending-${new Date(route.departureTime).getTime()}` : null) ||
+        `pending-${idx + 1}`;
+      route.routeId = rid;
+      route.route_id = rid;
+      route.route_number = route.route_number || rid;
+      route.route_code = route.route_code || route.route_name || (rid ? `Route-${rid}` : rid);
+      return route;
+    });
+
     // Keep pendingRoutes strictly pending; All Routes screen already falls back to history.
 
     res.json({
