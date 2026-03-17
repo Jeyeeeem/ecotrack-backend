@@ -5094,6 +5094,7 @@ app.post("/api/logistics/approve", async (req, res) => {
     const managerUpdatedAtClause = managerColumns.has("updated_at") ? ", updated_at = NOW()" : "";
     const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
+    const routeApprovalColumns = hasRouteApprovals ? await getTableColumns("route_approvals") : new Set();
     let managerApprovalRow = null;
     let originalManagerStatus = null;
     let resolvedRouteId = routeId;
@@ -5479,7 +5480,7 @@ app.post("/api/logistics/approve", async (req, res) => {
     }
 
     if (hasRouteApprovals && routeApprovalUpdates.size > 0) {
-      const whereClause = routeApprovalColumnsApprove.has("route_id")
+      const whereClause = routeApprovalColumns.has("route_id")
         ? "id::text = $3 OR COALESCE(route_id::text, '') = $3"
         : "id::text = $3";
       for (const raId of routeApprovalUpdates) {
