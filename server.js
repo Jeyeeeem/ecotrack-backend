@@ -5120,6 +5120,7 @@ app.post("/api/logistics/approve", async (req, res) => {
     let resolvedRouteId = routeId;
     let routeRow = null;
     const routeApprovalUpdates = new Set();
+    const routeApprovalKeys = new Set();
 
     if (hasManagerApprovals) {
       const routeIdParam = String(routeId || "");
@@ -5170,6 +5171,14 @@ app.post("/api/logistics/approve", async (req, res) => {
           [resolvedRouteId]
         );
         routeRow = routeByRouteId.rows[0] || null;
+      }
+      if (routeRow) {
+        if (routeRow.id !== undefined && routeRow.id !== null) {
+          routeApprovalKeys.add(String(routeRow.id));
+        }
+        if (routeRow.route_id !== undefined && routeRow.route_id !== null) {
+          routeApprovalKeys.add(String(routeRow.route_id));
+        }
       }
     }
 
@@ -5532,14 +5541,21 @@ app.post("/api/logistics/approve", async (req, res) => {
       }
     }
 
-    if (hasRouteApprovals && routeApprovalUpdates.size > 0) {
-      const whereClause = routeApprovalColumns.has("route_id")
-        ? "id::text = $3 OR COALESCE(route_id::text, '') = $3"
-        : "id::text = $3";
-      for (const raId of routeApprovalUpdates) {
+    // Aggregate all possible route approval keys and persist status
+    if (hasRouteApprovals) {
+      for (const raId of routeApprovalUpdates) routeApprovalKeys.add(String(raId));
+      if (routeApprovalKeys.size > 0) {
+        const keysArray = Array.from(routeApprovalKeys);
+        const whereClause = routeApprovalColumns.has("route_id")
+          ? "(id::text = ANY($3) OR route_id::text = ANY($3))"
+          : "id::text = ANY($3)";
         await pool.query(
-          `UPDATE route_approvals SET status = $1::text, manager_comment = $2, approved_at = CASE WHEN $1 = 'APPROVED' THEN NOW() ELSE approved_at END WHERE ${whereClause}`,
-          [status, decisionComment, String(raId)]
+          `UPDATE route_approvals
+           SET status = $1::text,
+               manager_comment = $2,
+               approved_at = CASE WHEN $1 = 'APPROVED' THEN NOW() ELSE approved_at END
+           WHERE ${whereClause}`,
+          [status, decisionComment, keysArray]
         );
       }
     } else if (!hasManagerApprovals) {
