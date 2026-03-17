@@ -3398,14 +3398,14 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
       pendingResult = await pool.query(
         `SELECT *
          FROM delivery_routes
-         WHERE ${pendingRouteStatusPredicate}
+         WHERE ${deliveryRouteStatusPredicate}
          ORDER BY created_at DESC
          LIMIT 20`
       );
       if (!statsResult) {
         statsResult = await pool.query(
           `SELECT 
-            (SELECT COUNT(*) FROM delivery_routes WHERE ${pendingRouteStatusPredicate}) as pending_count,
+            (SELECT COUNT(*) FROM delivery_routes WHERE ${deliveryRouteStatusPredicate}) as pending_count,
             (SELECT COUNT(*) FROM delivery_routes WHERE UPPER(COALESCE(status, '')) = 'APPROVED') as approved_count,
             (SELECT COUNT(*) FROM delivery_routes WHERE UPPER(COALESCE(status, '')) = 'DECLINED') as declined_count,
             COALESCE(AVG(estimated_carbon_kg), 0) as avg_co2_saved,
