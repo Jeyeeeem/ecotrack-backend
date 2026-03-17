@@ -228,7 +228,7 @@ async function getLogisticsDbSnapshot(routeIdOrCandidates) {
                 inv.total_value,
                 inv.batch_number,
                 inv.expected_expiry_date,
-                p.name AS product_name,
+                p.product_name AS product_name,
                 p.storage_category,
                 p.perishable,
                 p.image_url
@@ -2225,7 +2225,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
                   inv.total_value,
                   inv.batch_number,
                   inv.expected_expiry_date,
-                  p.name AS product_name,
+                  p.product_name AS product_name,
                   p.storage_category,
                   p.perishable,
                   p.image_url
@@ -2834,7 +2834,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
                   inv.total_value,
                   inv.batch_number,
                   inv.expected_expiry_date,
-                  p.name AS product_name,
+                  p.product_name AS product_name,
                   p.storage_category,
                   p.perishable,
                   p.image_url
@@ -4209,7 +4209,7 @@ app.get("/api/logistics/route/:routeId", async (req, res) => {
                   inv.total_value,
                   inv.batch_number,
                   inv.expected_expiry_date,
-                  p.name AS product_name,
+                  p.product_name AS product_name,
                   p.storage_category,
                   p.perishable,
                   p.image_url
