@@ -2173,13 +2173,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
   let optimizationSavings = parseMaybeJsonObject(optimization.savings);
   let requestOptimizationSavings = parseMaybeJsonObject(requestOptimization.savings);
   let optimizationDataSavings = parseMaybeJsonObject(optimizationData.savings);
-  const deliveryRoute = dbSnapshot.route || null;
-  const routeStopsFromDb = Array.isArray(dbSnapshot.stops) ? dbSnapshot.stops : [];
-  const cargoFromDb = Array.isArray(dbSnapshot.cargo) ? dbSnapshot.cargo : [];
-  const deliveryLog = dbSnapshot.deliveryLog || null;
-  const driverLocations = Array.isArray(dbSnapshot.driverLocations) ? dbSnapshot.driverLocations : [];
-
-  const routeIdCandidates = [
+  const baseRouteIdCandidates = [
     routeIdFromParams,
     row.route_id,
     row.route_name,
@@ -2188,9 +2182,16 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     row.id,
     row.approval_id,
     requestData.route_id,
-    routeData.route_id,
-    deliveryRoute?.route_id
-  ]
+    routeData.route_id
+  ];
+  const dbSnapshot = await getLogisticsDbSnapshot(baseRouteIdCandidates);
+  const deliveryRoute = dbSnapshot.route || null;
+  const routeStopsFromDb = Array.isArray(dbSnapshot.stops) ? dbSnapshot.stops : [];
+  const cargoFromDb = Array.isArray(dbSnapshot.cargo) ? dbSnapshot.cargo : [];
+  const deliveryLog = dbSnapshot.deliveryLog || null;
+  const driverLocations = Array.isArray(dbSnapshot.driverLocations) ? dbSnapshot.driverLocations : [];
+
+  const routeIdCandidates = [...baseRouteIdCandidates, deliveryRoute?.route_id]
     .map((v) => (v === undefined || v === null ? "" : String(v)))
     .filter((v) => v.trim() !== "");
   let routeId = String(routeIdCandidates.find((v) => v) || "");
@@ -3143,28 +3144,17 @@ const fetchRouteOptimizationStats = async () => {
 app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
   try {
     const businessId = req.user?.businessId || req.user?.business_id || null;
+    const pendingDeliveryStatuses = ["pending", "awaiting_approval", "planned", "assigned_to_driver"];
     const pendingRouteStatusPredicate = `
       (
-        UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g')) LIKE '%PEND%'
-        OR UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g')) LIKE '%AWAIT%'
-        OR UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g')) LIKE '%REVIEW%'
-        OR UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g')) LIKE '%SUBMIT%'
-        OR (
-          approved_at IS NULL
-          AND UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g'))
-              NOT IN ('APPROVED', 'DECLINED', 'REJECTED', 'CANCELLED', 'COMPLETED', 'SUPERSEDED')
-        )
-      )
-    `;
-    // Delivery_routes does not have approved_at column; use a predicate that only touches status.
-    const deliveryRouteStatusPredicate = `
-      (
-        UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g')) LIKE '%PEND%'
+        LOWER(COALESCE(status, '')) IN ('pending', 'awaiting_approval', 'planned', 'assigned_to_driver')
+        OR UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g')) LIKE '%PEND%'
         OR UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g')) LIKE '%AWAIT%'
         OR UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g')) LIKE '%REVIEW%'
         OR UPPER(REGEXP_REPLACE(COALESCE(status, ''), '[^A-Za-z0-9]+', '_', 'g')) LIKE '%SUBMIT%'
       )
     `;
+    const deliveryRouteStatusPredicate = `LOWER(COALESCE(status, '')) IN ('pending', 'awaiting_approval', 'planned', 'assigned_to_driver')`;
 
     const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
@@ -3192,9 +3182,12 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
       managerColumns.has("status") &&
       managerHasRouteKeys;
     const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
+    const hasDeliveryRoutes = await tableExists("delivery_routes");
+    const deliveryRouteColumns = hasDeliveryRoutes ? await getTableColumns("delivery_routes") : new Set();
 
     let pendingResult;
     let statsResult;
+    let usedDeliveryRoutes = false;
 
     const managerRowHasRoutePointer = (row) => {
       if (!row) return false;
@@ -3210,8 +3203,56 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
       );
     };
 
-    if (canUseManagerRouteData) {
-      const businessId = req.user?.businessId || req.user?.business_id || null;
+    // Prefer authoritative delivery_routes rows first to avoid generating placeholder pending ids.
+    if (hasDeliveryRoutes) {
+      const deliveryParams = [pendingDeliveryStatuses];
+      let deliveryWhere = `LOWER(COALESCE(status, '')) = ANY($1::text[])`;
+      if (businessId && deliveryRouteColumns.has("business_id")) {
+        deliveryParams.push(businessId);
+        deliveryWhere += ` AND business_id = $${deliveryParams.length}`;
+      }
+      pendingResult = await pool.query(
+        `SELECT 
+            COALESCE(route_id, id) AS route_id,
+            route_name,
+            route_type,
+            status,
+            driver_name,
+            vehicle_type,
+            created_at,
+            departure_time,
+            from_location,
+            to_location,
+            origin_location,
+            destination_location,
+            total_distance_km,
+            estimated_duration_minutes,
+            estimated_fuel_consumption_liters,
+            estimated_carbon_kg
+         FROM delivery_routes
+         WHERE ${deliveryWhere}
+         ORDER BY created_at DESC
+         LIMIT 20`,
+        deliveryParams
+      );
+      if (pendingResult.rows.length > 0) {
+        usedDeliveryRoutes = true;
+        statsResult = await pool.query(
+          `SELECT 
+              COUNT(*) FILTER (WHERE ${deliveryWhere}) as pending_count,
+              COUNT(*) FILTER (WHERE LOWER(COALESCE(status, '')) = 'approved') as approved_count,
+              COUNT(*) FILTER (WHERE LOWER(COALESCE(status, '')) = 'declined') as declined_count,
+              COALESCE(AVG(estimated_carbon_kg), 0) as avg_co2_saved,
+              COALESCE(SUM(estimated_carbon_kg), 0) as total_co2_reduced,
+              COALESCE(SUM(total_distance_km), 0) as total_km_saved
+           FROM delivery_routes
+           ${deliveryParams.length ? `WHERE ${deliveryWhere}` : ""}`,
+          deliveryParams
+        );
+      }
+    }
+
+    if (!usedDeliveryRoutes && canUseManagerRouteData) {
       const pendingParams = [];
       let pendingWhere = `
          ma.approval_type = 'route_optimization'
@@ -3306,7 +3347,7 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
           FROM route_approvals`
         );
       }
-    } else if (hasRouteApprovals) {
+    } else if (!usedDeliveryRoutes && hasRouteApprovals) {
       pendingResult = await pool.query(
         `SELECT 
           ${routeApprovalKeyExpr} as route_id, 
@@ -3401,7 +3442,7 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
     // Keep route_approvals for aggregate counters, but preserve manager_approvals
     // rows when available so dashboard cards use the same optimization payload
     // that admin submitted.
-    if (hasRouteApprovals) {
+    if (hasRouteApprovals && !usedDeliveryRoutes) {
       const routePendingResult = await pool.query(
         `SELECT 
           ${routeApprovalKeyExpr} as route_id, 
@@ -3989,9 +4030,22 @@ app.get("/api/logistics/route/:routeId", async (req, res) => {
     const routeApprovalColumns = hasRouteApprovals ? await getTableColumns("route_approvals") : new Set();
     const routeStopsTableCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
     const hasRouteStops = !!routeStopsTableCheck.rows[0]?.tbl;
+    const hasDeliveryRoutes = await tableExists("delivery_routes");
 
     let row = null;
-    if (canUseManagerRouteData) {
+    if (hasDeliveryRoutes) {
+      const deliveryResult = await pool.query(
+        `SELECT *
+         FROM delivery_routes
+         WHERE route_id::text = $1 OR COALESCE(route_name::text, '') = $1
+         ORDER BY created_at DESC NULLS LAST
+         LIMIT 1`,
+        [routeId]
+      );
+      row = deliveryResult.rows[0] || null;
+    }
+
+    if (!row && canUseManagerRouteData) {
       const managerConditions = [`ma.${managerPkCol}::text = $1`];
       if (managerColumns.has("route_id")) managerConditions.push(`COALESCE(ma.route_id::text, '') = $1`);
       if (managerColumns.has("related_record_id")) managerConditions.push(`COALESCE(ma.related_record_id::text, '') = $1`);
@@ -4071,11 +4125,49 @@ app.get("/api/logistics/pending", async (req, res) => {
       managerColumns.has("approval_type") &&
       managerColumns.has("status");
     const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
+    const pendingDeliveryStatuses = ["pending", "awaiting_approval", "planned", "assigned_to_driver"];
+    const hasDeliveryRoutes = await tableExists("delivery_routes");
+    const deliveryRouteColumns = hasDeliveryRoutes ? await getTableColumns("delivery_routes") : new Set();
     const businessId =
       (req.user && (req.user.businessId || req.user.business_id)) || null;
     let result;
+    let usedDeliveryRoutes = false;
     let usedManagerRows = false;
-    if (canUseManagerRouteData) {
+    if (hasDeliveryRoutes) {
+      const deliveryParams = [pendingDeliveryStatuses];
+      let deliveryWhere = `LOWER(COALESCE(status, '')) = ANY($1::text[])`;
+      if (businessId && deliveryRouteColumns.has("business_id")) {
+        deliveryParams.push(businessId);
+        deliveryWhere += ` AND business_id = $${deliveryParams.length}`;
+      }
+      result = await pool.query(
+        `SELECT 
+            COALESCE(route_id, id) AS route_id,
+            route_name,
+            route_type,
+            status,
+            driver_name,
+            vehicle_type,
+            created_at,
+            departure_time,
+            from_location,
+            to_location,
+            origin_location,
+            destination_location,
+            total_distance_km,
+            estimated_duration_minutes,
+            estimated_fuel_consumption_liters,
+            estimated_carbon_kg
+         FROM delivery_routes
+         WHERE ${deliveryWhere}
+         ORDER BY created_at DESC
+         LIMIT 30`,
+        deliveryParams
+      );
+      usedDeliveryRoutes = result.rows.length > 0;
+    }
+
+    if (!usedDeliveryRoutes && canUseManagerRouteData) {
       const managerRowHasRoutePointer = (row) => {
         if (!row) return false;
         const requestData = row.request_data && typeof row.request_data === "object" ? row.request_data : {};
@@ -4136,7 +4228,7 @@ app.get("/api/logistics/pending", async (req, res) => {
         `, routeParams);
         usedManagerRows = false;
       }
-    } else if (hasRouteApprovals) {
+    } else if (!usedDeliveryRoutes && hasRouteApprovals) {
       const routeParams = [];
       let routeBusinessClause = "";
       result = await pool.query(`
@@ -4150,7 +4242,7 @@ app.get("/api/logistics/pending", async (req, res) => {
         ${routeBusinessClause}
         ORDER BY submitted_at DESC
       `, routeParams);
-    } else {
+    } else if (!usedDeliveryRoutes) {
       result = { rows: [] };
     }
     const getNum = (...vals) => {
@@ -4191,6 +4283,26 @@ app.get("/api/logistics/pending", async (req, res) => {
             status: String(row.status || "pending").toUpperCase(),
             submitted_by: row.submitted_by ? String(row.submitted_by) : row.requested_by ? String(row.requested_by) : "System",
             created_at: row.created_at || null
+          };
+        })
+      : usedDeliveryRoutes
+      ? result.rows.map((row) => {
+          const originLoc = parseMaybeJsonObject(row.origin_location) || {};
+          return {
+            id: row.route_id,
+            product_name: row.route_type || "STANDARD",
+            location: row.from_location || originLoc.address || "Origin",
+            driver_name: row.driver_name || null,
+            vehicle_type: row.vehicle_type || null,
+            departure_time: row.departure_time || row.created_at || null,
+            total_distance_km: row.total_distance_km,
+            estimated_fuel_consumption_liters: row.estimated_fuel_consumption_liters,
+            estimated_carbon_kg: row.estimated_carbon_kg,
+            status: String(row.status || "pending").toUpperCase(),
+            submitted_by: row.created_by ? String(row.created_by) : "System",
+            created_at: row.created_at || null,
+            route_id: row.route_id,
+            route_name: row.route_name
           };
         })
       : result.rows;
