@@ -184,108 +184,98 @@ async function getLogisticsDbSnapshot(routeIdOrCandidates) {
   if (candidates.length === 0) return snapshot;
 
   try {
-    if (await tableExists("delivery_routes")) {
-      for (const candidate of candidates) {
-        const routeRes = await pool.query(
-          `SELECT * FROM delivery_routes 
-           WHERE route_id::text = $1 OR route_id = NULLIF($2, 0)
-           LIMIT 1`,
-          [candidate, Number(candidate) || 0]
-        );
-        if (routeRes.rows.length > 0) {
-          snapshot.route = routeRes.rows[0];
-          break;
-        }
+    for (const candidate of candidates) {
+      const routeRes = await pool.query(
+        `SELECT * FROM delivery_routes 
+         WHERE route_id::text = $1 OR route_id = NULLIF($2, 0)
+         LIMIT 1`,
+        [candidate, Number(candidate) || 0]
+      );
+      if (routeRes.rows.length > 0) {
+        snapshot.route = routeRes.rows[0];
+        break;
       }
     }
   } catch (_) {}
 
   try {
-    if (await tableExists("route_stops")) {
-      for (const candidate of candidates) {
-        const stopsRes = await pool.query(
-          `SELECT stop_id, stop_sequence, location, location_name, address, latitude, longitude,
-                  planned_arrival_time, actual_arrival_time, planned_departure_time, actual_departure_time, notes
-           FROM route_stops
-           WHERE route_id::text = $1 OR route_id = NULLIF($2, 0)
-           ORDER BY stop_sequence ASC`,
-          [candidate, Number(candidate) || 0]
-        );
-        if (stopsRes.rows.length > 0) {
-          snapshot.stops = stopsRes.rows;
-          break;
-        }
+    for (const candidate of candidates) {
+      const stopsRes = await pool.query(
+        `SELECT stop_id, stop_sequence, location, location_name, address, latitude, longitude,
+                planned_arrival_time, actual_arrival_time, planned_departure_time, actual_departure_time, notes
+         FROM route_stops
+         WHERE route_id::text = $1 OR route_id = NULLIF($2, 0)
+         ORDER BY stop_sequence ASC`,
+        [candidate, Number(candidate) || 0]
+      );
+      if (stopsRes.rows.length > 0) {
+        snapshot.stops = stopsRes.rows;
+        break;
       }
     }
   } catch (_) {}
 
   try {
-    if (await tableExists("delivery_items")) {
-      for (const candidate of candidates) {
-        const cargoRes = await pool.query(
-          `SELECT di.delivery_item_id,
-                  di.quantity_to_deliver,
-                  di.inventory_id,
-                  inv.unit_of_measure,
-                  inv.quantity,
-                  inv.product_id,
-                  inv.unit_price_at_entry,
-                  inv.total_value,
-                  inv.batch_number,
-                  inv.expected_expiry_date,
-                  p.name AS product_name,
-                  p.storage_category,
-                  p.perishable,
-                  p.image_url
-           FROM delivery_items di
-           LEFT JOIN inventory inv ON inv.inventory_id = di.inventory_id
-           LEFT JOIN products p ON p.product_id = inv.product_id
-           WHERE di.route_id::text = $1 OR di.route_id = NULLIF($2, 0)
-           ORDER BY di.delivery_item_id ASC`,
-          [candidate, Number(candidate) || 0]
-        );
-        if (cargoRes.rows.length > 0) {
-          snapshot.cargo = cargoRes.rows;
-          break;
-        }
+    for (const candidate of candidates) {
+      const cargoRes = await pool.query(
+        `SELECT di.delivery_item_id,
+                di.quantity_to_deliver,
+                di.inventory_id,
+                inv.unit_of_measure,
+                inv.quantity,
+                inv.product_id,
+                inv.unit_price_at_entry,
+                inv.total_value,
+                inv.batch_number,
+                inv.expected_expiry_date,
+                p.name AS product_name,
+                p.storage_category,
+                p.perishable,
+                p.image_url
+         FROM delivery_items di
+         LEFT JOIN inventory inv ON inv.inventory_id = di.inventory_id
+         LEFT JOIN products p ON p.product_id = inv.product_id
+         WHERE di.route_id::text = $1 OR di.route_id = NULLIF($2, 0)
+         ORDER BY di.delivery_item_id ASC`,
+        [candidate, Number(candidate) || 0]
+      );
+      if (cargoRes.rows.length > 0) {
+        snapshot.cargo = cargoRes.rows;
+        break;
       }
     }
   } catch (_) {}
 
   try {
-    if (await tableExists("delivery_logs")) {
-      for (const candidate of candidates) {
-        const logRes = await pool.query(
-          `SELECT *
-           FROM delivery_logs
-           WHERE route_id::text = $1 OR route_id = NULLIF($2, 0)
-           ORDER BY delivery_date DESC NULLS LAST, created_at DESC NULLS LAST
-           LIMIT 1`,
-          [candidate, Number(candidate) || 0]
-        );
-        if (logRes.rows.length > 0) {
-          snapshot.deliveryLog = logRes.rows[0];
-          break;
-        }
+    for (const candidate of candidates) {
+      const logRes = await pool.query(
+        `SELECT *
+         FROM delivery_logs
+         WHERE route_id::text = $1 OR route_id = NULLIF($2, 0)
+         ORDER BY delivery_date DESC NULLS LAST, created_at DESC NULLS LAST
+         LIMIT 1`,
+        [candidate, Number(candidate) || 0]
+      );
+      if (logRes.rows.length > 0) {
+        snapshot.deliveryLog = logRes.rows[0];
+        break;
       }
     }
   } catch (_) {}
 
   try {
-    if (await tableExists("driver_locations")) {
-      for (const candidate of candidates) {
-        const locRes = await pool.query(
-          `SELECT latitude, longitude, accuracy_m, speed_kmh, recorded_at
-           FROM driver_locations
-           WHERE route_id::text = $1 OR route_id = NULLIF($2, 0)
-           ORDER BY recorded_at DESC
-           LIMIT 50`,
-          [candidate, Number(candidate) || 0]
-        );
-        if (locRes.rows.length > 0) {
-          snapshot.driverLocations = locRes.rows;
-          break;
-        }
+    for (const candidate of candidates) {
+      const locRes = await pool.query(
+        `SELECT latitude, longitude, accuracy_m, speed_kmh, recorded_at
+         FROM driver_locations
+         WHERE route_id::text = $1 OR route_id = NULLIF($2, 0)
+         ORDER BY recorded_at DESC
+         LIMIT 50`,
+        [candidate, Number(candidate) || 0]
+      );
+      if (locRes.rows.length > 0) {
+        snapshot.driverLocations = locRes.rows;
+        break;
       }
     }
   } catch (_) {}
@@ -4090,7 +4080,7 @@ app.get("/api/logistics/route/:routeId", async (req, res) => {
     const routeApprovalColumns = hasRouteApprovals ? await getTableColumns("route_approvals") : new Set();
     const routeStopsTableCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
     const hasRouteStops = !!routeStopsTableCheck.rows[0]?.tbl;
-    const hasDeliveryRoutes = await tableExists("delivery_routes");
+    const hasDeliveryRoutes = true; // attempt delivery_routes even if to_regclass fails
 
     let row = null;
     if (hasDeliveryRoutes) {
