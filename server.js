@@ -2187,7 +2187,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
   const dbSnapshot = await getLogisticsDbSnapshot(baseRouteIdCandidates);
   const deliveryRoute = dbSnapshot.route || null;
   const routeStopsFromDb = Array.isArray(dbSnapshot.stops) ? dbSnapshot.stops : [];
-  const cargoFromDb = Array.isArray(dbSnapshot.cargo) ? dbSnapshot.cargo : [];
+  let cargoFromDb = Array.isArray(dbSnapshot.cargo) ? dbSnapshot.cargo : [];
   const deliveryLog = dbSnapshot.deliveryLog || null;
   const driverLocations = Array.isArray(dbSnapshot.driverLocations) ? dbSnapshot.driverLocations : [];
 
@@ -2203,6 +2203,18 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     routeId = String(deliveryRoute.route_id);
   }
   const routeOptimizationSnapshot = await getRouteOptimizationSnapshot(routeIdCandidates);
+
+  // Cargo sometimes arrives via delivery_items even when the initial snapshot missed it; refetch by route_id if needed.
+  if (cargoFromDb.length === 0 && routeId) {
+    try {
+      const extraSnapshot = await getLogisticsDbSnapshot([routeId]);
+      if (Array.isArray(extraSnapshot.cargo) && extraSnapshot.cargo.length > 0) {
+        cargoFromDb = extraSnapshot.cargo;
+      }
+    } catch (_) {
+      // best-effort; continue without cargo if lookup fails
+    }
+  }
 
   // Some deployments store richer optimization data in manager_approvals.request_data/extra_data
   // while route_approvals can contain zeros. Merge manager payload as fallback source-of-truth.
