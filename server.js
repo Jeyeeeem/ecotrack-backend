@@ -2254,6 +2254,45 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     }
   }
 
+  // Final cargo fallback: pull from request/route payloads if present.
+  const candidateCargoArrays = [
+    cargoFromDb,
+    Array.isArray(requestData.cargo) ? requestData.cargo : null,
+    Array.isArray(routeData.cargo) ? routeData.cargo : null,
+    Array.isArray(requestData.delivery_items) ? requestData.delivery_items : null,
+    Array.isArray(routeData.delivery_items) ? routeData.delivery_items : null
+  ].filter((arr) => Array.isArray(arr) && arr.length > 0);
+
+  const normalizeCargo = (item) => {
+    if (!item || typeof item !== "object") return null;
+    const qty =
+      toFiniteNumber(item.quantity_to_deliver, item.quantity, item.qty, item.amount) || null;
+    const unit =
+      item.unit_of_measure ||
+      item.unit ||
+      item.uom ||
+      (item.perishable ? "kg" : null);
+    return {
+      delivery_item_id: item.delivery_item_id ?? item.id ?? null,
+      inventory_id: item.inventory_id ?? null,
+      product_id: item.product_id ?? null,
+      product_name: item.product_name || item.name || "Item",
+      quantity: qty,
+      unit: unit,
+      storage_category: item.storage_category || null,
+      perishable: item.perishable ?? null,
+      image_url: item.image_url || null,
+      batch_number: item.batch_number || null,
+      expected_expiry_date: item.expected_expiry_date || null,
+      total_value: toFiniteNumber(item.total_value) || null,
+      unit_price: toFiniteNumber(item.unit_price_at_entry, item.unit_price) || null
+    };
+  };
+
+  if (candidateCargoArrays.length > 0) {
+    cargoFromDb = candidateCargoArrays[0].map(normalizeCargo).filter(Boolean);
+  }
+
   // Some deployments store richer optimization data in manager_approvals.request_data/extra_data
   // while route_approvals can contain zeros. Merge manager payload as fallback source-of-truth.
   let managerFallbackRow = null;
