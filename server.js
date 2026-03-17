@@ -3709,6 +3709,57 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
       console.warn("Logistics pending replace with delivery_routes failed:", replaceErr.message);
     }
 
+    // Also merge in any pending delivery_routes that aren't already present.
+    try {
+      if (await tableExists("delivery_routes")) {
+        const existingKeys = new Set(
+          pendingRoutes.map((r) => String(r.routeId || r.route_id || "").trim()).filter(Boolean)
+        );
+        const deliveryPending = await pool.query(
+          `SELECT 
+              COALESCE(route_id, id) AS route_id,
+              route_name,
+              route_type,
+              status,
+              driver_name,
+              vehicle_type,
+              created_at,
+              departure_time,
+              from_location,
+              to_location,
+              origin_location,
+              destination_location,
+              total_distance_km,
+              estimated_duration_minutes,
+              estimated_fuel_consumption_liters,
+              estimated_carbon_kg
+           FROM delivery_routes
+           WHERE ${deliveryRouteStatusPredicate}
+           ORDER BY created_at DESC
+           LIMIT 20`
+        );
+        for (const row of deliveryPending.rows) {
+          const key = String(row.route_id || "").trim();
+          if (!key || existingKeys.has(key)) continue;
+          try {
+            const route = await buildLogisticsRoutePayload(row, { hasRouteStops });
+            if (route) {
+              route.routeId = route.routeId || route.route_id || row.route_id;
+              route.route_id = route.route_id || route.routeId;
+              route.route_number = route.route_number || route.routeId;
+              route.route_code = route.route_code || route.route_name || (route.routeId ? `Route-${route.routeId}` : null);
+              pendingRoutes.push(route);
+              existingKeys.add(route.routeId);
+            }
+          } catch (mergeErr) {
+            console.warn("Logistics merge delivery_routes pending failed:", mergeErr.message);
+          }
+        }
+      }
+    } catch (mergeErrOuter) {
+      console.warn("Logistics merge delivery_routes outer failed:", mergeErrOuter.message);
+    }
+
     // Keep pendingRoutes strictly pending; All Routes screen already falls back to history.
 
     res.json({
