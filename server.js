@@ -2874,7 +2874,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     routeData.routeName ||
     deliveryRoute?.route_name ||
     (routeId ? `Route-${routeId}` : null);
-  const displayRouteCode = routeId ? `Route-${routeId}` : routeName;
+  const displayRouteCode = routeName || (routeId ? `Route-${routeId}` : null);
 
   const submittedBy = row.submitted_by || row.requested_by || row.reviewed_by || "System";
   const payload = {
