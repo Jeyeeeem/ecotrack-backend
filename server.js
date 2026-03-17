@@ -5529,12 +5529,20 @@ app.post("/api/logistics/approve", async (req, res) => {
       }
 
       if (managerMatchClauses.length > 0) {
-        await pool.query(
+        const managerUpdate = await pool.query(
           `UPDATE manager_approvals
            SET status = LOWER($1::text), manager_comment = $2, decision_notes = $2, reviewed_at = NOW()${managerUpdatedAtClause}
            WHERE approval_type = 'route_optimization'
              AND (${managerMatchClauses.join(" OR ")})`,
           managerParams
+        );
+        console.log(
+          "Approve debug: manager_approvals updated rows",
+          managerUpdate.rowCount,
+          "routeId",
+          routeIdParam,
+          "managerPk",
+          managerPkValue
         );
       } else {
         console.warn("manager_approvals update skipped: no matchable key/route id");
@@ -5549,13 +5557,19 @@ app.post("/api/logistics/approve", async (req, res) => {
         const whereClause = routeApprovalColumns.has("route_id")
           ? "(id::text = ANY($3) OR route_id::text = ANY($3))"
           : "id::text = ANY($3)";
-        await pool.query(
+        const raUpdate = await pool.query(
           `UPDATE route_approvals
            SET status = $1::text,
                manager_comment = $2,
                approved_at = CASE WHEN $1 = 'APPROVED' THEN NOW() ELSE approved_at END
            WHERE ${whereClause}`,
           [status, decisionComment, keysArray]
+        );
+        console.log(
+          "Approve debug: route_approvals updated rows",
+          raUpdate.rowCount,
+          "keys",
+          keysArray
         );
       }
     } else if (!hasManagerApprovals) {
