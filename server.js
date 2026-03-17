@@ -6952,6 +6952,20 @@ app.get("/api/superadmin/catalog", authenticate, authorize("admin", "super_admin
   }
 });
 
+// Lightweight version endpoint to verify deployed build
+const deployedCommit =
+  process.env.RENDER_GIT_COMMIT ||
+  process.env.VERCEL_GIT_COMMIT_SHA ||
+  process.env.GIT_COMMIT ||
+  null;
+app.get("/api/version", (_req, res) => {
+  res.json({
+    success: true,
+    commit: deployedCommit,
+    deployedAt: process.env.RENDER_GIT_COMMIT_CREATED_AT || null
+  });
+});
+
 
 // ============================================================
 // GLOBAL ERROR HANDLER
