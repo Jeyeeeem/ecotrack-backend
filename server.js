@@ -2179,19 +2179,21 @@ async function buildLogisticsRoutePayload(row, options = {}) {
   const deliveryLog = dbSnapshot.deliveryLog || null;
   const driverLocations = Array.isArray(dbSnapshot.driverLocations) ? dbSnapshot.driverLocations : [];
 
-  const routeIdCandidates = [
-    routeIdFromParams,
-    row.route_id,
-    row.related_record_id,
-    row.delivery_id,
-    row.id,
-    row.approval_id,
-    requestData.route_id,
-    routeData.route_id,
-    deliveryRoute?.route_id
-  ].filter((v) => v !== undefined && v !== null && String(v).trim() !== "");
-  const routeIdRaw = routeIdCandidates.find((v) => v !== undefined && v !== null) || "";
-  const routeId = String(routeIdRaw || "");
+    const routeIdCandidates = [
+      routeIdFromParams,
+      row.route_id,
+      row.related_record_id,
+      row.delivery_id,
+      row.id,
+      row.approval_id,
+      requestData.route_id,
+      routeData.route_id,
+      deliveryRoute?.route_id
+    ]
+      .map((v) => (v === undefined || v === null ? "" : String(v)))
+      .filter((v) => v.trim() !== "");
+    const routeIdRaw = routeIdCandidates.find((v) => v !== undefined && v !== null) || "";
+    const routeId = String(routeIdRaw || "");
   const routeOptimizationSnapshot = await getRouteOptimizationSnapshot(routeIdCandidates);
 
   // Some deployments store richer optimization data in manager_approvals.request_data/extra_data
