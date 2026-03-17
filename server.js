@@ -5142,6 +5142,14 @@ app.post("/api/logistics/approve", async (req, res) => {
     if (hasRouteApprovals) {
       const routeResult = await pool.query(`SELECT * FROM route_approvals WHERE id = $1 LIMIT 1`, [resolvedRouteId]);
       routeRow = routeResult.rows[0] || null;
+      // Fallback: match by route_id when id lookup fails
+      if (!routeRow && routeApprovalColumns.has("route_id")) {
+        const routeByRouteId = await pool.query(
+          `SELECT * FROM route_approvals WHERE route_id::text = $1 LIMIT 1`,
+          [resolvedRouteId]
+        );
+        routeRow = routeByRouteId.rows[0] || null;
+      }
     }
 
     if (status === 'APPROVED') {
