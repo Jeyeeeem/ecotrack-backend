@@ -3656,6 +3656,59 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
       return route;
     });
 
+    // If we still only have generated pending-* ids, try to replace them with real delivery_routes ids.
+    try {
+      const hasGeneratedOnly = pendingRoutes.every((r) => String(r.route_id || "").startsWith("pending-"));
+      if (hasGeneratedOnly && (await tableExists("delivery_routes"))) {
+        const deliveryPending = await pool.query(
+          `SELECT 
+              COALESCE(route_id, id) AS route_id,
+              route_name,
+              route_type,
+              status,
+              driver_name,
+              vehicle_type,
+              created_at,
+              departure_time,
+              from_location,
+              to_location,
+              origin_location,
+              destination_location,
+              total_distance_km,
+              estimated_duration_minutes,
+              estimated_fuel_consumption_liters,
+              estimated_carbon_kg
+           FROM delivery_routes
+           WHERE ${deliveryRouteStatusPredicate}
+           ORDER BY created_at DESC
+           LIMIT 20`
+        );
+        if (deliveryPending.rows.length > 0) {
+          const replacements = deliveryPending.rows.map((row) => ({
+            route_id: row.route_id,
+            routeId: row.route_id,
+            route_number: row.route_id,
+            route_code: row.route_name || (row.route_id ? `Route-${row.route_id}` : null),
+            route_name: row.route_name,
+            routeType: row.route_type || "STANDARD",
+            route_type: row.route_type || "STANDARD",
+            status: row.status || "pending",
+            from: row.from_location || "Origin",
+            to: row.to_location || null,
+            driver: row.driver_name || "Driver Not Assigned",
+            vehicle: row.vehicle_type || "van",
+            departureTime: row.departure_time || row.created_at || null,
+            stops: [],
+            route_path: [],
+            routePath: []
+          }));
+          pendingRoutes = replacements;
+        }
+      }
+    } catch (replaceErr) {
+      console.warn("Logistics pending replace with delivery_routes failed:", replaceErr.message);
+    }
+
     // Keep pendingRoutes strictly pending; All Routes screen already falls back to history.
 
     res.json({
