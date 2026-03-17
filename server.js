@@ -5115,6 +5115,7 @@ app.post("/api/logistics/approve", async (req, res) => {
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
     const routeApprovalColumns = hasRouteApprovals ? await getTableColumns("route_approvals") : new Set();
     let managerApprovalRow = null;
+    let managerPkValue = null;
     let originalManagerStatus = null;
     let resolvedRouteId = routeId;
     let routeRow = null;
@@ -5136,6 +5137,7 @@ app.post("/api/logistics/approve", async (req, res) => {
       );
       if (maResult.rows.length > 0) {
         managerApprovalRow = maResult.rows[0];
+        managerPkValue = managerApprovalRow[managerPkCol];
         originalManagerStatus = managerApprovalRow.status;
       }
       if (hasRouteApprovals) {
@@ -5494,19 +5496,40 @@ app.post("/api/logistics/approve", async (req, res) => {
 
     // Persist status updates only after validations succeed
     if (hasManagerApprovals && managerApprovalRow) {
-      const managerMatchClauses = [`${managerPkCol}::text = $3`];
-      if (managerColumns.has("route_id")) managerMatchClauses.push(`COALESCE(route_id::text, '') = $3`);
-      if (managerColumns.has("related_record_id")) managerMatchClauses.push(`COALESCE(related_record_id::text, '') = $3`);
-      if (managerColumns.has("delivery_id")) managerMatchClauses.push(`COALESCE(delivery_id::text, '') = $3`);
+      const managerMatchClauses = [];
+      const managerParams = [status, decisionComment];
+      const routeIdParam = String(resolvedRouteId || routeId || "");
 
-      const routeIdParam = String(routeId || "");
-      await pool.query(
-        `UPDATE manager_approvals
-         SET status = LOWER($1::text), manager_comment = $2, decision_notes = $2, reviewed_at = NOW()${managerUpdatedAtClause}
-         WHERE approval_type = 'route_optimization'
-           AND (${managerMatchClauses.join(" OR ")})`,
-        [status, decisionComment, routeIdParam]
-      );
+      if (managerPkValue !== null && managerPkValue !== undefined && managerPkValue !== "") {
+        managerParams.push(String(managerPkValue));
+        managerMatchClauses.push(`${managerPkCol}::text = $${managerParams.length}`);
+      }
+      if (routeIdParam) {
+        if (managerColumns.has("route_id")) {
+          managerParams.push(routeIdParam);
+          managerMatchClauses.push(`COALESCE(route_id::text, '') = $${managerParams.length}`);
+        }
+        if (managerColumns.has("related_record_id")) {
+          managerParams.push(routeIdParam);
+          managerMatchClauses.push(`COALESCE(related_record_id::text, '') = $${managerParams.length}`);
+        }
+        if (managerColumns.has("delivery_id")) {
+          managerParams.push(routeIdParam);
+          managerMatchClauses.push(`COALESCE(delivery_id::text, '') = $${managerParams.length}`);
+        }
+      }
+
+      if (managerMatchClauses.length > 0) {
+        await pool.query(
+          `UPDATE manager_approvals
+           SET status = LOWER($1::text), manager_comment = $2, decision_notes = $2, reviewed_at = NOW()${managerUpdatedAtClause}
+           WHERE approval_type = 'route_optimization'
+             AND (${managerMatchClauses.join(" OR ")})`,
+          managerParams
+        );
+      } else {
+        console.warn("manager_approvals update skipped: no matchable key/route id");
+      }
     }
 
     if (hasRouteApprovals && routeApprovalUpdates.size > 0) {
