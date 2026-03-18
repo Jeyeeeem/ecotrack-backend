@@ -5309,8 +5309,46 @@ app.post("/api/logistics/approve", async (req, res) => {
       const deliveriesTableCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
       const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
 
-      // Driver availability guard disabled to allow multiple concurrent assignments per driver
-      // (previously returned 409). If you want to re-enable, add checks here.
+      // Driver availability guard: block assignment if driver already has an active/pending delivery.
+      if (hasDeliveries && assignedDriver) {
+        try {
+          const deliveriesColumns = await getTableColumns("deliveries");
+          const driverNameCol = deliveriesColumns.has("driver_name") ? "driver_name" : null;
+          const driverIdCol = deliveriesColumns.has("driver_user_id")
+            ? "driver_user_id"
+            : deliveriesColumns.has("driver_id")
+            ? "driver_id"
+            : null;
+          const statusCol = deliveriesColumns.has("status") ? "status" : null;
+          if ((driverNameCol || driverIdCol) && statusCol) {
+            const params = [];
+            const where = [];
+            params.push(['assigned', 'accepted', 'in_progress', 'pending', 'planned']);
+            where.push(`${statusCol} = ANY($${params.length}::text[])`);
+            if (driverIdCol && selectedDriverId) {
+              params.push(selectedDriverId);
+              where.push(`${driverIdCol} = $${params.length}`);
+            }
+            if (driverNameCol) {
+              params.push(assignedDriver.toLowerCase());
+              where.push(`LOWER(COALESCE(${driverNameCol}, '')) = $${params.length}`);
+            }
+            const availability = await pool.query(
+              `SELECT COUNT(*) AS cnt FROM deliveries WHERE ${where.join(" AND ")}`,
+              params
+            );
+            const activeCount = parseInt(availability.rows[0]?.cnt || 0, 10);
+            if (activeCount > 0) {
+              return res.status(409).json({
+                success: false,
+                message: `${assignedDriver} already has an active or pending delivery. They must complete it before a new route can be assigned.`
+              });
+            }
+          }
+        } catch (availabilityErr) {
+          console.warn("Driver availability check failed, proceeding:", availabilityErr.message);
+        }
+      }
 
       if (hasDeliveries && assignedDriver && resolvedRouteId) {
         try {
