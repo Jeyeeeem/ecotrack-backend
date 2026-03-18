@@ -6903,6 +6903,10 @@ app.get("/api/driver/dashboard", authenticate, async (req, res) => {
             raArgs
           );
           pendingAcceptance = raResult.rows.map((row, idx) => {
+            const numericRouteId = (() => {
+              const m = String(row.route_id ?? "").match(/\\d+/);
+              return m ? Number(m[0]) : idx + 1;
+            })();
             const fallbackStops = [];
             if (row.from_location) {
               fallbackStops.push({ stopName: row.from_location, address: row.from_location, status: "pending" });
@@ -6911,8 +6915,8 @@ app.get("/api/driver/dashboard", authenticate, async (req, res) => {
               fallbackStops.push({ stopName: row.to_location, address: row.to_location, status: "pending" });
             }
             return {
-              deliveryId: null,
-              routeId: row.route_id ?? idx + 1,
+              deliveryId: numericRouteId,
+              routeId: row.route_id ?? numericRouteId,
               status: "assigned",
               driver: row.driver_name,
               vehicle: row.vehicle_type || row.route_type || "delivery",
