@@ -3391,6 +3391,11 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
     const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
     const hasDeliveryRoutes = await tableExists("delivery_routes");
     const deliveryRouteColumns = hasDeliveryRoutes ? await getTableColumns("delivery_routes") : new Set();
+    const deliveryDepartureExpr = deliveryRouteColumns.has("departure_time")
+      ? "departure_time"
+      : deliveryRouteColumns.has("created_at")
+      ? "created_at"
+      : "NULL::timestamp";
 
     let pendingResult;
     let statsResult;
@@ -3700,7 +3705,7 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
           driver_name,
             vehicle_type,
             created_at,
-            departure_time,
+            ${deliveryDepartureExpr} AS departure_time,
             from_location,
             to_location,
             origin_location,
