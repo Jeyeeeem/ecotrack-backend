@@ -5121,6 +5121,8 @@ app.post("/api/logistics/approve", async (req, res) => {
     let routeRow = null;
     const routeApprovalUpdates = new Set();
     const routeApprovalKeys = new Set();
+    let assignedDriver = null;
+    let selectedDriverId = null;
 
     if (hasManagerApprovals) {
       const routeIdParam = String(routeId || "");
@@ -5251,7 +5253,7 @@ app.post("/api/logistics/approve", async (req, res) => {
         }
       }
 
-      const assignedDriver =
+      assignedDriver =
         selectedDriverName ||
         requestedDriverName ||
         routeRow?.driver_name ||
@@ -5260,7 +5262,7 @@ app.post("/api/logistics/approve", async (req, res) => {
         routeData.driver_name ||
         null;
 
-      const selectedDriverId =
+      selectedDriverId =
         matchedDriver?.user_id ||
         requestedDriverId ||
         routeRow?.driver_user_id ||
@@ -5580,6 +5582,32 @@ app.post("/api/logistics/approve", async (req, res) => {
          WHERE ${managerPkCol} = $3`,
         [status, decisionComment, routeId]
       );
+    }
+
+    // Keep delivery_routes in sync so the dashboard drops the item and driver sees the assignment.
+    try {
+      const hasDeliveryRoutes = await tableExists("delivery_routes");
+      if (hasDeliveryRoutes) {
+        const deliveryRoutesColumns = await getTableColumns("delivery_routes");
+        const routeKeys = routeApprovalKeys.size > 0
+          ? Array.from(routeApprovalKeys)
+          : [String(resolvedRouteId || routeId || "")].filter(Boolean);
+        if (routeKeys.length > 0) {
+          const updates = ["status = LOWER($1::text)"];
+          if (deliveryRoutesColumns.has("driver_name")) updates.push("driver_name = COALESCE($2, driver_name)");
+          if (deliveryRoutesColumns.has("driver_user_id")) updates.push("driver_user_id = COALESCE($3, driver_user_id)");
+          else if (deliveryRoutesColumns.has("driver_id")) updates.push("driver_id = COALESCE($3, driver_id)");
+          if (deliveryRoutesColumns.has("updated_at")) updates.push("updated_at = NOW()");
+          await pool.query(
+            `UPDATE delivery_routes
+             SET ${updates.join(", ")}
+             WHERE route_id::text = ANY($4)`,
+            [status, assignedDriver, selectedDriverId, routeKeys]
+          );
+        }
+      }
+    } catch (deliveryRouteSyncErr) {
+      console.warn("delivery_routes sync after approve failed:", deliveryRouteSyncErr.message);
     }
 
     res.json({
