@@ -7498,11 +7498,11 @@ app.get("/api/driver/delivery/:id", authenticate, async (req, res) => {
           if (pathPoints.length >= 2) {
             // If we have no stops at all, fabricate from path endpoints so the map can render.
             if (stops.length === 0) {
-              const first = pathPoints.first?.() ?? pathPoints[0];
-              const last = pathPoints.last?.() ?? pathPoints[pathPoints.length - 1];
+              const first = pathPoints[0];
+              const last = pathPoints[pathPoints.length - 1];
               stops = [
-                { stopId: 1, sequence: 1, stopName: "Origin", address: "", status: "pending", latitude: first.latitude, longitude: first.longitude },
-                { stopId: 2, sequence: 2, stopName: "Destination", address: "", status: "pending", latitude: last.latitude, longitude: last.longitude }
+                { stopId: 1, sequence: 1, stopName: "Origin", address: "", status: "pending", latitude: first?.latitude, longitude: first?.longitude },
+                { stopId: 2, sequence: 2, stopName: "Destination", address: "", status: "pending", latitude: last?.latitude, longitude: last?.longitude }
               ];
             } else {
               stops.forEach((s, idx) => {
