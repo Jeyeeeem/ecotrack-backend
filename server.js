@@ -7080,6 +7080,23 @@ app.get("/api/driver/delivery/:id", authenticate, async (req, res) => {
     );
 
     if (result.rows.length === 0) {
+      // Fallback: try matching by route_id when client passed route id instead of delivery id.
+      if (hasRouteIdCol) {
+        const routeFallback = await pool.query(
+          `SELECT d.*${joinRouteApprovals ? ", ra.route_type" : ""}
+           FROM deliveries d
+           ${joinRouteApprovals ? "LEFT JOIN route_approvals ra ON d.route_id = ra.id" : ""}
+           WHERE COALESCE(d.route_id::text, '') = $1${driverGuard}
+           LIMIT 1`,
+          params
+        );
+        if (routeFallback.rows.length > 0) {
+          result.rows.push(routeFallback.rows[0]);
+        }
+      }
+    }
+
+    if (result.rows.length === 0) {
       return res.status(404).json({ success: false, message: "Delivery not found" });
     }
 
