@@ -6753,6 +6753,15 @@ app.get("/api/driver/dashboard", authenticate, async (req, res) => {
       return [];
     };
 
+    const normalizeItems = (raw) => {
+      if (Array.isArray(raw)) return raw;
+      if (typeof raw === "string") {
+        try { return JSON.parse(raw); } catch (_) { return []; }
+      }
+      if (raw && typeof raw === "object" && raw !== null) return [raw];
+      return [];
+    };
+
     const mapDelivery = (row) => ({
       deliveryId: row.delivery_id,
       routeId: row.route_id,
@@ -6775,13 +6784,13 @@ app.get("/api/driver/dashboard", authenticate, async (req, res) => {
         latitude: stop.latitude ?? null,
         longitude: stop.longitude ?? null
       })),
-      items: Array.isArray(row.delivery_items_json)
-        ? row.delivery_items_json.map(item => ({
-            productName: item.productName || item.product_name || "Item",
-            quantity: String(item.quantity ?? ""),
-            status: item.status || null
-          }))
-        : []
+      items: normalizeItems(row.delivery_items_json).map(item => ({
+        productName: item.productName || item.product_name || "Item",
+        quantity: String(item.quantity ?? ""),
+        unit: item.unit || item.unit_of_measure || item.unitOfMeasure || "",
+        batchNumber: item.batchNumber || item.batch_number || "",
+        status: item.status || null
+      }))
     });
 
     let pendingAcceptance = pendingAcceptanceResult.rows.map(mapDelivery);
