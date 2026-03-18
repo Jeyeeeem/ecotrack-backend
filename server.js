@@ -7430,10 +7430,11 @@ app.get("/api/driver/delivery/:id", authenticate, async (req, res) => {
     // If stops still have missing coordinates, fetch from route_approvals directly
     const stillMissingCoords = stops.some(s => !s.latitude || !s.longitude || s.latitude === 0 || s.longitude === 0);
     if (stillMissingCoords && row.route_id) {
+      // Try route_approvals first (may have stops array)
       try {
         const raResult = await pool.query(
-          `SELECT origin_latitude, origin_longitude, destination_latitude, destination_longitude, stops
-           FROM route_approvals WHERE id = $1 LIMIT 1`,
+          `SELECT origin_latitude, origin_longitude, destination_latitude, destination_longitude, stops, route_path
+           FROM route_approvals WHERE id = $1 OR route_id = $1 LIMIT 1`,
           [row.route_id]
         );
         if (raResult.rows.length > 0) {
@@ -7465,9 +7466,54 @@ app.get("/api/driver/delivery/:id", authenticate, async (req, res) => {
           // Final fallback: use origin for first stop, dest for last if still zero
           if (stops.length > 0) setIfMissing(stops[0], raOriginLat, raOriginLng);
           if (stops.length > 1) setIfMissing(stops[stops.length - 1], raDestLat, raDestLng);
+
+          // If we still have missing coords, try the route_path stored on route_approvals
+          if (Array.isArray(ra.route_path) && ra.route_path.length >= 2) {
+            const pathPoints = ra.route_path.map(normalizeStopLatLng);
+            stops.forEach((s, idx) => {
+              const fallback = pathPoints[Math.min(idx, pathPoints.length - 1)];
+              if (fallback) setIfMissing(s, fallback.latitude, fallback.longitude);
+            });
+          }
         }
       } catch (raErr) {
         console.warn("route_approvals coordinate enrichment fallback:", raErr.message);
+      }
+
+      // If still missing, try route_optimizations.optimization_data for route geometry
+      try {
+        const optResult = await pool.query(
+          `SELECT optimization_data FROM route_optimizations WHERE route_id = $1 ORDER BY optimization_id DESC LIMIT 1`,
+          [row.route_id]
+        );
+        if (optResult.rows.length > 0) {
+          const optData = parseMaybeJsonObject(optResult.rows[0].optimization_data);
+          const pathRaw =
+            optData?.routePath ||
+            optData?.route_path ||
+            optData?.optimizedPath ||
+            optData?.optimized_path ||
+            [];
+          const pathPoints = Array.isArray(pathRaw) ? pathRaw.map(normalizeStopLatLng) : [];
+          if (pathPoints.length >= 2) {
+            // If we have no stops at all, fabricate from path endpoints so the map can render.
+            if (stops.length === 0) {
+              const first = pathPoints.first?.() ?? pathPoints[0];
+              const last = pathPoints.last?.() ?? pathPoints[pathPoints.length - 1];
+              stops = [
+                { stopId: 1, sequence: 1, stopName: "Origin", address: "", status: "pending", latitude: first.latitude, longitude: first.longitude },
+                { stopId: 2, sequence: 2, stopName: "Destination", address: "", status: "pending", latitude: last.latitude, longitude: last.longitude }
+              ];
+            } else {
+              stops.forEach((s, idx) => {
+                const fallback = pathPoints[Math.min(idx, pathPoints.length - 1)];
+                if (fallback) setIfMissing(s, fallback.latitude, fallback.longitude);
+              });
+            }
+          }
+        }
+      } catch (optErr) {
+        console.warn("route_optimizations coordinate enrichment fallback:", optErr.message);
       }
     }
 
