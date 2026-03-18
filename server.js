@@ -3169,6 +3169,51 @@ WHERE ${statusExpr} NOT IN ('completed','cancelled','declined','rejected')
           }
         }
       }
+
+      // If deliveries table missing/empty, fall back to delivery_routes assignments.
+      if (driverMonitorRows.length === 0 && hasDeliveryRoutes) {
+        const drColumns = await getTableColumns("delivery_routes");
+        const statusCol = drColumns.has("status") ? "LOWER(COALESCE(status,''))" : null;
+        const driverNameCol = drColumns.has("driver_name") ? "driver_name" : null;
+        const driverIdCol = drColumns.has("driver_user_id")
+          ? "driver_user_id"
+          : drColumns.has("driver_id")
+          ? "driver_id"
+          : null;
+        if ((driverNameCol || driverIdCol) && statusCol) {
+          const params = [];
+          const businessClause =
+            businessId && drColumns.has("business_id")
+              ? (() => {
+                  params.push(businessId);
+                  return `AND (business_id = $${params.length} OR business_id IS NULL)`;
+                })()
+              : "";
+          const activeStatuses = ['assigned', 'accepted', 'in_progress', 'pending', 'planned'];
+          params.push(activeStatuses);
+          const activeClause = `${statusCol} = ANY($${params.length}::text[])`;
+          const drRows = await pool.query(
+            `SELECT
+               COALESCE(${driverNameCol}, 'Driver') AS full_name,
+               NULL::text AS email,
+               COALESCE(route_name, from_location || ' → ' || to_location) AS route_name,
+               ${statusCol} AS route_status,
+               route_id AS route_id,
+               ${drColumns.has("vehicle_type") ? "vehicle_type" : "NULL::text"} AS vehicle_type,
+               ${driverIdCol || "NULL::int"} AS user_id,
+               ${driverIdCol || "NULL::int"} AS driver_user_id,
+               0 AS stops_completed,
+               0 AS stops_total
+             FROM delivery_routes
+             WHERE ${activeClause}
+             ${businessClause}
+             ORDER BY created_at DESC NULLS LAST
+             LIMIT 50`,
+            params
+          );
+          driverMonitorRows = drRows.rows;
+        }
+      }
     } catch (liveDriverErr) {
       console.warn("Logistics driver monitor live-delivery lookup failed:", liveDriverErr.message);
     }
