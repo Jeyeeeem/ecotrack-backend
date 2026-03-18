@@ -6890,6 +6890,16 @@ app.get("/api/driver/routes", authenticate, async (req, res) => {
     query += ` AND LOWER(COALESCE(d.driver_name, '')) = ANY($1)`;
     query += ` ORDER BY ${driverRoutesOrderBy} LIMIT 50`;
     let result = await pool.query(query, params);
+
+    const normalizeItems = (raw) => {
+      if (Array.isArray(raw)) return raw;
+      if (typeof raw === "string") {
+        try { return JSON.parse(raw); } catch (_) { return []; }
+      }
+      if (raw && typeof raw === "object" && raw !== null) return [raw];
+      return [];
+    };
+
     let routes = result.rows.map(row => ({
       deliveryId: row.delivery_id,
       routeId: row.route_id,
@@ -6904,7 +6914,14 @@ app.get("/api/driver/routes", authenticate, async (req, res) => {
       estimatedFuel: parseFloat(row.estimated_fuel_consumption_liters) || 0,
       actualFuel: parseFloat(row.fuel_consumption) || 0,
       estimatedCO2: parseFloat(row.estimated_carbon_kg) || 0,
-      actualCO2: parseFloat(row.carbon_emissions) || 0
+      actualCO2: parseFloat(row.carbon_emissions) || 0,
+      items: normalizeItems(row.delivery_items_json).map(item => ({
+        productName: item.productName || item.product_name || "Item",
+        quantity: String(item.quantity ?? ""),
+        unit: item.unit || item.unit_of_measure || item.unitOfMeasure || "",
+        batchNumber: item.batchNumber || item.batch_number || "",
+        status: item.status || null
+      }))
     }));
 
     // Fallback for deployments where driver routes are stored in manager_approvals.extra_data
@@ -7007,6 +7024,15 @@ app.get("/api/driver/delivery/:id", authenticate, async (req, res) => {
     }
 
     const row = result.rows[0];
+
+    const normalizeItems = (raw) => {
+      if (Array.isArray(raw)) return raw;
+      if (typeof raw === "string") {
+        try { return JSON.parse(raw); } catch (_) { return []; }
+      }
+      if (raw && typeof raw === "object") return [raw];
+      return [];
+    };
 
     let stops = [];
     let stopsRows = [];
@@ -7226,7 +7252,14 @@ app.get("/api/driver/delivery/:id", authenticate, async (req, res) => {
         actualFuel: parseFloat(row.fuel_consumption) || 0,
         estimatedCO2: parseFloat(row.estimated_carbon_kg) || 0,
         actualCO2: parseFloat(row.carbon_emissions) || 0,
-        stops
+        stops,
+        items: normalizeItems(row.delivery_items_json).map((item) => ({
+          productName: item.productName || item.product_name || "Item",
+          quantity: String(item.quantity ?? ""),
+          unit: item.unit || item.unit_of_measure || item.unitOfMeasure || "",
+          batchNumber: item.batchNumber || item.batch_number || "",
+          status: item.status || null
+        }))
       }
     });
   } catch (err) {
