@@ -5605,6 +5605,64 @@ app.post("/api/logistics/approve", async (req, res) => {
                   console.warn("delivery insert route_stops fetch failed:", routeStopsErr.message);
                 }
 
+                // Fallback: build stops_json from route_path/origin/destination when route_stops is empty
+                if ((!stopsJson || stopsJson.length === 0) && routeRow) {
+                  try {
+                    const pathRaw =
+                      (Array.isArray(routeRow.route_path) && routeRow.route_path) ||
+                      (Array.isArray(routeRow.routePath) && routeRow.routePath) ||
+                      (Array.isArray(requestData.route_path) && requestData.route_path) ||
+                      (Array.isArray(requestData.routePath) && requestData.routePath) ||
+                      [];
+                    const pathNorm = Array.isArray(pathRaw)
+                      ? pathRaw
+                          .map((p) => ({
+                            latitude: toFiniteNumber(p.latitude, p.lat),
+                            longitude: toFiniteNumber(p.longitude, p.lon, p.lng)
+                          }))
+                          .filter((p) => p.latitude && p.longitude)
+                      : [];
+                    const originLat = toFiniteNumber(routeRow.origin_latitude, routeRow.originLatitude);
+                    const originLng = toFiniteNumber(routeRow.origin_longitude, routeRow.originLongitude);
+                    const destLat = toFiniteNumber(routeRow.destination_latitude, routeRow.destinationLatitude);
+                    const destLng = toFiniteNumber(routeRow.destination_longitude, routeRow.destinationLongitude);
+
+                    const originPoint = pathNorm[0] || (originLat && originLng ? { latitude: originLat, longitude: originLng } : null);
+                    const destPoint =
+                      pathNorm[pathNorm.length - 1] ||
+                      (destLat && destLng ? { latitude: destLat, longitude: destLng } : null);
+
+                    const builtStops = [];
+                    if (originPoint) {
+                      builtStops.push({
+                        stopId: 1,
+                        sequence: 1,
+                        stopName: routeRow.from_location || "Origin",
+                        address: routeRow.from_location || "",
+                        latitude: originPoint.latitude,
+                        longitude: originPoint.longitude,
+                        status: "pending"
+                      });
+                    }
+                    if (destPoint) {
+                      builtStops.push({
+                        stopId: builtStops.length + 1,
+                        sequence: builtStops.length + 1,
+                        stopName: routeRow.to_location || "Destination",
+                        address: routeRow.to_location || "",
+                        latitude: destPoint.latitude,
+                        longitude: destPoint.longitude,
+                        status: "pending"
+                      });
+                    }
+                    if (builtStops.length >= 2) {
+                      stopsJson = builtStops;
+                    }
+                  } catch (routePathFallbackErr) {
+                    console.warn("delivery insert route_path fallback failed:", routePathFallbackErr.message);
+                  }
+                }
+
                 const insertColumns = [];
                 const insertValues = [];
                 const pushInsert = (column, value) => {
