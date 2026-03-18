@@ -3728,6 +3728,87 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
       }
     }
 
+    // Fallback: if still empty, use deliveries table pending rows (DB-backed, no synthetic data)
+    if ((!pendingResult || pendingResult.rows.length === 0) && (await tableExists("deliveries"))) {
+      try {
+        const deliveryColumns = await getTableColumns("deliveries");
+        const statusExpr = deliveryColumns.has("status") ? "LOWER(COALESCE(status, ''))" : "''";
+        const deliveryPendingWhere = `
+          ${statusExpr} IN (
+            'pending','awaiting_approval','planned','assigned','assigned_to_driver',
+            'accepted','in_progress','in-transit','in_transit'
+          )
+        `;
+        const distanceExpr = deliveryColumns.has("distance_km")
+          ? "COALESCE(distance_km,0)"
+          : deliveryColumns.has("total_distance_km")
+          ? "COALESCE(total_distance_km,0)"
+          : "0::numeric";
+        const carbonExpr = deliveryColumns.has("estimated_carbon_kg")
+          ? "COALESCE(estimated_carbon_kg,0)"
+          : deliveryColumns.has("carbon_kg")
+          ? "COALESCE(carbon_kg,0)"
+          : "0::numeric";
+
+        const deliveryPending = await pool.query(
+          `SELECT * FROM deliveries
+           WHERE ${deliveryPendingWhere}
+           ORDER BY COALESCE(created_at, updated_at, NOW()) DESC
+           LIMIT 20`
+        );
+
+        const normalizedRows = deliveryPending.rows.map((row) => ({
+          ...row,
+          route_id: row.route_id || row.delivery_id || row.id || row.routeid || null,
+          route_name: row.route_name || row.delivery_name || row.route || row.name || null,
+          route_type: row.route_type || "DELIVERY",
+          from_location:
+            row.origin_location ||
+            row.from_location ||
+            row.origin ||
+            row.pickup_location ||
+            row.from ||
+            null,
+          to_location:
+            row.destination_location ||
+            row.to_location ||
+            row.destination ||
+            row.dropoff_location ||
+            row.to ||
+            null,
+          driver_name: row.driver_name || row.driver || row.assigned_driver || null,
+          vehicle_type: row.vehicle_type || row.vehicle || null,
+          departure_time: row.departure_time || row.created_at || row.updated_at || null,
+          original_distance: row.original_distance || row.distance || row.distance_km || row.total_distance_km || 0,
+          optimized_distance:
+            row.optimized_distance || row.distance || row.distance_km || row.total_distance_km || 0,
+          original_fuel: row.original_fuel || row.estimated_fuel_liters || 0,
+          optimized_fuel: row.optimized_fuel || row.estimated_fuel_liters || 0,
+          original_co2: row.original_co2 || row.optimized_co2 || row.estimated_carbon_kg || row.carbon_kg || 0,
+          optimized_co2: row.optimized_co2 || row.estimated_carbon_kg || row.carbon_kg || 0,
+          savings_km: row.savings_km || 0,
+          savings_fuel: row.savings_fuel || 0,
+          savings_co2: row.savings_co2 || 0,
+          status: row.status || "pending",
+          submitted_at: row.created_at || row.updated_at || null
+        }));
+
+        pendingResult = { rows: normalizedRows };
+        statsResult = await pool.query(
+          `SELECT 
+             COUNT(*) FILTER (WHERE ${deliveryPendingWhere}) as pending_count,
+             COUNT(*) FILTER (WHERE ${statusExpr} IN ('approved','completed','assigned','accepted','in_progress','in-transit','in_transit')) as approved_count,
+             COUNT(*) FILTER (WHERE ${statusExpr} IN ('declined','rejected','cancelled','canceled')) as declined_count,
+             AVG(${carbonExpr}) as avg_co2_saved,
+             SUM(${carbonExpr}) as total_co2_reduced,
+             SUM(${distanceExpr}) as total_km_saved
+           FROM deliveries`
+        );
+      } catch (deliveryFallbackErr) {
+        console.warn("Logistics dashboard deliveries fallback failed:", deliveryFallbackErr.message);
+      }
+    }
+
     const driverMonitorRows = await fetchDriverMonitorRows(businessId);
 
     const stats = statsResult.rows[0] || {};
