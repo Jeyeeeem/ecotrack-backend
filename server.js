@@ -6872,6 +6872,68 @@ app.get("/api/driver/dashboard", authenticate, async (req, res) => {
       pendingAcceptance = relaxedMapped.filter(d => d.status === 'assigned');
       activeDeliveries = relaxedMapped.filter(d => d.status === 'accepted' || d.status === 'in_progress');
     }
+
+    // Final safety net: surface approved routes (route_approvals / manager_approvals) as upcoming when deliveries are missing
+    if (!pendingAcceptance.length && !activeDeliveries.length) {
+      try {
+        const routeApprovalCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
+        const hasRouteApprovalsFallback = !!routeApprovalCheck.rows[0]?.tbl;
+        if (hasRouteApprovalsFallback) {
+          const raCols = await getTableColumns("route_approvals");
+          const raArgs = [];
+          const raWhere = [`LOWER(COALESCE(status,'')) = 'approved'`];
+          if (driverAliases.length) {
+            raArgs.push(driverAliases);
+            raWhere.push(`LOWER(COALESCE(driver_name,'')) = ANY($${raArgs.length})`);
+          }
+          if (driverId && raCols.has("driver_user_id")) {
+            raArgs.push(driverId);
+            raWhere.push(`COALESCE(driver_user_id,0) = $${raArgs.length}`);
+          }
+          const raRouteIdExpr = raCols.has("route_id") ? "COALESCE(route_id, id)" : "id";
+          const raDepartureExpr = raCols.has("departure_time") ? "departure_time" : "approved_at";
+          const raResult = await pool.query(
+            `SELECT ${raRouteIdExpr} as route_id, driver_name, vehicle_type, route_type, from_location, to_location,
+                    ${raDepartureExpr} as departure_time, optimized_distance, original_distance,
+                    optimized_fuel, original_fuel, optimized_co2, original_co2
+             FROM route_approvals
+             WHERE ${raWhere.join(" AND ")}
+             ORDER BY ${raDepartureExpr} DESC NULLS LAST, submitted_at DESC NULLS LAST
+             LIMIT 10`,
+            raArgs
+          );
+          pendingAcceptance = raResult.rows.map((row, idx) => {
+            const fallbackStops = [];
+            if (row.from_location) {
+              fallbackStops.push({ stopName: row.from_location, address: row.from_location, status: "pending" });
+            }
+            if (row.to_location) {
+              fallbackStops.push({ stopName: row.to_location, address: row.to_location, status: "pending" });
+            }
+            return {
+              deliveryId: null,
+              routeId: row.route_id ?? idx + 1,
+              status: "assigned",
+              driver: row.driver_name,
+              vehicle: row.vehicle_type || row.route_type || "delivery",
+              departureTime: row.departure_time,
+              arrivalTime: null,
+              from: row.from_location,
+              to: row.to_location,
+              distance: parseFloat(row.optimized_distance ?? row.original_distance ?? 0) || 0,
+              estimatedFuel: parseFloat(row.optimized_fuel ?? row.original_fuel ?? 0) || 0,
+              actualFuel: 0,
+              estimatedCO2: parseFloat(row.optimized_co2 ?? row.original_co2 ?? 0) || 0,
+              actualCO2: 0,
+              stops: fallbackStops.length ? fallbackStops : [],
+              items: []
+            };
+          });
+        }
+      } catch (raFallbackErr) {
+        console.warn("route_approvals fallback failed:", raFallbackErr.message);
+      }
+    }
     const activeDelivery = activeDeliveries[0] || null;
 
     const stats = statsResult.rows[0] || {};
