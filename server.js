@@ -6939,15 +6939,43 @@ app.get("/api/driver/routes", authenticate, async (req, res) => {
       SELECT d.*, ra.route_type
       FROM deliveries d
       LEFT JOIN route_approvals ra ON d.route_id = ra.id
-      WHERE d.driver_name IS NOT NULL
+      WHERE TRUE
     `;
     const driverAliases = await resolveDriverFilterAliases({ queryDriverName: driver_name, user: req.user });
     if (driverAliases.length === 0) {
       return res.status(400).json({ success: false, message: "Driver context missing" });
     }
     const params = [];
+    const filters = [];
+    // Match by driver name aliases
     params.push(driverAliases);
-    query += ` AND LOWER(COALESCE(d.driver_name, '')) = ANY($1)`;
+    filters.push(`LOWER(COALESCE(d.driver_name, '')) = ANY($${params.length})`);
+    // Match by driver_user_id if present
+    const idCol =
+      deliveriesColumns.has("driver_user_id") ? "d.driver_user_id" :
+      deliveriesColumns.has("driver_id") ? "d.driver_id" :
+      null;
+    const driverId = Number(req.user?.userId || req.user?.id || 0) || null;
+    if (idCol && driverId) {
+      params.push(driverId);
+      filters.push(`${idCol} = $${params.length}`);
+    }
+    // If route_approvals has driver_user_id/driver_name, include those too
+    const raHasDriverId = await (async () => {
+      const cols = await getTableColumns("route_approvals");
+      return { hasId: cols.has("driver_user_id") || cols.has("driver_id"), hasName: cols.has("driver_name") };
+    })();
+    if (raHasDriverId.hasId && driverId) {
+      filters.push(`COALESCE(ra.driver_user_id, ra.driver_id) = ${driverId}`);
+    }
+    if (raHasDriverId.hasName) {
+      params.push(driverAliases);
+      filters.push(`LOWER(COALESCE(ra.driver_name, '')) = ANY($${params.length})`);
+    }
+
+    if (filters.length) {
+      query += ` AND (${filters.join(" OR ")})`;
+    }
     query += ` ORDER BY ${driverRoutesOrderBy} LIMIT 50`;
     let result = await pool.query(query, params);
 
