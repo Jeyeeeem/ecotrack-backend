@@ -6856,23 +6856,6 @@ app.get("/api/driver/dashboard", authenticate, async (req, res) => {
     let pendingAcceptance = pendingAcceptanceResult.rows.map(mapDelivery);
     let activeDeliveries = activeResult.rows.map(mapDelivery);
     const recentCompletions = completedResult.rows.map(mapDelivery);
-    // If nothing matched due to name/ID mismatch, relax filters and retry once (low risk data).
-    if (!pendingAcceptance.length && !activeDeliveries.length && filters.length) {
-      const relaxed = await pool.query(`
-        SELECT ${col("delivery_id", "NULL")}, ${col("route_id", "NULL")}, ${col("status", "NULL")}, ${col("driver_name", "NULL")}, ${col("vehicle_type", "NULL")}, ${col("departure_time", "NULL")}, ${col("arrival_time", "NULL")},
-               ${col("from_location", "NULL")}, ${col("to_location", "NULL")}, ${col("distance_km", "0")}, ${col("estimated_fuel_consumption_liters", "0")}, ${col("fuel_consumption", "0")},
-               ${col("estimated_carbon_kg", "0")}, ${col("carbon_emissions", "0")}, ${stopsJsonSelect}, ${itemsJsonSelect}
-        FROM deliveries d
-        WHERE d.status IN ('assigned','accepted','in_progress')
-        ORDER BY ${orderByCreated}
-        LIMIT 20
-      `);
-      const relaxedMapped = relaxed.rows.map(mapDelivery);
-      // Split by status
-      pendingAcceptance = relaxedMapped.filter(d => d.status === 'assigned');
-      activeDeliveries = relaxedMapped.filter(d => d.status === 'accepted' || d.status === 'in_progress');
-    }
-
     // Final safety net: surface approved routes (route_approvals / manager_approvals) as upcoming when deliveries are missing
     if (!pendingAcceptance.length && !activeDeliveries.length) {
       try {
@@ -6885,6 +6868,11 @@ app.get("/api/driver/dashboard", authenticate, async (req, res) => {
           if (driverAliases.length) {
             raArgs.push(driverAliases);
             raWhere.push(`LOWER(COALESCE(driver_name,'')) = ANY($${raArgs.length})`);
+          }
+          if (driverId && (raCols.has("driver_user_id") || raCols.has("driver_id"))) {
+            const col = raCols.has("driver_user_id") ? "driver_user_id" : "driver_id";
+            raArgs.push(driverId);
+            raWhere.push(`COALESCE(${col},0) = $${raArgs.length}`);
           }
           if (driverId && raCols.has("driver_user_id")) {
             raArgs.push(driverId);
@@ -6967,13 +6955,21 @@ app.post("/api/driver/respond-delivery", authenticate, async (req, res) => {
     if (!driverAliases.length) {
       return res.status(400).json({ success: false, message: "Driver context missing" });
     }
+    const deliveriesColumns = await getTableColumns("deliveries");
+    const idCol =
+      deliveriesColumns.has("driver_user_id") ? "driver_user_id" :
+      deliveriesColumns.has("driver_id") ? "driver_id" :
+      null;
+    const driverId = Number(req.user?.userId || req.user?.id || 0) || null;
+
     const ownerResult = await pool.query(
       `SELECT delivery_id
        FROM deliveries
        WHERE delivery_id = $1
          AND LOWER(COALESCE(driver_name, '')) = ANY($2)
+         ${idCol && driverId ? `AND COALESCE(${idCol},0) = $3` : ``}
        LIMIT 1`,
-      [deliveryId, driverAliases]
+      idCol && driverId ? [deliveryId, driverAliases, driverId] : [deliveryId, driverAliases]
     );
     if (!ownerResult.rows.length) {
       return res.status(403).json({ success: false, message: "Delivery not assigned to this driver" });
