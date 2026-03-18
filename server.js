@@ -4896,6 +4896,7 @@ app.patch("/api/logistics/:id/decline", async (req, res) => {
     const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
     const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
+    const managerColumns = hasManagerApprovals ? await getManagerApprovalsColumns() : new Set();
     if (hasManagerApprovals) {
       const maResult = await pool.query(
         `UPDATE manager_approvals
@@ -4904,6 +4905,27 @@ app.patch("/api/logistics/:id/decline", async (req, res) => {
          RETURNING *`,
         [declineReason, id]
       );
+      // Bounce back to admin for re-check/re-submit
+      if (managerColumns.has("required_role")) {
+        try {
+          const routeRef = maResult.rows[0]?.route_id || maResult.rows[0]?.delivery_id || id;
+          const params = ['pending', 'admin', routeRef];
+          const reviewedAtClause = managerColumns.has("reviewed_at") ? ", reviewed_at = NULL" : "";
+          const updatedAtClause = managerColumns.has("updated_at") ? ", updated_at = NOW()" : "";
+          const matchClauses = [`${managerPkCol}::text = $3`];
+          if (managerColumns.has("route_id")) matchClauses.push(`COALESCE(route_id::text, '') = $3`);
+          if (managerColumns.has("related_record_id")) matchClauses.push(`COALESCE(related_record_id::text, '') = $3`);
+          if (managerColumns.has("delivery_id")) matchClauses.push(`COALESCE(delivery_id::text, '') = $3`);
+          await pool.query(
+            `UPDATE manager_approvals
+             SET status = $1, required_role = $2${reviewedAtClause}${updatedAtClause}
+             WHERE approval_type = 'route_optimization' AND (${matchClauses.join(" OR ")})`,
+            params
+          );
+        } catch (bounceErr) {
+          console.warn("Decline bounce-to-admin (patch) failed:", bounceErr.message);
+        }
+      }
       if (hasRouteApprovals) {
         if (maResult.rows.length > 0) {
           const routeRef = maResult.rows[0].route_id || maResult.rows[0].delivery_id;
@@ -5666,6 +5688,44 @@ app.post("/api/logistics/approve", async (req, res) => {
         );
       } else {
         console.warn("manager_approvals update skipped: no matchable key/route id");
+      }
+
+      // If declined, bounce back to admin for re-check/re-submission.
+      if (status === 'DECLINED' && managerColumns.has("required_role")) {
+        try {
+          const resetParams = ['pending', 'admin'];
+          const resetWhere = [];
+          if (managerPkValue !== null && managerPkValue !== undefined && managerPkValue !== "") {
+            resetParams.push(String(managerPkValue));
+            resetWhere.push(`${managerPkCol}::text = $${resetParams.length}`);
+          }
+          if (routeIdParam) {
+            if (managerColumns.has("route_id")) {
+              resetParams.push(routeIdParam);
+              resetWhere.push(`COALESCE(route_id::text, '') = $${resetParams.length}`);
+            }
+            if (managerColumns.has("related_record_id")) {
+              resetParams.push(routeIdParam);
+              resetWhere.push(`COALESCE(related_record_id::text, '') = $${resetParams.length}`);
+            }
+            if (managerColumns.has("delivery_id")) {
+              resetParams.push(routeIdParam);
+              resetWhere.push(`COALESCE(delivery_id::text, '') = $${resetParams.length}`);
+            }
+          }
+          if (resetWhere.length > 0) {
+            const reviewedAtClause = managerColumns.has("reviewed_at") ? ", reviewed_at = NULL" : "";
+            const updatedAtClause = managerColumns.has("updated_at") ? ", updated_at = NOW()" : "";
+            await pool.query(
+              `UPDATE manager_approvals
+               SET status = $1, required_role = $2${reviewedAtClause}${updatedAtClause}
+               WHERE approval_type = 'route_optimization' AND (${resetWhere.join(" OR ")})`,
+              resetParams
+            );
+          }
+        } catch (bounceErr) {
+          console.warn("Decline bounce-to-admin failed:", bounceErr.message);
+        }
       }
     }
 
