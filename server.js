@@ -5431,6 +5431,39 @@ app.post("/api/logistics/approve", async (req, res) => {
               const m = String(resolvedRouteId || "").match(/\\d+/);
               return m ? Number(m[0]) : NaN;
             })();
+            // Prebuild cargo manifest for driver dashboard
+            let deliveryItemsJson = null;
+            try {
+              if (deliveriesColumns.has("delivery_items_json") && !Number.isNaN(numericRouteId)) {
+                const diCheck = await pool.query(`SELECT to_regclass('public.delivery_items') AS tbl`);
+                if (diCheck.rows[0]?.tbl) {
+                  const di = await pool.query(
+                    `SELECT 
+                       COALESCE(p.product_name, inv.product_name, 'Item') as product_name,
+                       COALESCE(di.quantity_to_deliver, inv.quantity, 0) as quantity,
+                       COALESCE(inv.unit_of_measure, 'unit') as unit,
+                       COALESCE(inv.batch_number, '') as batch_number
+                     FROM delivery_items di
+                     LEFT JOIN inventory inv ON inv.inventory_id = di.inventory_id
+                     LEFT JOIN products p ON p.product_id = inv.product_id
+                     WHERE di.route_id = $1
+                     ORDER BY di.delivery_item_id ASC`,
+                    [numericRouteId]
+                  );
+                  if (di.rows.length > 0) {
+                    deliveryItemsJson = di.rows.map((r) => ({
+                      productName: r.product_name,
+                      quantity: Number(r.quantity) || 0,
+                      unit: r.unit,
+                      batchNumber: r.batch_number
+                    }));
+                  }
+                }
+              }
+            } catch (cargoErr) {
+              console.warn("Delivery cargo build failed:", cargoErr.message);
+            }
+
             if (!Number.isNaN(numericRouteId)) {
               const businessId =
                 routeRow?.business_id ||
@@ -5510,6 +5543,7 @@ app.post("/api/logistics/approve", async (req, res) => {
                 pushUpdate("distance_km", deliveryPayload.distance_km);
                 pushUpdate("estimated_fuel_consumption_liters", deliveryPayload.estimated_fuel_consumption_liters);
                 pushUpdate("estimated_carbon_kg", deliveryPayload.estimated_carbon_kg);
+                if (deliveryItemsJson) pushUpdate("delivery_items_json", JSON.stringify(deliveryItemsJson));
                 pushUpdate("status", nextStatus);
                 if (deliveriesColumns.has("updated_at")) pushUpdate("updated_at", new Date().toISOString());
 
@@ -5571,6 +5605,7 @@ app.post("/api/logistics/approve", async (req, res) => {
                 pushInsert("estimated_fuel_consumption_liters", deliveryPayload.estimated_fuel_consumption_liters);
                 pushInsert("estimated_carbon_kg", deliveryPayload.estimated_carbon_kg);
                 pushInsert("stops_json", stopsJson);
+                if (deliveryItemsJson) pushInsert("delivery_items_json", JSON.stringify(deliveryItemsJson));
 
                 if (insertColumns.length > 0) {
                   const placeholders = insertColumns.map((_, idx) => `$${idx + 1}`).join(", ");
