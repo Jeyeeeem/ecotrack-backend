@@ -7096,6 +7096,75 @@ app.get("/api/driver/delivery/:id", authenticate, async (req, res) => {
       }
     }
 
+    // Second fallback: synthesize delivery details from route_approvals when deliveries table has no row yet.
+    if (result.rows.length === 0) {
+      try {
+        const ra = await pool.query(
+          `SELECT * FROM route_approvals WHERE id::text = $1 OR route_id::text = $1 LIMIT 1`,
+          [String(id)]
+        );
+        if (ra.rows.length > 0) {
+          const raRow = ra.rows[0];
+          // Respect driver guard if present
+          if (driverAliases.length > 0) {
+            const driverName = String(raRow.driver_name || "").toLowerCase();
+            const match = driverAliases.some(alias => driverName === String(alias || "").toLowerCase());
+            if (!match && driverName) {
+              return res.status(403).json({ success: false, message: "Delivery not assigned to this driver" });
+            }
+          }
+
+          // Build stops from route_stops if available
+          let stops = [];
+          try {
+            const rsCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
+            if (rsCheck.rows[0]?.tbl) {
+              const stopsResult = await pool.query(
+                `SELECT stop_sequence, location_name, address, latitude, longitude, status
+                 FROM route_stops
+                 WHERE route_id::text = $1
+                 ORDER BY stop_sequence ASC`,
+                [String(raRow.route_id || raRow.id)]
+              );
+              stops = stopsResult.rows.map((s, idx) => ({
+                stopName: s.location_name || s.address || `Stop ${s.stop_sequence ?? idx + 1}`,
+                address: s.address || s.location_name || "",
+                stopId: s.stop_sequence ?? idx + 1,
+                sequence: s.stop_sequence ?? idx + 1,
+                latitude: toFiniteNumber(s.latitude),
+                longitude: toFiniteNumber(s.longitude),
+                status: s.status || "pending"
+              }));
+            }
+          } catch (rsErr) {
+            console.warn("route_stops fallback failed:", rsErr.message);
+          }
+
+          const deliveryPayload = {
+            deliveryId: Number(id) || Number(raRow.id) || 0,
+            routeId: raRow.route_id || raRow.id || null,
+            status: raRow.status || "pending",
+            driver: raRow.driver_name || null,
+            vehicle: raRow.vehicle_type || null,
+            departureTime: raRow.departure_time || raRow.submitted_at || null,
+            arrivalTime: raRow.approved_at || null,
+            from: raRow.from_location || null,
+            to: raRow.to_location || null,
+            distance: toFiniteNumberPreferNonZero(raRow.optimized_distance, raRow.original_distance, raRow.total_distance_km),
+            estimatedFuel: toFiniteNumberPreferNonZero(raRow.optimized_fuel, raRow.original_fuel, raRow.estimated_fuel_consumption_liters),
+            actualFuel: 0,
+            estimatedCO2: toFiniteNumberPreferNonZero(raRow.optimized_co2, raRow.original_co2, raRow.estimated_carbon_kg),
+            actualCO2: 0,
+            stops
+          };
+
+          return res.json({ success: true, delivery: deliveryPayload });
+        }
+      } catch (raFallbackErr) {
+        console.warn("route_approvals delivery fallback failed:", raFallbackErr.message);
+      }
+    }
+
     if (result.rows.length === 0) {
       return res.status(404).json({ success: false, message: "Delivery not found" });
     }
