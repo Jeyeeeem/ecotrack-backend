@@ -5587,7 +5587,10 @@ app.post("/api/logistics/approve", async (req, res) => {
               console.warn("Delivery cargo build failed:", cargoErr.message);
             }
 
-            if (!Number.isNaN(numericRouteId)) {
+            const routeIdForDelivery = !Number.isNaN(numericRouteId)
+              ? numericRouteId
+              : (resolvedRouteId ?? null);
+            if (routeIdForDelivery !== null && routeIdForDelivery !== undefined && routeIdForDelivery !== "") {
               const businessId =
                 routeRow?.business_id ||
                 managerApprovalRow?.business_id ||
@@ -5621,7 +5624,7 @@ app.post("/api/logistics/approve", async (req, res) => {
                 null;
               const routeNameFallback = `${fromLocation || "Origin"} → ${toLocation || "Destination"}`;
               const deliveryPayload = {
-                route_id: numericRouteId,
+                route_id: routeIdForDelivery,
                 business_id: businessId,
                 driver_name: assignedDriver,
                 driver_user_id: driverUserIdPayload,
