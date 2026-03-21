@@ -3151,8 +3151,7 @@ const fetchDriverMonitorRows = async (businessId = null) => {
                   return `AND (d.business_id = $${params.length} OR d.business_id IS NULL)`;
                 })()
               : "";
-          const liveDrivers = await pool.query(
-            `
+          const liveDriverQuery = `
             SELECT
               COALESCE(d.driver_name, u.full_name, u.username, u.email, 'Driver') AS full_name,
               COALESCE(d.driver_email, u.email, '') AS email,
@@ -3166,15 +3165,22 @@ const fetchDriverMonitorRows = async (businessId = null) => {
               COALESCE(d.stops_total, 0) AS stops_total
             FROM deliveries d
             LEFT JOIN users u ON ${driverIdExpr} = COALESCE(u.user_id, u.id)
-WHERE ${statusExpr} NOT IN ('completed','cancelled','declined','rejected')
+            WHERE ${statusExpr} NOT IN ('completed','cancelled','declined','rejected')
               ${businessClause}
             ORDER BY d.departure_time DESC NULLS LAST, d.created_at DESC NULLS LAST
             LIMIT 50
-          `,
-            params
-          );
-          if (liveDrivers.rows.length > 0) {
-            driverMonitorRows = liveDrivers.rows;
+          `;
+
+          const liveDrivers = await pool.query(liveDriverQuery, params);
+          let liveDriverRows = liveDrivers.rows;
+
+          // Relax business scoping if nothing is returned for the current tenant.
+          if (liveDriverRows.length === 0 && businessClause) {
+            liveDriverRows = (await pool.query(liveDriverQuery.replace(businessClause, ""), [])).rows;
+          }
+
+          if (liveDriverRows.length > 0) {
+            driverMonitorRows = liveDriverRows;
           }
         }
       }
