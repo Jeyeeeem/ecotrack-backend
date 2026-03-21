@@ -2,9 +2,15 @@
 require("dotenv").config();
 const { Pool } = require("pg");
 
-// Always use the production Neon database to avoid mismatched env vars.
-const connectionString =
-  "postgresql://neondb_owner:npg_pRAylQ9eZGI0@ep-jolly-mountain-a1hcta3p-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require";
+/**
+ * Preferred: set NEON_DATABASE_URL (or DATABASE_URL) in .env
+ * Example format: postgresql://user:pass@host/db?sslmode=require&channel_binding=require
+ */
+const connectionString = process.env.NEON_DATABASE_URL || process.env.DATABASE_URL;
+
+if (!connectionString) {
+  throw new Error("Database connection string missing. Set NEON_DATABASE_URL or DATABASE_URL.");
+}
 
 const pool = new Pool({
   connectionString,
