@@ -6965,7 +6965,7 @@ app.get("/api/driver/dashboard", authenticate, async (req, res) => {
              ${col("from_location", "NULL")}, ${col("to_location", "NULL")}, ${col("distance_km", "0")}, ${col("estimated_fuel_consumption_liters", "0")}, ${col("fuel_consumption", "0")},
              ${col("estimated_carbon_kg", "0")}, ${col("carbon_emissions", "0")}, ${stopsJsonSelect}, ${itemsJsonSelect}
       FROM deliveries d
-      WHERE d.status IN ('accepted', 'in_progress') ${clause}
+      WHERE d.status IN ('assigned', 'accepted', 'in_progress') ${clause}
       ORDER BY ${orderByCreated}
       LIMIT 20
     `, args);
@@ -7102,7 +7102,7 @@ app.get("/api/driver/dashboard", authenticate, async (req, res) => {
         console.warn("route_approvals fallback failed:", raFallbackErr.message);
       }
     }
-    const activeDelivery = activeDeliveries[0] || null;
+    const activeDelivery = activeDeliveries[0] || pendingAcceptance[0] || null;
 
     const stats = statsResult.rows[0] || {};
     res.json({ 
