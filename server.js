@@ -5248,8 +5248,14 @@ app.get("/api/logistics/history", async (req, res) => {
 app.post("/api/logistics/approve", async (req, res) => {
   const { routeId, decision, comment, driverName, driverUserId } = req.body;
   try {
-    const statusNormalized = String(decision || "").toUpperCase();
-    const status = statusNormalized === 'APPROVE' ? 'APPROVED' : statusNormalized === 'PENDING' ? 'PENDING' : 'DECLINED';
+    const normalizeDecisionStatus = (raw) => {
+      const s = String(raw || "").trim().toLowerCase();
+      if (!s) return "PENDING";
+      if (["approve", "approved", "accept", "accepted", "approve_route"].includes(s)) return "APPROVED";
+      if (["pending", "hold", "in_review", "awaiting", "awaiting_approval"].includes(s)) return "PENDING";
+      return "DECLINED";
+    };
+    const status = normalizeDecisionStatus(decision);
     const decisionComment = String(comment || "").trim();
     if (status === 'DECLINED' && !decisionComment) {
       return res.status(400).json({
@@ -5662,6 +5668,10 @@ app.post("/api/logistics/approve", async (req, res) => {
                 pushUpdate("estimated_carbon_kg", deliveryPayload.estimated_carbon_kg);
                 if (deliveryItemsJson) pushUpdate("delivery_items_json", JSON.stringify(deliveryItemsJson));
                 pushUpdate("status", nextStatus);
+                if (deliveriesColumns.has("priority")) pushUpdate("priority", "urgent");
+                if (deliveriesColumns.has("priority_level")) pushUpdate("priority_level", "high");
+                if (deliveriesColumns.has("urgency")) pushUpdate("urgency", "high");
+                if (deliveriesColumns.has("is_urgent")) pushUpdate("is_urgent", true);
                 if (deliveriesColumns.has("updated_at")) pushUpdate("updated_at", new Date().toISOString());
 
                 if (updatePairs.length > 0) {
@@ -5772,6 +5782,10 @@ app.post("/api/logistics/approve", async (req, res) => {
                 pushInsert("driver_user_id", deliveryPayload.driver_user_id);
                 pushInsert("route_name", deliveryPayload.route_name);
                 pushInsert("status", deliveryPayload.status);
+                if (deliveriesColumns.has("priority")) pushInsert("priority", "urgent");
+                if (deliveriesColumns.has("priority_level")) pushInsert("priority_level", "high");
+                if (deliveriesColumns.has("urgency")) pushInsert("urgency", "high");
+                if (deliveriesColumns.has("is_urgent")) pushInsert("is_urgent", true);
                 pushInsert("vehicle_type", deliveryPayload.vehicle_type);
                 pushInsert("departure_time", deliveryPayload.departure_time);
                 pushInsert("from_location", deliveryPayload.from_location);
