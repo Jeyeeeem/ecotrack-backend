@@ -1871,7 +1871,16 @@ app.get("/api/delivery-logs", authenticate, async (req, res) => {
 
 // Create delivery log
 app.post("/api/delivery-logs", authenticate, async (req, res) => {
-  const { route_id, actual_distance_km, actual_duration_minutes, actual_fuel_used_liters, actual_carbon_kg, delivery_date, driver_name, notes } = req.body;
+  const body = req.body;
+  // Support both snake_case (Android) and backend native field names
+  const route_id = body.route_id;
+  const actual_distance_km = body.actual_distance_km ?? body.actual_km ?? body.actualKm;
+  const actual_duration_minutes = body.actual_duration_minutes;
+  const actual_fuel_used_liters = body.actual_fuel_used_liters ?? body.actual_fuel_liters ?? body.actualFuelLiters;
+  const actual_carbon_kg = body.actual_carbon_kg;
+  const delivery_date = body.delivery_date;
+  const driver_name = body.driver_name;
+  const notes = body.notes;
   
   if (!route_id) {
     return res.status(400).json({ success: false, message: "Route ID is required" });
