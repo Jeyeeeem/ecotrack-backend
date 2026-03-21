@@ -3121,7 +3121,9 @@ const fetchDriverMonitorRows = async (businessId = null) => {
       const hasDeliveryRoutes = !!deliveryRoutesTableCheck.rows[0]?.tbl;
       if (hasDeliveries) {
         const deliveriesColumns = await getTableColumns("deliveries");
-        const statusExpr = deliveriesColumns.has("status") ? "LOWER(COALESCE(d.status,''))" : "''";
+        const statusExpr = deliveriesColumns.has("status")
+          ? "LOWER(COALESCE(d.status,''))"
+          : "'assigned'";
         const hasDriverName = deliveriesColumns.has("driver_name");
         const hasBusinessCol = deliveriesColumns.has("business_id");
         const routeNameExpr = deliveriesColumns.has("route_name")
