@@ -1940,27 +1940,6 @@ app.get("/api/ecotrust/leaderboard", async (req, res) => {
   }
 });
 
-// Public leaderboard (no auth) for pre-login screens
-app.get("/api/ecotrust/public-leaderboard", async (req, res) => {
-  try {
-    const limit = Math.min(parseInt(req.query.limit || "50", 10) || 20, 100);
-    const result = await pool.query(
-      `
-      SELECT es.*, bp.business_name
-      FROM ecotrust_scores es
-      LEFT JOIN business_profiles bp ON es.business_id = bp.business_id
-      ORDER BY es.current_score DESC NULLS LAST, es.rank ASC
-      LIMIT $1
-      `,
-      [limit]
-    );
-    res.json({ success: true, leaderboard: result.rows });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ success: false, message: "Database error" });
-  }
-});
-
 // Get ecotrust score for business
 app.get("/api/ecotrust/:businessId", authenticate, async (req, res) => {
   try {
