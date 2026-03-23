@@ -6997,113 +6997,731 @@ app.patch("/api/approvals/:id/decision", async (req, res) => {
 });
 
 // ============================================================
-// SUSTAINABILITY MANAGER ROUTES (Existing)
+// SUSTAINABILITY MANAGER ROUTES
 // ============================================================
 
-app.get("/api/sustainability/dashboard", async (req, res) => {
-  try {
-    const pendingResult = await pool.query(`
-      SELECT d.delivery_id, d.route_id, d.status as delivery_status, d.driver_name, d.vehicle_type, d.departure_time, 
-             d.arrival_time, d.from_location, d.to_location, d.distance_km, d.fuel_consumption, 
-             d.estimated_fuel_consumption_liters, d.carbon_emissions, d.estimated_carbon_kg, 
-             d.created_at as submitted_at, d.business_id, bp.business_name, d.carbon_verification_status 
-      FROM deliveries d 
-      LEFT JOIN business_profiles bp ON d.business_id = bp.business_id 
-      WHERE d.carbon_verification_status = 'pending' OR d.carbon_verification_status IS NULL 
-      ORDER BY d.created_at DESC LIMIT 20
-    `);
-    const countsResult = await pool.query(`
-      SELECT
-        COUNT(*) FILTER (WHERE carbon_verification_status IS NULL OR carbon_verification_status = 'pending') AS pending_count,
-        COUNT(*) FILTER (WHERE carbon_verification_status = 'verified') AS verified_count,
-        COUNT(*) FILTER (WHERE carbon_verification_status = 'revision_requested') AS revision_count,
-        COUNT(*) FILTER (WHERE carbon_verification_status = 'verified' AND carbon_verified_at::date = CURRENT_DATE) AS verified_today,
-        COALESCE(SUM(carbon_emissions) FILTER (WHERE carbon_verification_status = 'verified'), 0) AS total_co2_verified
-      FROM deliveries;
-    `);
-    const counts = countsResult.rows[0] || {};
-    const pendingItems = pendingResult.rows.map(row => ({ 
-      id: row.delivery_id, 
-      deliveryId: `DEL-${row.delivery_id}`, 
-      type: 'delivery', 
-      date: row.departure_time || row.created_at, 
-      route: `${row.from_location} → ${row.to_location}`, 
-      driver: row.driver_name, 
-      vehicle: row.vehicle_type, 
-      estimatedFuel: parseFloat(row.estimated_fuel_consumption_liters) || 0, 
-      actualFuel: parseFloat(row.fuel_consumption) || 0, 
-      estimatedCO2: parseFloat(row.estimated_carbon_kg) || 0, 
-      actualCO2: parseFloat(row.carbon_emissions) || 0, 
-      distance: parseFloat(row.distance_km) || 0, 
-      businessName: row.business_name, 
-      submittedAt: row.submitted_at, 
-      status: row.carbon_verification_status || 'pending' 
-    }));
-    res.json({ 
-      success: true, 
-      summary: { 
-        pendingVerifications: parseInt(counts.pending_count, 10) || pendingItems.length, 
-        verifiedToday: parseInt(counts.verified_today, 10) || 0, 
-        totalCO2Verified: parseFloat(counts.total_co2_verified) || 0 
-      }, 
-      pendingVerifications: pendingItems, 
-      message: null 
-    });
-  } catch (err) { res.status(500).json({ success: false }); }
-});
+function normalizeSustainabilityApprovalStatus(status) {
+  const s = String(status || "").trim().toLowerCase();
+  if (!s) return "pending";
+  if (s.includes("revision") || s.includes("declin") || s.includes("reject")) return "revision_requested";
+  if (s.includes("verif") || s.includes("approv") || s === "resolved" || s === "completed") return "verified";
+  if (s.includes("pending") || s.includes("review") || s.includes("await") || s.includes("submit")) return "pending";
+  return s;
+}
 
-app.post("/api/sustainability/verify", async (req, res) => {
-  const { verificationId, decision, comment, sourceType } = req.body;
+const sustainabilityPendingStatusPredicate = `
+  (
+    LOWER(COALESCE(status, '')) IN ('pending', 'pending_review', 'awaiting_approval', 'submitted', 'in_review')
+    OR LOWER(COALESCE(status, '')) LIKE '%pending%'
+    OR LOWER(COALESCE(status, '')) LIKE '%review%'
+    OR LOWER(COALESCE(status, '')) LIKE '%await%'
+    OR LOWER(COALESCE(status, '')) LIKE '%submit%'
+  )
+`;
+
+function buildSustainabilitySourceKey(sourceType, sourceId) {
+  const normalizedType = String(sourceType || "delivery").trim().toLowerCase();
+  const normalizedId = String(sourceId || "").trim();
+  return normalizedId ? `${normalizedType}:${normalizedId}` : null;
+}
+
+function buildSustainabilitySnapshotFromDeliveryRow(row, statusOverride = null) {
+  const sourceId = row.delivery_id ?? row.id ?? null;
+  const status = normalizeSustainabilityApprovalStatus(
+    statusOverride ?? row.carbon_verification_status ?? row.status
+  );
+  const fromLocation = row.from_location || "Origin";
+  const toLocation = row.to_location || "Destination";
+  const routeLabel = row.route_name || `${fromLocation} → ${toLocation}`;
+  const submittedAt = row.submitted_at || row.created_at || row.departure_time || null;
+  return {
+    source_type: "delivery",
+    source_id: sourceId,
+    route_id: row.route_id ?? null,
+    delivery_id: row.delivery_id ?? null,
+    delivery_label: sourceId ? `DEL-${sourceId}` : "DELIVERY",
+    date: row.departure_time || row.carbon_verified_at || submittedAt,
+    route: routeLabel,
+    driver: row.driver_name || null,
+    vehicle: row.vehicle_type || null,
+    estimatedFuel: parseFloat(row.estimated_fuel_consumption_liters) || 0,
+    actualFuel: parseFloat(row.fuel_consumption) || 0,
+    estimatedCO2: parseFloat(row.estimated_carbon_kg) || 0,
+    actualCO2: parseFloat(row.carbon_emissions) || 0,
+    distance: parseFloat(row.distance_km) || 0,
+    businessName: row.business_name || null,
+    submittedAt,
+    reviewedAt: row.carbon_verified_at || null,
+    status,
+    comment: row.carbon_verification_comment || null
+  };
+}
+
+function buildSustainabilitySourceKeysFromManagerRow(row, managerPkCol) {
+  const requestData = parseMaybeJsonObject(row.request_data) || {};
+  const extraData = parseMaybeJsonObject(row.extra_data) || {};
+  const sourceData = parseMaybeJsonObject(extraData.source) || {};
+  const sourceType = String(
+    requestData.source_type ||
+    sourceData.source_type ||
+    (row.delivery_id ? "delivery" : "route_approval")
+  ).trim().toLowerCase();
+
+  const keys = new Set();
+  const pushKey = (type, id) => {
+    const key = buildSustainabilitySourceKey(type, id);
+    if (key) keys.add(key);
+  };
+
+  pushKey(sourceType, requestData.source_id);
+  pushKey(sourceType, sourceData.source_id);
+  pushKey("delivery", row.delivery_id);
+  pushKey("route_approval", row.related_record_id);
+  pushKey("route_approval", row.route_id);
+  pushKey("delivery", row.related_record_id);
+  pushKey("approval", row[managerPkCol]);
+
+  return Array.from(keys);
+}
+
+function mapSustainabilityManagerRowToMobileItem(row, managerPkCol) {
+  const requestData = parseMaybeJsonObject(row.request_data) || {};
+  const extraData = parseMaybeJsonObject(row.extra_data) || {};
+  const sourceData = parseMaybeJsonObject(extraData.source) || {};
+  const merged = { ...sourceData, ...requestData };
+
+  const approvalId = parseInt(row[managerPkCol] ?? row.approval_id ?? row.id, 10) || 0;
+  const sourceType = String(
+    merged.source_type ||
+    (row.delivery_id ? "delivery" : "route_approval")
+  ).trim().toLowerCase();
+  const sourceId = merged.source_id ?? row.related_record_id ?? row.delivery_id ?? row.route_id ?? approvalId;
+  const deliveryLabel =
+    merged.delivery_label ||
+    (sourceId !== null && sourceId !== undefined ? `DEL-${sourceId}` : `DEL-${approvalId}`);
+
+  return {
+    id: approvalId,
+    approvalId,
+    sourceId: parseInt(sourceId, 10) || 0,
+    deliveryId: deliveryLabel,
+    type: sourceType,
+    routeId: parseInt(merged.route_id ?? row.route_id, 10) || null,
+    date: merged.date || row.created_at || null,
+    route: merged.route || row.location || "Unknown Route",
+    driver: merged.driver || null,
+    vehicle: merged.vehicle || null,
+    estimatedFuel: parseFloat(merged.estimatedFuel ?? merged.estimated_fuel ?? 0) || 0,
+    actualFuel: parseFloat(merged.actualFuel ?? merged.actual_fuel ?? 0) || 0,
+    estimatedCO2: parseFloat(merged.estimatedCO2 ?? merged.estimated_co2 ?? 0) || 0,
+    actualCO2: parseFloat(merged.actualCO2 ?? merged.actual_co2 ?? 0) || 0,
+    distance: parseFloat(merged.distance ?? 0) || 0,
+    businessName: merged.businessName || null,
+    submittedAt: merged.submittedAt || row.created_at || null,
+    reviewedAt: row.reviewed_at || row.decision_date || merged.reviewedAt || null,
+    status: normalizeSustainabilityApprovalStatus(row.status),
+    comment: row.manager_comment || row.review_notes || row.decision_notes || merged.comment || null
+  };
+}
+
+async function listLegacySustainabilityDeliveryRows({ businessId = null, includeHistory = false, limit = 200 } = {}) {
+  if (!(await tableExists("deliveries"))) {
+    return [];
+  }
+
+  const deliveryColumns = await getTableColumns("deliveries");
+  if (!deliveryColumns.has("delivery_id")) {
+    return [];
+  }
+
+  const params = [];
+  const whereClauses = [];
+
+  if (businessId && deliveryColumns.has("business_id")) {
+    params.push(businessId);
+    whereClauses.push(`d.business_id = $${params.length}`);
+  }
+
+  if (includeHistory) {
+    whereClauses.push(`LOWER(COALESCE(d.carbon_verification_status, '')) IN ('verified', 'revision_requested')`);
+  } else {
+    whereClauses.push(`d.carbon_verification_status IS NULL OR LOWER(COALESCE(d.carbon_verification_status, '')) = 'pending'`);
+  }
+
+  params.push(limit);
+  const dateOrderExpr = includeHistory
+    ? "COALESCE(d.carbon_verified_at, d.updated_at, d.created_at) DESC NULLS LAST"
+    : "COALESCE(d.created_at, d.departure_time) DESC NULLS LAST";
+
+  const result = await pool.query(
+    `
+    SELECT
+      d.delivery_id,
+      d.route_id,
+      d.driver_name,
+      d.vehicle_type,
+      d.departure_time,
+      d.arrival_time,
+      d.from_location,
+      d.to_location,
+      d.distance_km,
+      d.fuel_consumption,
+      d.estimated_fuel_consumption_liters,
+      d.carbon_emissions,
+      d.estimated_carbon_kg,
+      d.created_at,
+      d.updated_at,
+      d.business_id,
+      d.carbon_verification_status,
+      d.carbon_verification_comment,
+      d.carbon_verified_at,
+      bp.business_name
+    FROM deliveries d
+    LEFT JOIN business_profiles bp ON bp.business_id = d.business_id
+    WHERE ${whereClauses.join(" AND ")}
+    ORDER BY ${dateOrderExpr}
+    LIMIT $${params.length}
+  `,
+    params
+  );
+
+  return result.rows || [];
+}
+
+async function syncLegacySustainabilityApprovals(businessId = null) {
   try {
-    const normalizedDecision = String(decision || "").toUpperCase();
-    const isVerify = ["VERIFY", "VERIFIED", "APPROVE", "APPROVED"].includes(normalizedDecision);
-    const carbonStatus = isVerify ? 'verified' : 'revision_requested';
-    if (sourceType === 'route_approval' || sourceType === 'route') {
-      await pool.query(`UPDATE route_approvals SET carbon_verification_status = $1, carbon_verification_comment = $2, carbon_verified_at = NOW() WHERE id = $3`, [carbonStatus, comment, verificationId]);
-    } else {
-      await pool.query(`UPDATE deliveries SET carbon_verification_status = $1, carbon_verification_comment = $2, carbon_verified_at = NOW() WHERE delivery_id = $3`, [carbonStatus, comment, verificationId]);
+    const hasManagerApprovals = await tableExists("manager_approvals");
+    if (!hasManagerApprovals) {
+      return { inserted: 0, available: false };
     }
-    res.json({ success: true, message: `Carbon footprint verified successfully` });
-  } catch (err) { res.status(500).json({ success: false }); }
+
+    const managerColumns = await getManagerApprovalsColumns();
+    const managerPkCol = await getManagerApprovalsPkColumn();
+    const canUseManagerQueue =
+      managerColumns.has("approval_type") &&
+      managerColumns.has("status") &&
+      (
+        managerColumns.has("related_record_id") ||
+        managerColumns.has("delivery_id") ||
+        managerColumns.has("route_id") ||
+        managerColumns.has("request_data") ||
+        managerColumns.has("extra_data")
+      );
+
+    if (!canUseManagerQueue) {
+      return { inserted: 0, available: false };
+    }
+
+    const legacyRows = await listLegacySustainabilityDeliveryRows({
+      businessId,
+      includeHistory: true,
+      limit: 500
+    });
+
+    if (legacyRows.length === 0) {
+      return { inserted: 0, available: true };
+    }
+
+    const managerParams = [];
+    let managerWhere = `approval_type = 'carbon_verification'`;
+    if (businessId && managerColumns.has("business_id")) {
+      managerParams.push(businessId);
+      managerWhere += ` AND business_id = $${managerParams.length}`;
+    }
+
+    const managerRowsResult = await pool.query(
+      `SELECT *
+       FROM manager_approvals
+       WHERE ${managerWhere}
+       ORDER BY ${
+         managerColumns.has("created_at")
+           ? "created_at DESC NULLS LAST"
+           : `${managerPkCol} DESC`
+       }`,
+      managerParams
+    );
+
+    const existingKeys = new Set();
+    for (const row of managerRowsResult.rows) {
+      buildSustainabilitySourceKeysFromManagerRow(row, managerPkCol).forEach((key) => existingKeys.add(key));
+    }
+
+    let inserted = 0;
+
+    for (const row of legacyRows) {
+      const snapshot = buildSustainabilitySnapshotFromDeliveryRow(row);
+      const sourceKey = buildSustainabilitySourceKey(snapshot.source_type, snapshot.source_id);
+      if (!sourceKey || existingKeys.has(sourceKey)) {
+        continue;
+      }
+
+      const normalizedStatus = normalizeSustainabilityApprovalStatus(row.carbon_verification_status);
+      const submittedAt = snapshot.submittedAt || new Date().toISOString();
+      const reviewedAt = normalizedStatus === "pending"
+        ? null
+        : row.carbon_verified_at || row.updated_at || submittedAt;
+
+      const insertCols = [];
+      const insertVals = [];
+      const insertParams = [];
+      let idx = 1;
+      const push = (column, value) => {
+        insertCols.push(column);
+        insertVals.push(`$${idx++}`);
+        insertParams.push(value);
+      };
+
+      if (managerColumns.has("business_id")) push("business_id", row.business_id ?? businessId ?? null);
+      if (managerColumns.has("approval_type")) push("approval_type", "carbon_verification");
+      if (managerColumns.has("status")) push("status", normalizedStatus);
+      if (managerColumns.has("required_role")) push("required_role", "sustainability_manager");
+      if (managerColumns.has("related_record_id")) push("related_record_id", snapshot.source_id);
+      if (managerColumns.has("delivery_id")) push("delivery_id", snapshot.delivery_id ?? snapshot.source_id);
+      if (managerColumns.has("route_id")) push("route_id", snapshot.route_id);
+      if (managerColumns.has("product_name")) push("product_name", "Carbon Verification");
+      if (managerColumns.has("location")) push("location", snapshot.route || "Delivery");
+      if (managerColumns.has("priority")) push("priority", "MEDIUM");
+      if (managerColumns.has("ai_suggestion")) push("ai_suggestion", `Verify carbon footprint for ${snapshot.route || snapshot.delivery_label}`);
+      if (managerColumns.has("submitted_by")) push("submitted_by", row.submitted_by || null);
+      if (managerColumns.has("request_data")) push("request_data", JSON.stringify(snapshot));
+      if (managerColumns.has("extra_data")) push("extra_data", JSON.stringify({ source: snapshot }));
+      if (managerColumns.has("created_at")) push("created_at", submittedAt);
+      if (managerColumns.has("updated_at")) push("updated_at", reviewedAt || submittedAt);
+      if (normalizedStatus !== "pending" && managerColumns.has("reviewed_at")) push("reviewed_at", reviewedAt);
+      if (normalizedStatus !== "pending" && managerColumns.has("manager_comment")) push("manager_comment", row.carbon_verification_comment || null);
+      if (normalizedStatus !== "pending" && managerColumns.has("review_notes")) push("review_notes", row.carbon_verification_comment || null);
+      if (normalizedStatus !== "pending" && managerColumns.has("decision_notes")) push("decision_notes", row.carbon_verification_comment || null);
+
+      if (insertCols.length === 0) {
+        continue;
+      }
+
+      await pool.query(
+        `INSERT INTO manager_approvals (${insertCols.join(", ")})
+         VALUES (${insertVals.join(", ")})`,
+        insertParams
+      );
+
+      existingKeys.add(sourceKey);
+      inserted += 1;
+    }
+
+    return { inserted, available: true };
+  } catch (err) {
+    console.warn("Legacy sustainability approval sync failed:", err.message);
+    return { inserted: 0, available: false };
+  }
+}
+
+async function fetchSustainabilityQueueItems({ includeHistory = false, businessId = null, limit = 50 } = {}) {
+  await syncLegacySustainabilityApprovals(businessId);
+
+  const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
+  const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
+  const managerColumns = hasManagerApprovals ? await getManagerApprovalsColumns() : new Set();
+  const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "approval_id";
+  const canUseManagerApprovals =
+    hasManagerApprovals &&
+    managerColumns.has("approval_type") &&
+    managerColumns.has("status");
+
+  if (canUseManagerApprovals) {
+    const params = [];
+    let where = `ma.approval_type = 'carbon_verification'`;
+
+    if (businessId && managerColumns.has("business_id")) {
+      params.push(businessId);
+      where += ` AND ma.business_id = $${params.length}`;
+    }
+
+    if (includeHistory) {
+      where += ` AND LOWER(COALESCE(ma.status, '')) IN ('verified', 'revision_requested')`;
+    } else {
+      where += ` AND ${sustainabilityPendingStatusPredicate.replace(/\bstatus\b/g, "ma.status")}`;
+      if (managerColumns.has("required_role")) {
+        where += ` AND LOWER(COALESCE(ma.required_role, '')) = 'sustainability_manager'`;
+      }
+    }
+
+    params.push(limit);
+    const orderExpr = includeHistory
+      ? managerColumns.has("reviewed_at")
+        ? "ma.reviewed_at DESC NULLS LAST, ma.created_at DESC NULLS LAST"
+        : "ma.created_at DESC NULLS LAST"
+      : "ma.created_at DESC NULLS LAST";
+
+    const result = await pool.query(
+      `
+      SELECT ma.*
+      FROM manager_approvals ma
+      WHERE ${where}
+      ORDER BY ${orderExpr}
+      LIMIT $${params.length}
+    `,
+      params
+    );
+
+    return (result.rows || []).map((row) => mapSustainabilityManagerRowToMobileItem(row, managerPkCol));
+  }
+
+  const legacyRows = await listLegacySustainabilityDeliveryRows({ businessId, includeHistory, limit });
+  return legacyRows.map((row) => {
+    const snapshot = buildSustainabilitySnapshotFromDeliveryRow(row);
+    return {
+      id: parseInt(snapshot.source_id, 10) || 0,
+      approvalId: parseInt(snapshot.source_id, 10) || 0,
+      sourceId: parseInt(snapshot.source_id, 10) || 0,
+      deliveryId: snapshot.delivery_label,
+      type: snapshot.source_type,
+      routeId: parseInt(snapshot.route_id, 10) || null,
+      date: snapshot.date,
+      route: snapshot.route,
+      driver: snapshot.driver,
+      vehicle: snapshot.vehicle,
+      estimatedFuel: snapshot.estimatedFuel,
+      actualFuel: snapshot.actualFuel,
+      estimatedCO2: snapshot.estimatedCO2,
+      actualCO2: snapshot.actualCO2,
+      distance: snapshot.distance,
+      businessName: snapshot.businessName,
+      submittedAt: snapshot.submittedAt,
+      reviewedAt: snapshot.reviewedAt,
+      status: snapshot.status,
+      comment: snapshot.comment
+    };
+  });
+}
+
+function summarizeSustainabilityItems(pendingItems, historyItems) {
+  const todayIso = new Date().toISOString().slice(0, 10);
+  const totalVerified = historyItems.filter((item) => item.status === "verified").length;
+  const totalRevisions = historyItems.filter((item) => item.status === "revision_requested").length;
+  const verifiedToday = historyItems.filter((item) => {
+    if (item.status !== "verified") return false;
+    const decidedAt = String(item.reviewedAt || item.date || item.submittedAt || "");
+    return decidedAt.slice(0, 10) === todayIso;
+  }).length;
+  const totalCO2Verified = historyItems
+    .filter((item) => item.status === "verified")
+    .reduce((sum, item) => sum + (parseFloat(item.actualCO2) || 0), 0);
+
+  return {
+    pendingVerifications: pendingItems.length,
+    verifiedToday,
+    revisionRequested: totalRevisions,
+    totalVerified,
+    totalRevisions,
+    totalCO2Verified: parseFloat(totalCO2Verified.toFixed(2)),
+    ecoTrustPoints: totalVerified * 10
+  };
+}
+
+async function updateSustainabilitySourceStatus({ sourceType, sourceId, routeId = null, carbonStatus, comment }) {
+  const cleanSourceType = String(sourceType || "delivery").trim().toLowerCase();
+  const cleanSourceId = String(sourceId || "").trim();
+  const cleanComment = comment || null;
+
+  if (!cleanSourceId) {
+    return { success: false, message: "Linked source ID is missing" };
+  }
+
+  if ((cleanSourceType === "route_approval" || cleanSourceType === "route") && (await tableExists("route_approvals"))) {
+    await pool.query(
+      `UPDATE route_approvals
+       SET carbon_verification_status = $1,
+           carbon_verification_comment = $2,
+           carbon_verified_at = NOW()
+       WHERE id::text = $3 OR route_id::text = $3`,
+      [carbonStatus, cleanComment, cleanSourceId]
+    );
+    return { success: true };
+  }
+
+  if (await tableExists("deliveries")) {
+    await pool.query(
+      `UPDATE deliveries
+       SET carbon_verification_status = $1,
+           carbon_verification_comment = $2,
+           carbon_verified_at = NOW()
+       WHERE delivery_id::text = $3 OR route_id::text = $3`,
+      [carbonStatus, cleanComment, cleanSourceId]
+    );
+    return { success: true };
+  }
+
+  return { success: false, message: "No linked sustainability source table found" };
+}
+
+async function findLatestSustainabilityManagerApprovalByAnyId(candidateId, managerColumns, managerPkCol, businessId = null, sourceType = null) {
+  const cleanId = String(candidateId || "").trim();
+  if (!cleanId) return null;
+
+  const params = [];
+  let where = `ma.approval_type = 'carbon_verification'`;
+  if (businessId && managerColumns.has("business_id")) {
+    params.push(businessId);
+    where += ` AND ma.business_id = $${params.length}`;
+  }
+
+  const idParamIndex = params.length + 1;
+  params.push(cleanId);
+  const matchClauses = [`ma.${managerPkCol}::text = $${idParamIndex}`];
+  if (managerColumns.has("related_record_id")) matchClauses.push(`COALESCE(ma.related_record_id::text, '') = $${idParamIndex}`);
+  if (managerColumns.has("delivery_id")) matchClauses.push(`COALESCE(ma.delivery_id::text, '') = $${idParamIndex}`);
+  if (managerColumns.has("route_id")) matchClauses.push(`COALESCE(ma.route_id::text, '') = $${idParamIndex}`);
+
+  const result = await pool.query(
+    `
+    SELECT ma.*
+    FROM manager_approvals ma
+    WHERE ${where}
+      AND (${matchClauses.join(" OR ")})
+    ORDER BY ${
+      managerColumns.has("created_at")
+        ? "ma.created_at DESC NULLS LAST"
+        : `ma.${managerPkCol} DESC`
+    }
+  `,
+    params
+  );
+
+  if (!result.rows.length) {
+    return null;
+  }
+
+  if (!sourceType) {
+    return result.rows[0];
+  }
+
+  const desiredSourceType = String(sourceType).trim().toLowerCase();
+  return (
+    result.rows.find((row) => {
+      const requestData = parseMaybeJsonObject(row.request_data) || {};
+      const extraData = parseMaybeJsonObject(row.extra_data) || {};
+      const sourceData = parseMaybeJsonObject(extraData.source) || {};
+      const rowSourceType = String(
+        requestData.source_type ||
+        sourceData.source_type ||
+        (row.delivery_id ? "delivery" : "route_approval")
+      ).trim().toLowerCase();
+      return rowSourceType === desiredSourceType;
+    }) || result.rows[0]
+  );
+}
+
+app.get("/api/sustainability/dashboard", optionalAuth, async (req, res) => {
+  try {
+    const businessId = req.user?.businessId || req.user?.business_id || null;
+    const pendingItems = await fetchSustainabilityQueueItems({
+      includeHistory: false,
+      businessId,
+      limit: 20
+    });
+    const historyItems = await fetchSustainabilityQueueItems({
+      includeHistory: true,
+      businessId,
+      limit: 500
+    });
+    const summary = summarizeSustainabilityItems(pendingItems, historyItems);
+
+    return res.json({
+      success: true,
+      summary: {
+        pendingVerifications: summary.pendingVerifications,
+        verifiedToday: summary.verifiedToday,
+        revisionRequested: summary.revisionRequested,
+        totalCO2Verified: summary.totalCO2Verified,
+        ecoTrustPoints: summary.ecoTrustPoints
+      },
+      pendingVerifications: pendingItems.map((item) => ({
+        id: item.id,
+        deliveryId: item.deliveryId,
+        type: item.type,
+        routeId: item.routeId,
+        date: item.date,
+        route: item.route,
+        driver: item.driver,
+        vehicle: item.vehicle,
+        estimatedFuel: item.estimatedFuel,
+        actualFuel: item.actualFuel,
+        estimatedCO2: item.estimatedCO2,
+        actualCO2: item.actualCO2,
+        distance: item.distance,
+        businessName: item.businessName,
+        submittedAt: item.submittedAt,
+        status: item.status
+      })),
+      message: null
+    });
+  } catch (err) {
+    console.error("Sustainability dashboard error:", err);
+    return res.status(500).json({ success: false, message: "Sustainability dashboard unavailable" });
+  }
 });
 
-app.get("/api/sustainability/history", async (req, res) => {
+app.post("/api/sustainability/verify", optionalAuth, async (req, res) => {
+  const { verificationId, decision, comment, sourceType } = req.body || {};
+  if (!verificationId || !decision) {
+    return res.status(400).json({ success: false, message: "verificationId and decision are required" });
+  }
+
   try {
-    const result = await pool.query(`
-      SELECT d.*, bp.business_name 
-      FROM deliveries d 
-      LEFT JOIN business_profiles bp ON d.business_id = bp.business_id 
-      WHERE d.carbon_verification_status IN ('verified', 'revision_requested') 
-      ORDER BY d.carbon_verified_at DESC LIMIT 50
-    `);
-    const rows = result.rows || [];
-    const totalVerified = rows.filter(r => String(r.carbon_verification_status || '').toLowerCase() === 'verified').length;
-    const totalRevisions = rows.filter(r => String(r.carbon_verification_status || '').toLowerCase() === 'revision_requested').length;
-    const totalCO2Verified = rows
-      .filter(r => String(r.carbon_verification_status || '').toLowerCase() === 'verified')
-      .reduce((sum, r) => sum + (parseFloat(r.carbon_emissions) || 0), 0);
-    const summary = {
-      verifiedToday: 0,
-      totalVerified,
-      totalRevisions,
-      totalCO2Verified,
-      ecoTrustPoints: totalVerified * 10
-    };
-    res.json({ 
-      success: true, 
-      history: rows.map(row => ({ 
-        id: row.delivery_id, 
-        route: `${row.from_location} → ${row.to_location}`, 
-        driver: row.driver_name, 
-        date: row.carbon_verified_at, 
-        estimatedCO2: parseFloat(row.estimated_carbon_kg) || 0, 
-        actualCO2: parseFloat(row.carbon_emissions) || 0, 
-        status: row.carbon_verification_status 
-      })), 
-      summary,
-      message: null 
+    const businessId = req.user?.businessId || req.user?.business_id || null;
+    await syncLegacySustainabilityApprovals(businessId);
+
+    const normalizedDecision = String(decision || "").trim().toUpperCase();
+    const isVerify = ["VERIFY", "VERIFIED", "APPROVE", "APPROVED"].includes(normalizedDecision);
+    const carbonStatus = isVerify ? "verified" : "revision_requested";
+    const cleanComment = comment || null;
+
+    const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
+    const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
+    const managerColumns = hasManagerApprovals ? await getManagerApprovalsColumns() : new Set();
+    const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "approval_id";
+    const canUseManagerApprovals =
+      hasManagerApprovals &&
+      managerColumns.has("approval_type") &&
+      managerColumns.has("status");
+
+    let sourceRecordType = String(sourceType || "delivery").trim().toLowerCase();
+    let sourceRecordId = verificationId;
+    let routeId = null;
+
+    if (canUseManagerApprovals) {
+      const matchedApproval = await findLatestSustainabilityManagerApprovalByAnyId(
+        verificationId,
+        managerColumns,
+        managerPkCol,
+        businessId,
+        sourceType
+      );
+
+      if (matchedApproval) {
+        const setClauses = ["status = $1"];
+        const params = [carbonStatus];
+        let idx = 2;
+
+        if (managerColumns.has("updated_at")) setClauses.push("updated_at = NOW()");
+        if (managerColumns.has("reviewed_at")) setClauses.push("reviewed_at = NOW()");
+        if (managerColumns.has("decision_date")) setClauses.push("decision_date = NOW()");
+        if (managerColumns.has("review_notes")) {
+          setClauses.push(`review_notes = $${idx}`);
+          params.push(cleanComment);
+          idx++;
+        }
+        if (managerColumns.has("manager_comment")) {
+          setClauses.push(`manager_comment = $${idx}`);
+          params.push(cleanComment);
+          idx++;
+        }
+        if (managerColumns.has("decision_notes")) {
+          setClauses.push(`decision_notes = $${idx}`);
+          params.push(cleanComment);
+          idx++;
+        }
+        if (managerColumns.has("decision")) {
+          setClauses.push(`decision = $${idx}`);
+          params.push(carbonStatus);
+          idx++;
+        }
+        if (carbonStatus === "revision_requested" && managerColumns.has("required_role")) {
+          setClauses.push(`required_role = $${idx}`);
+          params.push("admin");
+          idx++;
+        }
+
+        params.push(String(matchedApproval[managerPkCol]));
+        await pool.query(
+          `UPDATE manager_approvals
+           SET ${setClauses.join(", ")}
+           WHERE ${managerPkCol}::text = $${idx}
+             AND approval_type = 'carbon_verification'`,
+          params
+        );
+
+        const requestData = parseMaybeJsonObject(matchedApproval.request_data) || {};
+        const extraData = parseMaybeJsonObject(matchedApproval.extra_data) || {};
+        const sourceData = parseMaybeJsonObject(extraData.source) || {};
+        sourceRecordType = String(
+          requestData.source_type ||
+          sourceData.source_type ||
+          sourceRecordType
+        ).trim().toLowerCase();
+        sourceRecordId =
+          requestData.source_id ||
+          sourceData.source_id ||
+          matchedApproval.related_record_id ||
+          matchedApproval.delivery_id ||
+          verificationId;
+        routeId = requestData.route_id || sourceData.route_id || matchedApproval.route_id || null;
+      }
+    }
+
+    const sourceUpdate = await updateSustainabilitySourceStatus({
+      sourceType: sourceRecordType,
+      sourceId: sourceRecordId,
+      routeId,
+      carbonStatus,
+      comment: cleanComment
     });
-  } catch (err) { res.status(500).json({ success: false }); }
+
+    if (!sourceUpdate.success) {
+      return res.status(500).json({ success: false, message: sourceUpdate.message || "Failed to update source record" });
+    }
+
+    return res.json({
+      success: true,
+      message: carbonStatus === "verified"
+        ? "Carbon footprint verified successfully"
+        : "Carbon verification returned for revision"
+    });
+  } catch (err) {
+    console.error("Sustainability verify error:", err);
+    return res.status(500).json({ success: false, message: "Failed to submit sustainability decision" });
+  }
+});
+
+app.get("/api/sustainability/history", optionalAuth, async (req, res) => {
+  try {
+    const businessId = req.user?.businessId || req.user?.business_id || null;
+    const historyItems = await fetchSustainabilityQueueItems({
+      includeHistory: true,
+      businessId,
+      limit: 50
+    });
+    const summary = summarizeSustainabilityItems([], historyItems);
+
+    return res.json({
+      success: true,
+      history: historyItems.map((item) => ({
+        id: item.id,
+        verificationId: item.sourceId || item.id,
+        type: item.type,
+        route: item.route,
+        driver: item.driver,
+        date: item.reviewedAt || item.date || item.submittedAt,
+        estimatedCO2: item.estimatedCO2,
+        actualCO2: item.actualCO2,
+        estimatedFuel: item.estimatedFuel,
+        actualFuel: item.actualFuel,
+        distance: item.distance,
+        status: item.status,
+        comment: item.comment,
+        businessName: item.businessName
+      })),
+      summary: {
+        verifiedToday: summary.verifiedToday,
+        totalVerified: summary.totalVerified,
+        totalRevisions: summary.totalRevisions,
+        totalCO2Verified: summary.totalCO2Verified,
+        ecoTrustPoints: summary.ecoTrustPoints
+      },
+      message: null
+    });
+  } catch (err) {
+    console.error("Sustainability history error:", err);
+    return res.status(500).json({ success: false, message: "Failed to load sustainability history" });
+  }
 });
 
 // ============================================================
