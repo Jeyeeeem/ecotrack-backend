@@ -187,7 +187,9 @@ async function getLogisticsDbSnapshot(routeIdOrCandidates) {
     for (const candidate of candidates) {
       const routeRes = await pool.query(
         `SELECT * FROM delivery_routes 
-         WHERE route_id::text = $1 OR route_id = NULLIF($2, 0)
+         WHERE route_id::text = $1
+            OR route_id = NULLIF($2, 0)
+            OR COALESCE(route_name::text, '') = $1
          LIMIT 1`,
         [candidate, Number(candidate) || 0]
       );
@@ -2056,6 +2058,17 @@ const normalizeLogisticsStop = (stop, index) => {
   };
 };
 
+const parseMaybeJsonArray = (value) => {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    return [];
+  }
+};
+
 const parseMaybeJsonObject = (value) => {
   if (!value) return {};
   if (typeof value === "object") return value;
@@ -2099,6 +2112,75 @@ const extractLatLng = (...values) => {
     }
   }
   return null;
+};
+
+const toNormalizedLogisticsStops = (candidateStops) => {
+  if (!Array.isArray(candidateStops) || candidateStops.length === 0) return [];
+  return candidateStops.map((stop, index) => {
+    const base = normalizeLogisticsStop(stop, index);
+    const point = extractLatLng(stop?.location, stop);
+    return point ? { ...base, latitude: point.latitude, longitude: point.longitude } : base;
+  });
+};
+
+const scoreLogisticsStops = (stops) => {
+  if (!Array.isArray(stops) || stops.length === 0) return -1;
+  const coordinateCount = stops.filter((stop) => stop?.latitude != null && stop?.longitude != null).length;
+  const distinctSequences = new Set(
+    stops.map((stop, index) => {
+      const parsed = Number.parseInt(stop?.sequence ?? stop?.stop_sequence ?? index + 1, 10);
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : index + 1;
+    })
+  ).size;
+  return stops.length * 100 + coordinateCount * 10 + distinctSequences;
+};
+
+const pickBestLogisticsStops = (...candidateArrays) => {
+  let bestStops = [];
+  let bestScore = -1;
+  for (const candidate of candidateArrays) {
+    const normalized = toNormalizedLogisticsStops(candidate);
+    const score = scoreLogisticsStops(normalized);
+    if (score > bestScore) {
+      bestStops = normalized;
+      bestScore = score;
+    }
+  }
+  return bestStops;
+};
+
+const mergeLogisticsStopCoordinates = (preferredStops, fallbackStops) => {
+  if (!Array.isArray(preferredStops) || preferredStops.length === 0) {
+    return Array.isArray(fallbackStops) ? fallbackStops : [];
+  }
+  if (!Array.isArray(fallbackStops) || fallbackStops.length === 0) {
+    return preferredStops;
+  }
+
+  const fallbackBySequence = new Map();
+  fallbackStops.forEach((stop, index) => {
+    const parsedSequence = Number.parseInt(
+      stop?.sequence ?? stop?.stop_sequence ?? stop?.stopId ?? stop?.stop_id ?? index + 1,
+      10
+    );
+    const sequence = Number.isFinite(parsedSequence) && parsedSequence > 0 ? parsedSequence : index + 1;
+    if (!fallbackBySequence.has(sequence)) {
+      fallbackBySequence.set(sequence, stop);
+    }
+  });
+
+  return preferredStops.map((stop, index) => {
+    const parsedSequence = Number.parseInt(
+      stop?.sequence ?? stop?.stop_sequence ?? stop?.stopId ?? stop?.stop_id ?? index + 1,
+      10
+    );
+    const sequence = Number.isFinite(parsedSequence) && parsedSequence > 0 ? parsedSequence : index + 1;
+    const fallbackStop = fallbackBySequence.get(sequence);
+    const merged = fallbackStop ? { ...fallbackStop, ...stop } : stop;
+    const base = normalizeLogisticsStop(merged, index);
+    const point = extractLatLng(stop, fallbackStop);
+    return point ? { ...base, latitude: point.latitude, longitude: point.longitude } : base;
+  });
 };
 
 const normalizeRoutePoint = (point) => {
@@ -2473,32 +2555,40 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     routeData.destination
   );
 
-  let stops = [];
-  if (Array.isArray(row.stops_json) && row.stops_json.length > 0) {
-    stops = row.stops_json.map((stop, index) => {
-      const base = normalizeLogisticsStop(stop, index);
-      const point = extractLatLng(stop);
-      return point ? { ...base, latitude: point.latitude, longitude: point.longitude } : base;
-    });
-  } else if (Array.isArray(routeStopsFromDb) && routeStopsFromDb.length > 0) {
-    stops = routeStopsFromDb.map((stop, index) => {
-      const base = normalizeLogisticsStop(stop, index);
-      const point = extractLatLng(stop.location, stop);
-      return point ? { ...base, latitude: point.latitude, longitude: point.longitude } : base;
-    });
-  } else if (Array.isArray(requestData.stops) && requestData.stops.length > 0) {
-    stops = requestData.stops.map((stop, index) => {
-      const base = normalizeLogisticsStop(stop, index);
-      const point = extractLatLng(stop);
-      return point ? { ...base, latitude: point.latitude, longitude: point.longitude } : base;
-    });
-  } else if (Array.isArray(routeData.stops) && routeData.stops.length > 0) {
-    stops = routeData.stops.map((stop, index) => {
-      const base = normalizeLogisticsStop(stop, index);
-      const point = extractLatLng(stop);
-      return point ? { ...base, latitude: point.latitude, longitude: point.longitude } : base;
-    });
-  } else if (hasRouteStops && routeId) {
+  const rowStops = parseMaybeJsonArray(row.stops_json);
+  const dbStops = toNormalizedLogisticsStops(routeStopsFromDb);
+  let stops = pickBestLogisticsStops(
+    rowStops,
+    requestData.stops,
+    requestData.original_stops,
+    requestData.originalStops,
+    requestData.optimized_stops,
+    requestData.optimizedStops,
+    routeData.stops,
+    routeData.original_stops,
+    routeData.originalStops,
+    routeData.optimized_stops,
+    routeData.optimizedStops,
+    optimizationData.originalStops,
+    optimizationData.original_stops,
+    optimizationData.optimizedStops,
+    optimizationData.optimized_stops,
+    optimization.originalStops,
+    optimization.original_stops,
+    optimization.optimizedStops,
+    optimization.optimized_stops,
+    requestOptimizationData.originalStops,
+    requestOptimizationData.original_stops,
+    requestOptimizationData.optimizedStops,
+    requestOptimizationData.optimized_stops,
+    requestOptimization.originalStops,
+    requestOptimization.original_stops,
+    requestOptimization.optimizedStops,
+    requestOptimization.optimized_stops,
+    dbStops
+  );
+
+  if (stops.length === 0 && hasRouteStops && routeId) {
     try {
       const stopsResult = await pool.query(
         `SELECT stop_sequence, location_name, address, latitude, longitude
@@ -2508,15 +2598,17 @@ async function buildLogisticsRoutePayload(row, options = {}) {
         [routeId]
       );
       if (stopsResult.rows.length > 0) {
-        stops = stopsResult.rows.map((stop, index) => {
-          const base = normalizeLogisticsStop(stop, index);
-          const point = extractLatLng(stop);
-          return point ? { ...base, latitude: point.latitude, longitude: point.longitude } : base;
-        });
+        stops = toNormalizedLogisticsStops(stopsResult.rows);
       }
     } catch (e) {
       // Ignore route stop lookup failures and keep fallback stops below.
     }
+  }
+
+  if (stops.length > 0 && dbStops.length > 0) {
+    const preferredStops = stops.length >= dbStops.length ? stops : dbStops;
+    const fallbackStops = preferredStops === stops ? dbStops : stops;
+    stops = mergeLogisticsStopCoordinates(preferredStops, fallbackStops);
   }
 
   if (stops.length === 0) {
@@ -4856,17 +4948,19 @@ app.get("/api/logistics/route/:routeId", async (req, res) => {
             [ridInt]
           );
           if (stopsRes.rows.length > 0) {
-            const refreshedStops = stopsRes.rows.map((stop, index) => {
-              const base = normalizeLogisticsStop(stop, index);
-              const point = extractLatLng(stop);
-              return point ? { ...base, latitude: point.latitude, longitude: point.longitude } : base;
-            });
-            route.stops = refreshedStops;
-            if (!Array.isArray(route.original_stops) || route.original_stops.length === 0) {
-              route.original_stops = refreshedStops;
+            const refreshedStops = toNormalizedLogisticsStops(stopsRes.rows);
+            const currentStops = Array.isArray(route.stops) ? route.stops : [];
+            const preferredStops =
+              currentStops.length >= refreshedStops.length ? currentStops : refreshedStops;
+            const fallbackStops =
+              preferredStops === currentStops ? refreshedStops : currentStops;
+            const mergedStops = mergeLogisticsStopCoordinates(preferredStops, fallbackStops);
+            route.stops = mergedStops.length > 0 ? mergedStops : preferredStops;
+            if (!Array.isArray(route.original_stops) || route.original_stops.length < route.stops.length) {
+              route.original_stops = route.stops;
             }
-            if (!Array.isArray(route.optimized_stops) || route.optimized_stops.length === 0) {
-              route.optimized_stops = refreshedStops;
+            if (!Array.isArray(route.optimized_stops) || route.optimized_stops.length < route.stops.length) {
+              route.optimized_stops = route.stops;
             }
           }
         }
