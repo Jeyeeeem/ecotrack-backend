@@ -2930,7 +2930,14 @@ async function buildLogisticsRoutePayload(row, options = {}) {
   const displayRouteCode = routeName || (routeId ? `Route-${routeId}` : null);
 
   const submittedBy = row.submitted_by || row.requested_by || row.reviewed_by || "System";
+  const approvalId =
+    row.approval_id ??
+    row.approvalId ??
+    row.id ??
+    null;
   const payload = {
+    approval_id: approvalId,
+    approvalId,
     route_id: routeId,
     routeId,
     route_number: routeId,
@@ -3365,6 +3372,267 @@ const fetchRouteOptimizationStats = async () => {
   }
 };
 
+const isPendingLogisticsManagerStatus = (rawStatus) => {
+  const status = String(rawStatus || "").trim().toLowerCase();
+  if (!status) return true;
+  return (
+    ["pending", "awaiting_approval", "submitted", "in_review", "for_approval"].includes(status) ||
+    status.includes("pending") ||
+    status.includes("await") ||
+    status.includes("review") ||
+    status.includes("submit")
+  );
+};
+
+const normalizeLogisticsManagerStatus = (rawStatus) => {
+  const status = String(rawStatus || "").trim().toLowerCase();
+  if (isPendingLogisticsManagerStatus(status)) return "pending";
+  if (
+    [
+      "approved",
+      "approve",
+      "accepted",
+      "assigned",
+      "completed",
+      "in_progress",
+      "in-transit",
+      "in_transit"
+    ].includes(status)
+  ) {
+    return "approved";
+  }
+  if (["declined", "rejected", "cancelled", "canceled"].includes(status)) {
+    return "declined";
+  }
+  return "pending";
+};
+
+async function findLatestLogisticsManagerApprovalByAnyId(candidateId, managerColumns, managerPkCol, businessId = null) {
+  const lookupId = String(candidateId || "").trim();
+  if (!lookupId) return null;
+
+  const params = [lookupId];
+  const matchClauses = [`COALESCE(ma.${managerPkCol}::text, '') = $1`];
+  if (managerColumns.has("route_id")) matchClauses.push(`COALESCE(ma.route_id::text, '') = $1`);
+  if (managerColumns.has("related_record_id")) matchClauses.push(`COALESCE(ma.related_record_id::text, '') = $1`);
+  if (managerColumns.has("delivery_id")) matchClauses.push(`COALESCE(ma.delivery_id::text, '') = $1`);
+  if (managerColumns.has("request_data")) matchClauses.push(`COALESCE(ma.request_data->>'route_id', '') = $1`);
+  if (managerColumns.has("extra_data")) matchClauses.push(`COALESCE(ma.extra_data->'route'->>'route_id', '') = $1`);
+  const businessClause =
+    businessId && managerColumns.has("business_id")
+      ? (() => {
+          params.push(businessId);
+          return ` AND COALESCE(ma.business_id, 0) = $${params.length}`;
+        })()
+      : "";
+
+  const orderExpr = managerColumns.has("created_at")
+    ? "ma.created_at DESC NULLS LAST"
+    : `ma.${managerPkCol} DESC`;
+
+  const result = await pool.query(
+    `SELECT *
+     FROM manager_approvals ma
+     WHERE ma.approval_type = 'route_optimization'
+       AND (${matchClauses.join(" OR ")})
+       ${businessClause}
+     ORDER BY ${orderExpr}
+     LIMIT 1`,
+    params
+  );
+
+  return result.rows[0] || null;
+}
+
+async function syncLegacyLogisticsApprovals(businessId = null) {
+  try {
+    const hasManagerApprovals = await tableExists("manager_approvals");
+    const hasRouteApprovals = await tableExists("route_approvals");
+    if (!hasManagerApprovals || !hasRouteApprovals) {
+      return { inserted: 0, available: false };
+    }
+
+    const managerColumns = await getManagerApprovalsColumns();
+    const managerPkCol = await getManagerApprovalsPkColumn();
+    const routeApprovalColumns = await getTableColumns("route_approvals");
+    const canUseManagerQueue =
+      managerColumns.has("approval_type") &&
+      managerColumns.has("status") &&
+      (
+        managerColumns.has("route_id") ||
+        managerColumns.has("related_record_id") ||
+        managerColumns.has("delivery_id") ||
+        managerColumns.has("request_data") ||
+        managerColumns.has("extra_data")
+      );
+
+    if (!canUseManagerQueue) {
+      return { inserted: 0, available: false };
+    }
+
+    const routeParams = [];
+    let routeWhere = "1=1";
+    if (businessId && routeApprovalColumns.has("business_id")) {
+      routeParams.push(businessId);
+      routeWhere += ` AND COALESCE(ra.business_id, 0) = $${routeParams.length}`;
+    }
+
+    const legacyRoutesResult = await pool.query(
+      `SELECT ra.*
+       FROM route_approvals ra
+       WHERE ${routeWhere}
+       ORDER BY COALESCE(ra.submitted_at, ra.created_at, NOW()) DESC, ra.id DESC
+       LIMIT 500`,
+      routeParams
+    );
+
+    if (legacyRoutesResult.rows.length === 0) {
+      return { inserted: 0, available: true };
+    }
+
+    const managerParams = [];
+    let managerWhere = `approval_type = 'route_optimization'`;
+    if (businessId && managerColumns.has("business_id")) {
+      managerParams.push(businessId);
+      managerWhere += ` AND COALESCE(business_id, 0) = $${managerParams.length}`;
+    }
+
+    const managerRowsResult = await pool.query(
+      `SELECT * FROM manager_approvals
+       WHERE ${managerWhere}
+       ORDER BY ${
+         managerColumns.has("created_at")
+           ? "created_at DESC NULLS LAST"
+           : `${managerPkCol} DESC`
+       }`,
+      managerParams
+    );
+
+    const existingKeys = new Set();
+    for (const row of managerRowsResult.rows) {
+      const requestData = parseMaybeJsonObject(row.request_data) || {};
+      const extraData = parseMaybeJsonObject(row.extra_data) || {};
+      const routeData =
+        extraData.route && typeof extraData.route === "object" ? extraData.route : {};
+      normalizeRouteIdCandidates(row.route_id || row.related_record_id || row.delivery_id || row[managerPkCol], [
+        requestData.route_id,
+        routeData.route_id
+      ]).forEach((candidate) => existingKeys.add(candidate));
+    }
+
+    let inserted = 0;
+
+    for (const row of legacyRoutesResult.rows) {
+      const routeIdValue =
+        (routeApprovalColumns.has("route_id") ? row.route_id : null) || row.id || null;
+      const routeKeyCandidates = normalizeRouteIdCandidates(routeIdValue, [
+        row.id,
+        row.route_id,
+        row.route_name
+      ]);
+
+      if (routeKeyCandidates.some((candidate) => existingKeys.has(candidate))) {
+        continue;
+      }
+
+      const normalizedStatus = normalizeLogisticsManagerStatus(row.status);
+      const submittedAt = row.submitted_at || row.created_at || new Date().toISOString();
+      const reviewedAt =
+        normalizedStatus === "pending"
+          ? null
+          : row.approved_at || row.updated_at || submittedAt;
+      const routeSnapshot = {
+        route_id: row.route_id ?? row.id ?? null,
+        route_name: row.route_name || null,
+        route_type: row.route_type || "STANDARD",
+        from_location: row.from_location || null,
+        to_location: row.to_location || null,
+        driver_name: row.driver_name || null,
+        vehicle_type: row.vehicle_type || null,
+        departure_time: row.departure_time || null,
+        original_distance: row.original_distance ?? null,
+        optimized_distance: row.optimized_distance ?? null,
+        original_fuel: row.original_fuel ?? null,
+        optimized_fuel: row.optimized_fuel ?? null,
+        original_co2: row.original_co2 ?? null,
+        optimized_co2: row.optimized_co2 ?? null,
+        savings_km: row.savings_km ?? null,
+        savings_fuel: row.savings_fuel ?? null,
+        savings_co2: row.savings_co2 ?? null,
+        ai_suggestion: row.ai_suggestion || null,
+        route_path: row.route_path || null
+      };
+      const requestData = {
+        ...routeSnapshot,
+        submitted_by: row.submitted_by || null,
+        submitted_at: submittedAt
+      };
+      const extraData = {
+        route: routeSnapshot,
+        optimization: {
+          optimized_distance: row.optimized_distance ?? null,
+          optimized_fuel: row.optimized_fuel ?? null,
+          optimized_co2: row.optimized_co2 ?? null,
+          savings_km: row.savings_km ?? null,
+          savings_fuel: row.savings_fuel ?? null,
+          savings_co2: row.savings_co2 ?? null
+        }
+      };
+
+      const insertCols = [];
+      const insertVals = [];
+      const insertParams = [];
+      let idx = 1;
+      const push = (column, value) => {
+        insertCols.push(column);
+        insertVals.push(`$${idx++}`);
+        insertParams.push(value);
+      };
+
+      if (managerColumns.has("business_id")) push("business_id", row.business_id ?? businessId ?? null);
+      if (managerColumns.has("approval_type")) push("approval_type", "route_optimization");
+      if (managerColumns.has("status")) push("status", normalizedStatus);
+      if (managerColumns.has("required_role")) {
+        push("required_role", normalizedStatus === "pending" ? "logistics_manager" : "logistics_manager");
+      }
+      if (managerColumns.has("route_id")) push("route_id", row.route_id ?? row.id ?? null);
+      if (managerColumns.has("related_record_id")) push("related_record_id", row.id ?? row.route_id ?? null);
+      if (managerColumns.has("delivery_id")) push("delivery_id", row.route_id ?? row.id ?? null);
+      if (managerColumns.has("product_name")) push("product_name", row.route_type || row.route_name || "STANDARD");
+      if (managerColumns.has("location")) push("location", row.from_location || "Origin");
+      if (managerColumns.has("priority")) push("priority", "MEDIUM");
+      if (managerColumns.has("ai_suggestion")) push("ai_suggestion", row.ai_suggestion || null);
+      if (managerColumns.has("submitted_by")) push("submitted_by", row.submitted_by || null);
+      if (managerColumns.has("manager_comment") && normalizedStatus !== "pending") {
+        push("manager_comment", row.manager_comment || null);
+      }
+      if (managerColumns.has("decision_notes") && normalizedStatus !== "pending") {
+        push("decision_notes", row.manager_comment || null);
+      }
+      if (managerColumns.has("reviewed_at") && reviewedAt) push("reviewed_at", reviewedAt);
+      if (managerColumns.has("request_data")) push("request_data", JSON.stringify(requestData));
+      if (managerColumns.has("extra_data")) push("extra_data", JSON.stringify(extraData));
+      if (managerColumns.has("created_at")) push("created_at", submittedAt);
+
+      if (insertCols.length === 0) continue;
+
+      await pool.query(
+        `INSERT INTO manager_approvals (${insertCols.join(", ")})
+         VALUES (${insertVals.join(", ")})`,
+        insertParams
+      );
+
+      routeKeyCandidates.forEach((candidate) => existingKeys.add(candidate));
+      inserted += 1;
+    }
+
+    return { inserted, available: true };
+  } catch (err) {
+    console.warn("Legacy logistics approval sync failed:", err.message);
+    return { inserted: 0, available: false };
+  }
+}
+
 app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
   try {
     const businessId = req.user?.businessId || req.user?.business_id || null;
@@ -3413,6 +3681,11 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
       : deliveryRouteColumns.has("created_at")
       ? "created_at"
       : "NULL::timestamp";
+    await syncLegacyLogisticsApprovals(businessId);
+    const managerPendingRoleClause =
+      managerColumns.has("required_role")
+        ? ` AND LOWER(COALESCE(required_role, '')) = 'logistics_manager'`
+        : "";
 
     let pendingResult;
     let statsResult;
@@ -3432,8 +3705,8 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
       );
     };
 
-    // Prefer authoritative delivery_routes rows first to avoid generating placeholder pending ids.
-    if (hasDeliveryRoutes) {
+    // Legacy-only fallback: if there is no manager approval queue support, fall back to raw delivery routes.
+    if (!canUseManagerRouteData && hasDeliveryRoutes) {
       const deliveryParams = [pendingDeliveryStatuses];
       let deliveryWhere = `LOWER(COALESCE(status, '')) = ANY($1::text[])`;
       if (businessId && deliveryRouteColumns.has("business_id")) {
@@ -3511,7 +3784,15 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
       }
       statsResult = await pool.query(
         `SELECT 
-          COUNT(*) FILTER (WHERE LOWER(status) IN ('pending', 'awaiting_approval')) as pending_count,
+          COUNT(*) FILTER (
+            WHERE (
+              LOWER(COALESCE(status, '')) IN ('pending', 'awaiting_approval', 'submitted', 'in_review', 'for_approval')
+              OR LOWER(COALESCE(status, '')) LIKE '%pending%'
+              OR LOWER(COALESCE(status, '')) LIKE '%await%'
+              OR LOWER(COALESCE(status, '')) LIKE '%review%'
+              OR LOWER(COALESCE(status, '')) LIKE '%submit%'
+            )${managerPendingRoleClause}
+          ) as pending_count,
           COUNT(*) FILTER (WHERE LOWER(COALESCE(status, '')) = 'approved') as approved_count,
           COUNT(*) FILTER (WHERE LOWER(COALESCE(status, '')) IN ('declined', 'rejected')) as declined_count,
           0::numeric as avg_co2_saved,
@@ -3533,7 +3814,7 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
       }
 
       // Fallback: some deployments have manager_approvals table but logistics rows only exist in route_approvals.
-      if (pendingResult.rows.length === 0 && hasRouteApprovals) {
+      if (pendingResult.rows.length === 0 && hasRouteApprovals && !canUseManagerRouteData) {
         pendingResult = await pool.query(
           `SELECT 
             ${routeApprovalKeyExpr} as route_id, 
@@ -3573,7 +3854,7 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
           FROM route_approvals`
         );
       }
-    } else if (!usedDeliveryRoutes && hasRouteApprovals) {
+    } else if (!usedDeliveryRoutes && hasRouteApprovals && !canUseManagerRouteData) {
       pendingResult = await pool.query(
         `SELECT 
           ${routeApprovalKeyExpr} as route_id, 
@@ -3629,7 +3910,11 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
     }
 
     // Final fallback to delivery_routes when no approvals are present
-    if ((!pendingResult || pendingResult.rows.length === 0) && (await tableExists("delivery_routes"))) {
+    if (
+      !canUseManagerRouteData &&
+      (!pendingResult || pendingResult.rows.length === 0) &&
+      (await tableExists("delivery_routes"))
+    ) {
       pendingResult = await pool.query(
         `SELECT 
             route_id AS route_id,
@@ -3665,7 +3950,7 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
     // Keep route_approvals for aggregate counters, but preserve manager_approvals
     // rows when available so dashboard cards use the same optimization payload
     // that admin submitted.
-    if (hasRouteApprovals && !usedDeliveryRoutes) {
+    if (hasRouteApprovals && !usedDeliveryRoutes && !canUseManagerRouteData) {
       const routePendingResult = await pool.query(
         `SELECT 
           ${routeApprovalKeyExpr} as route_id, 
@@ -3706,13 +3991,17 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
       );
 
       statsResult = routeStatsResult;
-      if (!canUseManagerRouteData || pendingResult.rows.length === 0) {
+      if (!canUseManagerRouteData) {
         pendingResult = routePendingResult;
       }
     }
 
     // Fallback: delivery_routes when approvals tables are empty or missing required columns
-    if ((!pendingResult || pendingResult.rows.length === 0) && (await tableExists("delivery_routes"))) {
+    if (
+      !canUseManagerRouteData &&
+      (!pendingResult || pendingResult.rows.length === 0) &&
+      (await tableExists("delivery_routes"))
+    ) {
       pendingResult = await pool.query(
         `SELECT 
           route_id AS route_id,
@@ -3751,7 +4040,7 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
     }
 
     // Fallback: if still empty, use deliveries table pending rows (DB-backed, no synthetic data)
-    if ((!pendingResult || pendingResult.rows.length === 0) && (await tableExists("deliveries"))) {
+    if (!canUseManagerRouteData && (!pendingResult || pendingResult.rows.length === 0) && (await tableExists("deliveries"))) {
       try {
         const deliveryColumns = await getTableColumns("deliveries");
         const statusExpr = deliveryColumns.has("status") ? "LOWER(COALESCE(status, ''))" : "''";
@@ -3838,51 +4127,36 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
     let approvedCount = parseInt(stats.approved_count, 10) || 0;
     let declinedCount = parseInt(stats.declined_count, 10) || 0;
 
-    // Fallback: count delivery assignments as approved progress for logistics dashboard.
-    try {
-      // Keep delivery_routes in sync so the route drops out of pending and shows as approved/assigned
-      if (hasDeliveryRoutes && resolvedRouteId) {
-        try {
-          await pool.query(
-            `UPDATE delivery_routes
-             SET status = 'approved',
-                 driver_name = COALESCE($1, driver_name),
-                 driver_user_id = COALESCE($2, driver_user_id),
-                 updated_at = NOW()
-             WHERE route_id::text = $3`,
-            [assignedDriver, selectedDriverId, String(resolvedRouteId)]
+    // Raw delivery status is only a compatibility fallback when the manager queue is unavailable.
+    if (!canUseManagerRouteData) {
+      try {
+        const deliveriesTableCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
+        const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
+        if (hasDeliveries) {
+          const deliveriesColumns = await getTableColumns("deliveries");
+          const deliveryStatusExpr = deliveriesColumns.has("status") ? "LOWER(COALESCE(status, ''))" : "''";
+          const deliveryIdExpr = deliveriesColumns.has("delivery_id")
+            ? "delivery_id::text"
+            : deliveriesColumns.has("id")
+            ? "id::text"
+            : "NULL::text";
+          const routeIdExpr = deliveriesColumns.has("route_id")
+            ? `COALESCE(route_id::text, ${deliveryIdExpr})`
+            : deliveryIdExpr;
+          const deliveryStats = await pool.query(
+            `SELECT
+               COUNT(DISTINCT ${routeIdExpr}) FILTER (WHERE ${deliveryStatusExpr} IN ('assigned', 'accepted', 'in_progress', 'completed')) as approved_count,
+               COUNT(DISTINCT ${routeIdExpr}) FILTER (WHERE ${deliveryStatusExpr} IN ('declined', 'rejected', 'cancelled')) as declined_count
+             FROM deliveries`
           );
-        } catch (deliveryRouteErr) {
-          console.warn("delivery_routes sync after approve failed:", deliveryRouteErr.message);
+          const deliveryApproved = parseInt(deliveryStats.rows[0]?.approved_count, 10) || 0;
+          const deliveryDeclined = parseInt(deliveryStats.rows[0]?.declined_count, 10) || 0;
+          approvedCount = Math.max(approvedCount, deliveryApproved);
+          declinedCount = Math.max(declinedCount, deliveryDeclined);
         }
+      } catch (deliveryStatsErr) {
+        console.warn("Logistics dashboard delivery stats fallback failed:", deliveryStatsErr.message);
       }
-
-      const deliveriesTableCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
-      const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
-      if (hasDeliveries) {
-        const deliveriesColumns = await getTableColumns("deliveries");
-        const deliveryStatusExpr = deliveriesColumns.has("status") ? "LOWER(COALESCE(status, ''))" : "''";
-        const deliveryIdExpr = deliveriesColumns.has("delivery_id")
-          ? "delivery_id::text"
-          : deliveriesColumns.has("id")
-          ? "id::text"
-          : "NULL::text";
-        const routeIdExpr = deliveriesColumns.has("route_id")
-          ? `COALESCE(route_id::text, ${deliveryIdExpr})`
-          : deliveryIdExpr;
-        const deliveryStats = await pool.query(
-          `SELECT
-             COUNT(DISTINCT ${routeIdExpr}) FILTER (WHERE ${deliveryStatusExpr} IN ('assigned', 'accepted', 'in_progress', 'completed')) as approved_count,
-             COUNT(DISTINCT ${routeIdExpr}) FILTER (WHERE ${deliveryStatusExpr} IN ('declined', 'rejected', 'cancelled')) as declined_count
-           FROM deliveries`
-        );
-        const deliveryApproved = parseInt(deliveryStats.rows[0]?.approved_count, 10) || 0;
-        const deliveryDeclined = parseInt(deliveryStats.rows[0]?.declined_count, 10) || 0;
-        approvedCount = Math.max(approvedCount, deliveryApproved);
-        declinedCount = Math.max(declinedCount, deliveryDeclined);
-      }
-    } catch (deliveryStatsErr) {
-      console.warn("Logistics dashboard delivery stats fallback failed:", deliveryStatsErr.message);
     }
     const routeStopsTableCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
     const hasRouteStops = !!routeStopsTableCheck.rows[0]?.tbl;
@@ -3979,7 +4253,7 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
       if (currentTs >= existingTs) pendingFingerprintMap.set(fingerprint, route);
     }
     let pendingRoutes = Array.from(pendingFingerprintMap.values());
-    if (hasRouteApprovals && pendingRoutes.length > 0) {
+    if (!canUseManagerRouteData && hasRouteApprovals && pendingRoutes.length > 0) {
       try {
         const resolvedRoutesResult = await pool.query(
           `SELECT DISTINCT ${routeApprovalKeyExpr} AS route_key
@@ -4020,7 +4294,9 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
 
     // If we still only have generated pending-* ids, try to replace them with real delivery_routes ids.
     try {
-      const hasGeneratedOnly = pendingRoutes.every((r) => String(r.route_id || "").startsWith("pending-"));
+      const hasGeneratedOnly =
+        !canUseManagerRouteData &&
+        pendingRoutes.every((r) => String(r.route_id || "").startsWith("pending-"));
       if (hasGeneratedOnly && (await tableExists("delivery_routes"))) {
         const deliveryPending = await pool.query(
           `SELECT 
@@ -4070,7 +4346,7 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
 
     // Also merge in any pending delivery_routes that aren't already present.
     try {
-      if (await tableExists("delivery_routes")) {
+      if (!canUseManagerRouteData && (await tableExists("delivery_routes"))) {
         const existingKeys = new Set(
           pendingRoutes.map((r) => String(r.routeId || r.route_id || "").trim()).filter(Boolean)
         );
@@ -4165,7 +4441,7 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
     res.json({
       success: true,
       summary: {
-        pendingApprovals: pendingRoutes.length,
+        pendingApprovals: parseInt(stats.pending_count, 10) || pendingRoutes.length,
         approvedToday: approvedCount,
         declined: declinedCount,
         avgCO2Saved: parseFloat(stats.avg_co2_saved) || 0,
@@ -4210,8 +4486,10 @@ app.get("/api/logistics/driver-monitor", optionalAuth, async (req, res) => {
   }
 });
 
-app.get("/api/logistics/stats", async (_req, res) => {
+app.get("/api/logistics/stats", async (req, res) => {
   try {
+    const businessId = req.user?.businessId || req.user?.business_id || null;
+    await syncLegacyLogisticsApprovals(businessId);
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
     const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
@@ -4219,13 +4497,32 @@ app.get("/api/logistics/stats", async (_req, res) => {
     let countsRow = { pending: 0, approved: 0, declined: 0 };
 
     if (hasManagerApprovals) {
+      const managerColumns = await getManagerApprovalsColumns();
+      const params = [];
+      let where = `approval_type = 'route_optimization'`;
+      if (businessId && managerColumns.has("business_id")) {
+        params.push(businessId);
+        where += ` AND COALESCE(business_id, 0) = $${params.length}`;
+      }
+      const pendingRoleClause = managerColumns.has("required_role")
+        ? ` AND LOWER(COALESCE(required_role, '')) = 'logistics_manager'`
+        : "";
       const counts = await pool.query(
         `SELECT
-           COUNT(*) FILTER (WHERE LOWER(COALESCE(status,'')) IN ('pending','awaiting_approval','submitted','in_review','for_approval')) AS pending,
+           COUNT(*) FILTER (
+             WHERE (
+               LOWER(COALESCE(status,'')) IN ('pending','awaiting_approval','submitted','in_review','for_approval')
+               OR LOWER(COALESCE(status,'')) LIKE '%pending%'
+               OR LOWER(COALESCE(status,'')) LIKE '%await%'
+               OR LOWER(COALESCE(status,'')) LIKE '%review%'
+               OR LOWER(COALESCE(status,'')) LIKE '%submit%'
+             )${pendingRoleClause}
+           ) AS pending,
            COUNT(*) FILTER (WHERE LOWER(COALESCE(status,'')) = 'approved') AS approved,
            COUNT(*) FILTER (WHERE LOWER(COALESCE(status,'')) IN ('declined','rejected','cancelled')) AS declined
          FROM manager_approvals
-         WHERE approval_type = 'route_optimization'`
+         WHERE ${where}`,
+        params
       );
       countsRow = counts.rows[0] || countsRow;
     } else if (hasRouteApprovals) {
@@ -4321,9 +4618,11 @@ app.post("/api/logistics/admin/cleanup-pending-duplicates", authenticate, author
 app.get("/api/logistics/route/:routeId", async (req, res) => {
   try {
     const { routeId } = req.params;
+    const businessId = req.user?.businessId || req.user?.business_id || null;
     if (!routeId) {
       return res.status(400).json({ success: false, message: "Route ID is required" });
     }
+    await syncLegacyLogisticsApprovals(businessId);
 
     const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
@@ -4352,7 +4651,7 @@ app.get("/api/logistics/route/:routeId", async (req, res) => {
       const m = String(routeId || "").match(/\\d+/);
       return m && m[0] ? m[0] : null;
     })();
-    if (hasDeliveryRoutes) {
+    if (!canUseManagerRouteData && hasDeliveryRoutes) {
       const deliveryResult = await pool.query(
         `SELECT *
          FROM delivery_routes
@@ -4378,30 +4677,20 @@ app.get("/api/logistics/route/:routeId", async (req, res) => {
     }
 
     if (!row && canUseManagerRouteData) {
-      const managerConditions = [`ma.${managerPkCol}::text = $1`];
-      if (managerColumns.has("route_id")) managerConditions.push(`COALESCE(ma.route_id::text, '') = $1`);
-      if (managerColumns.has("related_record_id")) managerConditions.push(`COALESCE(ma.related_record_id::text, '') = $1`);
-      if (managerColumns.has("delivery_id")) managerConditions.push(`COALESCE(ma.delivery_id::text, '') = $1`);
-      if (managerColumns.has("request_data")) managerConditions.push(`COALESCE(ma.request_data->>'route_id', '') = $1`);
-      if (managerColumns.has("extra_data")) managerConditions.push(`COALESCE(ma.extra_data->'route'->>'route_id', '') = $1`);
-
-    const managerOrderBy = managerColumns.has("created_at")
-      ? "ma.created_at DESC"
-      : managerColumns.has(managerPkCol)
-      ? `ma.${managerPkCol} DESC`
-      : "1";
-    const managerResult = await pool.query(
-        `SELECT *
-         FROM manager_approvals ma
-         WHERE ma.approval_type = 'route_optimization'
-           AND (
-             ${managerConditions.join("\n             OR ")}
-           )
-         ORDER BY ${managerOrderBy}
-         LIMIT 1`,
-        [routeId]
+      row = await findLatestLogisticsManagerApprovalByAnyId(
+        routeId,
+        managerColumns,
+        managerPkCol,
+        businessId
       );
-      row = managerResult.rows[0] || null;
+      if (!row && numericRouteId && numericRouteId !== String(routeId)) {
+        row = await findLatestLogisticsManagerApprovalByAnyId(
+          numericRouteId,
+          managerColumns,
+          managerPkCol,
+          businessId
+        );
+      }
     }
 
     if (!row && hasRouteApprovals) {
@@ -4546,21 +4835,26 @@ app.get("/api/logistics/pending", async (req, res) => {
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
+    const businessId =
+      (req.user && (req.user.businessId || req.user.business_id)) || null;
     const managerColumns = hasManagerApprovals ? await getManagerApprovalsColumns() : new Set();
     const canUseManagerRouteData =
       hasManagerApprovals &&
       managerColumns.has("approval_type") &&
       managerColumns.has("status");
+    await syncLegacyLogisticsApprovals(businessId);
+    const managerPendingRoleClause =
+      managerColumns.has("required_role")
+        ? ` AND LOWER(COALESCE(ma.required_role, '')) = 'logistics_manager'`
+        : "";
     const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
     const pendingDeliveryStatuses = ["pending", "awaiting_approval", "planned", "assigned_to_driver"];
     const hasDeliveryRoutes = await tableExists("delivery_routes");
     const deliveryRouteColumns = hasDeliveryRoutes ? await getTableColumns("delivery_routes") : new Set();
-    const businessId =
-      (req.user && (req.user.businessId || req.user.business_id)) || null;
     let result;
     let usedDeliveryRoutes = false;
     let usedManagerRows = false;
-    if (hasDeliveryRoutes) {
+    if (!canUseManagerRouteData && hasDeliveryRoutes) {
       const deliveryParams = [pendingDeliveryStatuses];
       let deliveryWhere = `LOWER(COALESCE(status, '')) = ANY($1::text[])`;
       if (businessId && deliveryRouteColumns.has("business_id")) {
@@ -4611,6 +4905,10 @@ app.get("/api/logistics/pending", async (req, res) => {
       // Relax business scoping to avoid missing admin-submitted routes.
       const managerParams = [];
       let managerBusinessClause = "";
+      if (businessId && managerColumns.has("business_id")) {
+        managerParams.push(businessId);
+        managerBusinessClause += ` AND COALESCE(ma.business_id, 0) = $${managerParams.length}`;
+      }
       result = await pool.query(`
         SELECT *
         FROM manager_approvals ma
@@ -4623,6 +4921,7 @@ app.get("/api/logistics/pending", async (req, res) => {
             OR LOWER(COALESCE(ma.status, '')) LIKE '%submit%'
           )
           ${managerBusinessClause}
+          ${managerPendingRoleClause}
         ORDER BY ma.created_at DESC
       `, managerParams);
       usedManagerRows = true;
@@ -4638,8 +4937,8 @@ app.get("/api/logistics/pending", async (req, res) => {
         }
       }
 
-      // Fallback to route_approvals when manager_approvals has no logistics records.
-      if (result.rows.length === 0 && hasRouteApprovals) {
+      // Compatibility fallback only when queue support is unavailable.
+      if (result.rows.length === 0 && hasRouteApprovals && !canUseManagerRouteData) {
         const routeParams = [];
         let routeBusinessClause = "";
         result = await pool.query(`
@@ -4853,18 +5152,31 @@ app.patch("/api/logistics/:id/approve", async (req, res) => {
   const { id } = req.params;
   const { comment, driver_id } = req.body;
   try {
+    const businessId = req.user?.businessId || req.user?.business_id || null;
+    await syncLegacyLogisticsApprovals(businessId);
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
     const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
     const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
+    const managerColumns = hasManagerApprovals ? await getManagerApprovalsColumns() : new Set();
     if (hasManagerApprovals) {
+      const matchedApproval = await findLatestLogisticsManagerApprovalByAnyId(
+        id,
+        managerColumns,
+        managerPkCol,
+        businessId
+      );
+      const managerApprovalId =
+        matchedApproval && matchedApproval[managerPkCol] !== undefined && matchedApproval[managerPkCol] !== null
+          ? matchedApproval[managerPkCol]
+          : id;
       const maResult = await pool.query(
         `UPDATE manager_approvals 
          SET status = 'approved', manager_comment = $1, decision_notes = $1, reviewed_at = NOW(), updated_at = NOW()
          WHERE ${managerPkCol} = $2 AND approval_type = 'route_optimization'
          RETURNING *`,
-        [comment || '', id]
+        [comment || '', managerApprovalId]
       );
       if (hasRouteApprovals) {
         if (maResult.rows.length > 0) {
@@ -4987,6 +5299,8 @@ app.patch("/api/logistics/:id/decline", async (req, res) => {
   const { id } = req.params;
   const { reason } = req.body;
   try {
+    const businessId = req.user?.businessId || req.user?.business_id || null;
+    await syncLegacyLogisticsApprovals(businessId);
     const declineReason = String(reason || "").trim();
     if (!declineReason) {
       return res.status(400).json({
@@ -5001,12 +5315,22 @@ app.patch("/api/logistics/:id/decline", async (req, res) => {
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
     const managerColumns = hasManagerApprovals ? await getManagerApprovalsColumns() : new Set();
     if (hasManagerApprovals) {
+      const matchedApproval = await findLatestLogisticsManagerApprovalByAnyId(
+        id,
+        managerColumns,
+        managerPkCol,
+        businessId
+      );
+      const managerApprovalId =
+        matchedApproval && matchedApproval[managerPkCol] !== undefined && matchedApproval[managerPkCol] !== null
+          ? matchedApproval[managerPkCol]
+          : id;
       const maResult = await pool.query(
         `UPDATE manager_approvals
          SET status = 'declined', manager_comment = $1, decision_notes = $1, reviewed_at = NOW(), updated_at = NOW()
          WHERE ${managerPkCol} = $2 AND approval_type = 'route_optimization'
          RETURNING *`,
-        [declineReason, id]
+        [declineReason, managerApprovalId]
       );
       // Bounce back to admin for re-check/re-submit
       if (managerColumns.has("required_role")) {
@@ -5055,6 +5379,8 @@ app.patch("/api/logistics/:id/decline", async (req, res) => {
 
 app.get("/api/logistics/history", async (req, res) => {
   try {
+    const businessId = req.user?.businessId || req.user?.business_id || null;
+    await syncLegacyLogisticsApprovals(businessId);
     const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
     const routeApprovalColumns = hasRouteApprovals ? await getTableColumns("route_approvals") : new Set();
@@ -5103,17 +5429,11 @@ app.get("/api/logistics/history", async (req, res) => {
     const managerHistoryOrderBy = managerColumns.has("updated_at")
       ? "ma.reviewed_at DESC NULLS LAST, ma.updated_at DESC"
       : "ma.reviewed_at DESC NULLS LAST, ma.created_at DESC NULLS LAST";
-    let result = hasRouteApprovals
-      ? await pool.query(`
-          SELECT ra.id as approval_id, ${routeApprovalRefExpr} as route_id, ra.route_type as product_name, ra.from_location, ra.to_location, ra.from_location as location, ra.driver_name, 
-                 ra.status, ${savingsKmExpr} as savings_km, ${savingsCo2Expr} as savings_co2, COALESCE(NULLIF(ra.ai_suggestion, ''), ${roAiExpr}, '') as ai_suggestion, ra.approved_at as reviewed_at, ra.manager_comment as review_notes 
-          FROM route_approvals ra
-          ${joinRouteOptimizations ? "LEFT JOIN route_optimizations ro ON ro.route_id = " + routeApprovalRefExpr : ""}
-          WHERE LOWER(COALESCE(ra.status, '')) IN ('approved', 'declined', 'rejected')
-          ORDER BY ra.approved_at DESC NULLS LAST, ra.submitted_at DESC NULLS LAST
-          LIMIT 100
-        `)
-      : canUseManagerRouteData
+    const managerHistoryBusinessClause =
+      businessId && managerColumns.has("business_id")
+        ? ` AND COALESCE(ma.business_id, 0) = ${Number(businessId) || 0}`
+        : "";
+    let result = canUseManagerRouteData
       ? await pool.query(`
           SELECT
             ma.${managerPkCol} as approval_id,
@@ -5132,7 +5452,18 @@ app.get("/api/logistics/history", async (req, res) => {
           FROM manager_approvals ma
           WHERE ma.approval_type = 'route_optimization'
             AND LOWER(ma.status) IN ('approved', 'declined', 'rejected')
+            ${managerHistoryBusinessClause}
           ORDER BY ${managerHistoryOrderBy}
+          LIMIT 100
+        `)
+      : hasRouteApprovals
+      ? await pool.query(`
+          SELECT ra.id as approval_id, ${routeApprovalRefExpr} as route_id, ra.route_type as product_name, ra.from_location, ra.to_location, ra.from_location as location, ra.driver_name,
+                 ra.status, ${savingsKmExpr} as savings_km, ${savingsCo2Expr} as savings_co2, COALESCE(NULLIF(ra.ai_suggestion, ''), ${roAiExpr}, '') as ai_suggestion, ra.approved_at as reviewed_at, ra.manager_comment as review_notes
+          FROM route_approvals ra
+          ${joinRouteOptimizations ? "LEFT JOIN route_optimizations ro ON ro.route_id = " + routeApprovalRefExpr : ""}
+          WHERE LOWER(COALESCE(ra.status, '')) IN ('approved', 'declined', 'rejected')
+          ORDER BY ra.approved_at DESC NULLS LAST, ra.submitted_at DESC NULLS LAST
           LIMIT 100
         `)
       : { rows: [] };
@@ -5161,10 +5492,10 @@ app.get("/api/logistics/history", async (req, res) => {
       `);
     }
 
-    if (hasRouteApprovals && result.rows.length === 0) {
+    if (!canUseManagerRouteData && hasRouteApprovals && result.rows.length === 0) {
       result = await pool.query(`
-        SELECT ra.id as approval_id, ${routeApprovalRefExpr} as route_id, ra.route_type as product_name, ra.from_location, ra.to_location, ra.from_location as location, ra.driver_name, 
-               ra.status, ${savingsKmExpr} as savings_km, ${savingsCo2Expr} as savings_co2, COALESCE(NULLIF(ra.ai_suggestion, ''), ${roAiExpr}, '') as ai_suggestion, ra.approved_at as reviewed_at, ra.manager_comment as review_notes 
+        SELECT ra.id as approval_id, ${routeApprovalRefExpr} as route_id, ra.route_type as product_name, ra.from_location, ra.to_location, ra.from_location as location, ra.driver_name,
+               ra.status, ${savingsKmExpr} as savings_km, ${savingsCo2Expr} as savings_co2, COALESCE(NULLIF(ra.ai_suggestion, ''), ${roAiExpr}, '') as ai_suggestion, ra.approved_at as reviewed_at, ra.manager_comment as review_notes
         FROM route_approvals ra
         ${joinRouteOptimizations ? "LEFT JOIN route_optimizations ro ON ro.route_id = " + routeApprovalRefExpr : ""}
         WHERE LOWER(COALESCE(ra.status, '')) IN ('approved', 'declined', 'rejected')
@@ -5174,7 +5505,7 @@ app.get("/api/logistics/history", async (req, res) => {
     }
 
     // Final fallback: build history directly from deliveries so approved assignments are visible.
-    if (result.rows.length === 0) {
+    if (!canUseManagerRouteData && result.rows.length === 0) {
       const deliveriesTableCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
       const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
       if (hasDeliveries) {
@@ -5256,6 +5587,7 @@ app.get("/api/logistics/history", async (req, res) => {
 app.post("/api/logistics/approve", async (req, res) => {
   const { routeId, decision, comment, driverName, driverUserId } = req.body;
   try {
+    const businessId = req.user?.businessId || req.user?.business_id || null;
     const normalizeDecisionStatus = (raw) => {
       const s = String(raw || "").trim().toLowerCase();
       if (!s) return "PENDING";
@@ -5263,6 +5595,7 @@ app.post("/api/logistics/approve", async (req, res) => {
       if (["pending", "hold", "in_review", "awaiting", "awaiting_approval"].includes(s)) return "PENDING";
       return "DECLINED";
     };
+    await syncLegacyLogisticsApprovals(businessId);
     const status = normalizeDecisionStatus(decision);
     const decisionComment = String(comment || "").trim();
     if (status === 'DECLINED' && !decisionComment) {
@@ -5301,21 +5634,13 @@ app.post("/api/logistics/approve", async (req, res) => {
     let selectedDriverId = null;
 
     if (hasManagerApprovals) {
-      const routeIdParam = String(routeId || "");
-      const managerMatchClauses = [`COALESCE(${managerPkCol}::text, '') = $1`];
-      if (managerColumns.has("route_id")) managerMatchClauses.push(`COALESCE(route_id::text, '') = $1`);
-      if (managerColumns.has("related_record_id")) managerMatchClauses.push(`COALESCE(related_record_id::text, '') = $1`);
-      if (managerColumns.has("delivery_id")) managerMatchClauses.push(`COALESCE(delivery_id::text, '') = $1`);
-
-      const maResult = await pool.query(
-        `SELECT * FROM manager_approvals
-         WHERE approval_type = 'route_optimization'
-           AND (${managerMatchClauses.join(" OR ")})
-         LIMIT 1`,
-        [routeIdParam]
+      managerApprovalRow = await findLatestLogisticsManagerApprovalByAnyId(
+        routeId,
+        managerColumns,
+        managerPkCol,
+        businessId
       );
-      if (maResult.rows.length > 0) {
-        managerApprovalRow = maResult.rows[0];
+      if (managerApprovalRow) {
         managerPkValue = managerApprovalRow[managerPkCol];
         originalManagerStatus = managerApprovalRow.status;
       }
