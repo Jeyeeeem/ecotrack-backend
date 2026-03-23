@@ -6299,46 +6299,6 @@ app.get("/api/inventory/dashboard", async (req, res) => {
         };
       });
 
-      // Include alert-backed pending items that do not yet have a pending manager_approvals row.
-      if (hasAlerts) {
-        const linkedAlertIds = new Set(
-          pendingResult.rows
-            .map((r) => r.alert_id)
-            .filter((v) => v !== null && v !== undefined)
-            .map((v) => String(v))
-        );
-        const activeAlertsResult = await pool.query(`
-          SELECT id, product_name, risk_level, location, quantity, details, days_left, submitted_by
-          FROM alerts
-          WHERE status = 'active'
-          ORDER BY created_at DESC
-          LIMIT 50
-        `);
-        const extraAlerts = activeAlertsResult.rows
-          .filter((row) => !linkedAlertIds.has(String(row.id)))
-          .map((row) => {
-            const quantityValue = row.quantity;
-            const quantityLabel =
-              quantityValue === null || quantityValue === undefined || quantityValue === ""
-                ? "0 kg"
-                : `${quantityValue}${String(quantityValue).toLowerCase().includes("kg") ? "" : " kg"}`;
-            return {
-              id: parseInt(row.id, 10) || 0,
-              itemNumber: `#${row.id}`,
-              priority: row.risk_level || "MEDIUM",
-              productName: row.product_name || "Unknown Product",
-              location: row.location || "Unknown",
-              quantity: quantityLabel,
-              daysLeft: parseInt(row.days_left, 10) || 0,
-              aiSuggestion: row.details || "Review this item",
-              submittedBy: row.submitted_by ? String(row.submitted_by) : "System"
-            };
-          });
-        if (extraAlerts.length > 0) {
-          pendingItems = [...pendingItems, ...extraAlerts];
-        }
-      }
-
       const riskStats = pendingItems.reduce(
         (acc, item) => {
           const level = String(item.priority || "").toUpperCase();
@@ -6366,7 +6326,7 @@ app.get("/api/inventory/dashboard", async (req, res) => {
       return res.json({
         success: true,
         summary: {
-          pendingApprovals: pendingItems.length,
+          pendingApprovals: parseInt(stats.pending_count, 10) || 0,
           approvedToday: Math.max(parseInt(stats.approved_count, 10) || 0, parseInt(fallbackAlertSummary.resolved_count, 10) || 0),
           declined: Math.max(parseInt(stats.declined_count, 10) || 0, parseInt(fallbackAlertSummary.declined_count, 10) || 0),
           highRisk: riskStats.highRisk,
@@ -6378,44 +6338,17 @@ app.get("/api/inventory/dashboard", async (req, res) => {
       });
     }
 
-    const pendingResult = await pool.query(`
-      SELECT id, product_id, product_name, alert_type, risk_level, details, days_left, temperature, humidity,
-             location, quantity, value, status, created_at, submitted_by
-      FROM alerts WHERE status = 'active'
-      ORDER BY CASE risk_level WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 3 END, days_left ASC LIMIT 20
-    `);
-    const statsResult = await pool.query(`
-      SELECT COUNT(*) as total_alerts,
-             COUNT(*) FILTER (WHERE risk_level = 'HIGH') as high_risk,
-             COUNT(*) FILTER (WHERE risk_level = 'MEDIUM') as medium_risk,
-             COUNT(*) FILTER (WHERE risk_level = 'LOW') as low_risk,
-             COUNT(*) FILTER (WHERE status = 'resolved') as resolved,
-             COUNT(*) FILTER (WHERE status = 'active') as pending
-      FROM alerts
-    `);
-    const pendingItems = pendingResult.rows.map((row) => ({
-      id: row.id,
-      itemNumber: `#${row.id}`,
-      priority: row.risk_level || "MEDIUM",
-      productName: row.product_name || "Unknown Product",
-      location: row.location || "Unknown",
-      quantity: row.quantity ? `${row.quantity} kg` : "0 kg",
-      daysLeft: row.days_left || 0,
-      aiSuggestion: row.details || "Review this item",
-      submittedBy: row.submitted_by || "System"
-    }));
-    const stats = statsResult.rows[0] || { total_alerts: 0, high_risk: 0, medium_risk: 0, low_risk: 0, resolved: 0, pending: 0 };
     res.json({
       success: true,
       summary: {
-        pendingApprovals: parseInt(stats.pending, 10) || 0,
-        approvedToday: parseInt(stats.resolved, 10) || 0,
+        pendingApprovals: 0,
+        approvedToday: 0,
         declined: 0,
-        highRisk: parseInt(stats.high_risk, 10) || 0,
-        mediumRisk: parseInt(stats.medium_risk, 10) || 0,
-        lowRisk: parseInt(stats.low_risk, 10) || 0
+        highRisk: 0,
+        mediumRisk: 0,
+        lowRisk: 0
       },
-      pendingItems,
+      pendingItems: [],
       message: null
     });
   } catch (err) {
