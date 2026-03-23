@@ -2041,10 +2041,18 @@ const computePathDistanceKm = (points) => {
 const normalizeLogisticsStop = (stop, index) => {
   const name = stop?.stop_name || stop?.stopName || stop?.location_name || stop?.location || stop?.name || `Stop ${index + 1}`;
   const address = stop?.address || stop?.location || stop?.full_address || "";
+  const parsedSequence = Number.parseInt(
+    stop?.sequence ?? stop?.stop_sequence ?? stop?.stopId ?? stop?.stop_id,
+    10
+  );
+  const sequence = Number.isFinite(parsedSequence) && parsedSequence > 0 ? parsedSequence : index + 1;
   return {
     stop_name: String(name),
     stopName: String(name),
-    address: String(address)
+    address: String(address),
+    sequence,
+    stop_sequence: sequence,
+    stop_type: stop?.stop_type || stop?.type || null
   };
 };
 
@@ -2214,9 +2222,28 @@ async function buildLogisticsRoutePayload(row, options = {}) {
   const routeIdCandidates = [...baseRouteIdCandidates, deliveryRoute?.route_id]
     .map((v) => (v === undefined || v === null ? "" : String(v)))
     .filter((v) => v.trim() !== "");
-  let routeId = String(routeIdCandidates.find((v) => v) || "");
-  if (!routeId && row.route_name) {
-    const m = String(row.route_name).match(/(\d[\d-]*)$/);
+  const authoritativeRouteIdCandidates = [
+    deliveryRoute?.route_id,
+    routeApprovalSnapshot?.route_id,
+    routeData.route_id,
+    requestData.route_id,
+    row.route_id,
+    row.related_record_id,
+    row.delivery_id,
+    numericFromParams,
+    routeIdFromParams
+  ]
+    .map((v) => (v === undefined || v === null ? "" : String(v)))
+    .filter((v) => v.trim() !== "");
+  let routeId = String(authoritativeRouteIdCandidates.find((v) => v) || "");
+  if (!routeId) {
+    const namedRouteCandidate =
+      routeData.route_name ||
+      routeData.routeName ||
+      row.route_name ||
+      deliveryRoute?.route_name ||
+      routeIdFromParams;
+    const m = String(namedRouteCandidate || "").match(/(\d[\d-]*)$/);
     if (m && m[1]) routeId = m[1].replace(/[^0-9]/g, "");
   }
   if (!routeId && deliveryRoute?.route_id != null) {
@@ -2541,6 +2568,28 @@ async function buildLogisticsRoutePayload(row, options = {}) {
   if (!hasDetailedStoredPath && routePath.length >= 2) {
     routePath = await buildRoadRoutePath(routePath);
   }
+
+  const normalizeStopList = (candidateStops, fallbackStops = []) => {
+    if (!Array.isArray(candidateStops) || candidateStops.length === 0) {
+      return fallbackStops;
+    }
+    return candidateStops.map((stop, index) => {
+      const base = normalizeLogisticsStop(stop, index);
+      const point = extractLatLng(stop);
+      return point ? { ...base, latitude: point.latitude, longitude: point.longitude } : base;
+    });
+  };
+
+  const originalStops = normalizeStopList(stops, stops);
+  const optimizedStops = normalizeStopList(
+    optimizationData.optimizedStops ||
+      optimization.optimizedStops ||
+      requestOptimizationData.optimizedStops ||
+      requestOptimization.optimizedStops ||
+      routeData.optimizedStops ||
+      routeData.optimized_stops,
+    originalStops
+  );
 
   const computedDistanceKm = computePathDistanceKm(routePath);
 
@@ -2925,6 +2974,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
   const routeName =
     routeData.route_name ||
     routeData.routeName ||
+    row.route_name ||
     deliveryRoute?.route_name ||
     (routeId ? `Route-${routeId}` : null);
   const displayRouteCode = routeName || (routeId ? `Route-${routeId}` : null);
@@ -2940,7 +2990,7 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     approvalId,
     route_id: routeId,
     routeId,
-    route_number: routeId,
+    route_number: deliveryRoute?.route_id ?? row.route_id ?? routeId,
     route_code: displayRouteCode,
     route_name: routeName,
     routeName,
@@ -3007,8 +3057,8 @@ async function buildLogisticsRoutePayload(row, options = {}) {
       fuelSaved: totalSavingsFuel,
       co2Saved: totalSavingsCO2
     },
-    original_stops: stops,
-    optimized_stops: optimizationData.optimizedStops || optimization.optimizedStops || stops,
+    original_stops: originalStops,
+    optimized_stops: optimizedStops,
     optimized_path: routePath,
     status: row.status || deliveryRoute?.status || "PENDING",
     submitted_by: String(submittedBy),
@@ -4729,7 +4779,17 @@ app.get("/api/logistics/route/:routeId", async (req, res) => {
     // Ensure cargo is populated directly from delivery_items for this route_id
     try {
       const ridInt = (() => {
-        const candidates = [route.routeId, route.route_id, routeId];
+        const candidates = [
+          row.route_id,
+          route.route_number,
+          route.route_id,
+          route.routeId,
+          row.delivery_id,
+          row.route_name,
+          route.route_code,
+          route.route_name,
+          routeId
+        ];
         for (const c of candidates) {
           const m = String(c || "").match(/\\d+/);
           if (m && Number.isFinite(parseInt(m[0], 10))) return parseInt(m[0], 10);
@@ -4796,11 +4856,18 @@ app.get("/api/logistics/route/:routeId", async (req, res) => {
             [ridInt]
           );
           if (stopsRes.rows.length > 0) {
-            route.stops = stopsRes.rows.map((stop, index) => {
+            const refreshedStops = stopsRes.rows.map((stop, index) => {
               const base = normalizeLogisticsStop(stop, index);
               const point = extractLatLng(stop);
               return point ? { ...base, latitude: point.latitude, longitude: point.longitude } : base;
             });
+            route.stops = refreshedStops;
+            if (!Array.isArray(route.original_stops) || route.original_stops.length === 0) {
+              route.original_stops = refreshedStops;
+            }
+            if (!Array.isArray(route.optimized_stops) || route.optimized_stops.length === 0) {
+              route.optimized_stops = refreshedStops;
+            }
           }
         }
       }
