@@ -24,6 +24,9 @@ app.use(helmet({
   contentSecurityPolicy: false // Disable for development
 }));
 
+// Render and similar hosts terminate TLS/proxy upstream and forward the client IP.
+app.set("trust proxy", 1);
+
 // CORS configuration
 app.use(cors({
   origin: '*', 
@@ -120,6 +123,35 @@ async function getTableColumns(tableName) {
   }
 }
 
+function getExistingColumns(columns, candidates = []) {
+  return candidates.filter((candidate) => candidate && columns.has(candidate));
+}
+
+function getFirstExistingColumn(columns, candidates = []) {
+  return getExistingColumns(columns, candidates)[0] || null;
+}
+
+function getQualifiedColumn(columns, alias, candidates = [], fallback = "NULL") {
+  const column = getFirstExistingColumn(columns, candidates);
+  if (!column) return fallback;
+  return alias ? `${alias}.${column}` : column;
+}
+
+function getCoalesceColumns(columns, alias, candidates = [], fallback = "NULL") {
+  const matches = getExistingColumns(columns, candidates).map((column) =>
+    alias ? `${alias}.${column}` : column
+  );
+  if (matches.length === 0) return fallback;
+  return matches.length === 1 ? matches[0] : `COALESCE(${matches.join(", ")})`;
+}
+
+function getDescOrderExpr(columns, alias, candidates = [], fallback = "1 DESC") {
+  const matches = getExistingColumns(columns, candidates).map((column) =>
+    `${alias ? `${alias}.` : ""}${column} DESC NULLS LAST`
+  );
+  return matches.length > 0 ? matches.join(", ") : fallback;
+}
+
 async function getManagerApprovalsPkColumn() {
   const now = Date.now();
   if (now - managerApprovalsPkCache.loadedAt < MANAGER_PK_CACHE_TTL_MS) {
@@ -143,6 +175,9 @@ async function getManagerApprovalsPkColumn() {
 // Lightweight table existence check with memoization
 const tableExistsCache = new Map();
 const TABLE_EXISTS_TTL_MS = 5 * 60 * 1000;
+const legacyLogisticsSyncCache = new Map();
+const LEGACY_LOGISTICS_SYNC_TTL_MS = 15 * 1000;
+
 async function tableExists(tableName) {
   const key = String(tableName || "").toLowerCase();
   const cached = tableExistsCache.get(key);
@@ -157,6 +192,10 @@ async function tableExists(tableName) {
     tableExistsCache.set(key, { exists: false, checkedAt: now });
     return false;
   }
+}
+
+function getScopedCacheKey(value) {
+  return value === undefined || value === null || value === "" ? "all" : String(value);
 }
 
 const normalizeRouteIdCandidates = (routeId, extras = []) => {
@@ -204,14 +243,36 @@ async function getLogisticsDbSnapshot(routeIdOrCandidates) {
   try {
     const tableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
     if (tableCheck.rows[0]?.tbl) {
-      for (const candidate of candidates) {
-        const raRes = await pool.query(
-          `SELECT * FROM route_approvals WHERE route_id::text = $1 OR id::text = $1 ORDER BY created_at DESC LIMIT 1`,
-          [candidate]
+      const routeApprovalColumns = await getTableColumns("route_approvals");
+      const routeApprovalPkCol = getFirstExistingColumn(routeApprovalColumns, [
+        "id",
+        "route_approval_id",
+        "approval_id",
+        "route_id"
+      ]);
+      const routeApprovalMatchClauses = [];
+      if (routeApprovalColumns.has("route_id")) routeApprovalMatchClauses.push(`route_id::text = $1`);
+      if (routeApprovalPkCol) routeApprovalMatchClauses.push(`${routeApprovalPkCol}::text = $1`);
+      if (routeApprovalMatchClauses.length > 0) {
+        const routeApprovalOrderExpr = getDescOrderExpr(
+          routeApprovalColumns,
+          "",
+          ["submitted_at", "approved_at", "created_at", routeApprovalPkCol],
+          routeApprovalPkCol ? `${routeApprovalPkCol} DESC` : "1 DESC"
         );
-        if (raRes.rows.length > 0) {
-          snapshot.routeApproval = raRes.rows[0];
-          break;
+        for (const candidate of candidates) {
+          const raRes = await pool.query(
+            `SELECT *
+             FROM route_approvals
+             WHERE ${routeApprovalMatchClauses.join(" OR ")}
+             ORDER BY ${routeApprovalOrderExpr}
+             LIMIT 1`,
+            [candidate]
+          );
+          if (raRes.rows.length > 0) {
+            snapshot.routeApproval = raRes.rows[0];
+            break;
+          }
         }
       }
     }
@@ -3192,6 +3253,7 @@ const fetchDriverMonitorRows = async (businessId = null) => {
     const emailExpr = usersColumns.has("email")
       ? "NULLIF(u.email, '')"
       : "NULL";
+    const userJoinIdExpr = getCoalesceColumns(usersColumns, "u", ["user_id", "id"], "NULL::int");
     const usersResult = await pool.query(
       `SELECT
         ${idExpr} AS user_id,
@@ -3293,7 +3355,13 @@ const fetchDriverMonitorRows = async (businessId = null) => {
           : deliveriesColumns.has("driver_id")
           ? "d.driver_id"
           : "NULL::int";
-        if (hasDriverName || deliveriesColumns.has("driver_user_id")) {
+        const deliveryOrderExpr = getDescOrderExpr(
+          deliveriesColumns,
+          "d",
+          ["departure_time", "created_at", "updated_at", "delivery_id", "id"],
+          "1 DESC"
+        );
+        if (hasDriverName || deliveriesColumns.has("driver_user_id") || deliveriesColumns.has("driver_id")) {
           const params = [];
           const businessClause =
             businessId && hasBusinessCol
@@ -3302,10 +3370,22 @@ const fetchDriverMonitorRows = async (businessId = null) => {
                   return `AND (d.business_id = $${params.length} OR d.business_id IS NULL)`;
                 })()
               : "";
+          const userJoinClause =
+            driverIdExpr !== "NULL::int" && userJoinIdExpr !== "NULL::int"
+              ? `LEFT JOIN users u ON ${driverIdExpr} = ${userJoinIdExpr}`
+              : "";
+          const liveNameExpr = hasDriverName ? "NULLIF(d.driver_name, '')" : "NULL::text";
+          const liveEmailExpr = deliveriesColumns.has("driver_email") ? "NULLIF(d.driver_email, '')" : "NULL::text";
+          const joinedUserNameExpr = userJoinClause
+            ? getCoalesceColumns(usersColumns, "u", ["full_name", "name", "username", "email"], "NULL::text")
+            : "NULL::text";
+          const joinedUserEmailExpr = userJoinClause
+            ? getQualifiedColumn(usersColumns, "u", ["email"], "NULL::text")
+            : "NULL::text";
           const liveDriverQuery = `
             SELECT
-              COALESCE(d.driver_name, u.full_name, u.username, u.email, 'Driver') AS full_name,
-              COALESCE(d.driver_email, u.email, '') AS email,
+              COALESCE(${liveNameExpr}, ${joinedUserNameExpr}, 'Driver') AS full_name,
+              COALESCE(${liveEmailExpr}, ${joinedUserEmailExpr}, '') AS email,
               ${routeNameExpr} AS route_name,
               ${statusExpr} AS route_status,
               ${routeIdExpr || "NULL::text"} AS route_id,
@@ -3315,10 +3395,10 @@ const fetchDriverMonitorRows = async (businessId = null) => {
               COALESCE(d.stops_completed, 0) AS stops_completed,
               COALESCE(d.stops_total, 0) AS stops_total
             FROM deliveries d
-            LEFT JOIN users u ON ${driverIdExpr} = COALESCE(u.user_id, u.id)
+            ${userJoinClause}
             WHERE ${statusExpr} NOT IN ('completed','cancelled','declined','rejected')
               ${businessClause}
-            ORDER BY d.departure_time DESC NULLS LAST, d.created_at DESC NULLS LAST
+            ORDER BY ${deliveryOrderExpr}
             LIMIT 50
           `;
 
@@ -3386,47 +3466,71 @@ const fetchDriverMonitorRows = async (businessId = null) => {
 
     // Fallback busy drivers from route approvals
     try {
-        const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
-        const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
-        if (hasRouteApprovals) {
-          const routeColumns = await getTableColumns("route_approvals");
-          const hasBusinessCol = routeColumns.has("business_id");
-          const params = [];
-          const businessClause =
-            businessId && hasBusinessCol
-              ? (() => {
-                  params.push(businessId);
-                  return `AND (business_id = $${params.length} OR business_id IS NULL)`;
-                })()
-              : "";
-          const driverIdExpr = routeColumns.has("driver_user_id")
-            ? "driver_user_id"
-            : routeColumns.has("driver_id")
-            ? "driver_id"
-            : "NULL::int";
-    const busyRouteApprovals = await pool.query(
-      `SELECT
-        COALESCE(driver_name, '') AS driver_name,
-        ${driverIdExpr} AS driver_user_id,
-        COALESCE(from_location, '') || ' → ' || COALESCE(to_location, '') AS route_name,
-        UPPER(status) AS route_status,
-        COALESCE(route_id, id) AS route_id
-      FROM route_approvals
-      WHERE COALESCE(driver_name, '') <> ''
-        AND (
-          LOWER(COALESCE(status, '')) IN ('pending', 'awaiting_approval', 'submitted', 'in_review', 'for_approval', 'assigned', 'accepted', 'in_progress')
-                OR LOWER(COALESCE(status, '')) LIKE '%pending%'
-                OR LOWER(COALESCE(status, '')) LIKE '%await%'
-                OR LOWER(COALESCE(status, '')) LIKE '%review%'
-                OR LOWER(COALESCE(status, '')) LIKE '%submit%'
-              )
-             ${businessClause}
-            ORDER BY COALESCE(submitted_at, approved_at) DESC NULLS LAST, id DESC
+      const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
+      const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
+      if (hasRouteApprovals) {
+        const routeColumns = await getTableColumns("route_approvals");
+        const hasBusinessCol = routeColumns.has("business_id");
+        const routeStatusAvailable = routeColumns.has("status");
+        const params = [];
+        const businessClause =
+          businessId && hasBusinessCol
+            ? (() => {
+                params.push(businessId);
+                return `AND (business_id = $${params.length} OR business_id IS NULL)`;
+              })()
+            : "";
+        const driverIdExpr = routeColumns.has("driver_user_id")
+          ? "driver_user_id"
+          : routeColumns.has("driver_id")
+          ? "driver_id"
+          : "NULL::int";
+        const routeIdExpr = getCoalesceColumns(routeColumns, "", ["route_id", "id"], "NULL::text");
+        const routeOrderExpr = getDescOrderExpr(
+          routeColumns,
+          "",
+          ["submitted_at", "approved_at", "created_at", "id", "route_id"],
+          "1 DESC"
+        );
+        const routeFromExpr = routeColumns.has("from_location") ? "COALESCE(from_location, '')" : "''";
+        const routeToExpr = routeColumns.has("to_location") ? "COALESCE(to_location, '')" : "''";
+        const routeNameExpr = routeColumns.has("route_name")
+          ? "COALESCE(route_name, '')"
+          : `${routeFromExpr} || CASE WHEN ${routeToExpr} <> '' THEN ' → ' || ${routeToExpr} ELSE '' END`;
+        const routeStatusExpr = routeStatusAvailable ? "UPPER(status)" : "'PENDING'";
+        const routeStatusPredicate = routeStatusAvailable
+          ? `(
+              LOWER(COALESCE(status, '')) IN ('pending', 'awaiting_approval', 'submitted', 'in_review', 'for_approval', 'assigned', 'accepted', 'in_progress')
+              OR LOWER(COALESCE(status, '')) LIKE '%pending%'
+              OR LOWER(COALESCE(status, '')) LIKE '%await%'
+              OR LOWER(COALESCE(status, '')) LIKE '%review%'
+              OR LOWER(COALESCE(status, '')) LIKE '%submit%'
+            )`
+          : "TRUE";
+        const driverNameExpr = routeColumns.has("driver_name") ? "COALESCE(driver_name, '')" : "''";
+        const hasDriverIdentity =
+          routeColumns.has("driver_name") || routeColumns.has("driver_user_id") || routeColumns.has("driver_id");
+
+        if (hasDriverIdentity) {
+          const busyRouteApprovals = await pool.query(
+            `SELECT
+              ${driverNameExpr} AS driver_name,
+              ${driverIdExpr} AS driver_user_id,
+              ${routeNameExpr} AS route_name,
+              ${routeStatusExpr} AS route_status,
+              ${routeIdExpr} AS route_id
+            FROM route_approvals
+            WHERE (${driverNameExpr} <> '' OR ${driverIdExpr} IS NOT NULL)
+              AND ${routeStatusPredicate}
+              ${businessClause}
+            ORDER BY ${routeOrderExpr}
             LIMIT 50`,
             params
           );
-        for (const row of busyRouteApprovals.rows) {
-          upsertBusy(row.driver_name, row.route_name, row.route_status, row.route_id, null, row.driver_user_id);
+
+          for (const row of busyRouteApprovals.rows) {
+            upsertBusy(row.driver_name, row.route_name, row.route_status, row.route_id, null, row.driver_user_id);
+          }
         }
       }
     } catch (driverRouteErr) {
@@ -3587,192 +3691,234 @@ async function findLatestLogisticsManagerApprovalByAnyId(candidateId, managerCol
 }
 
 async function syncLegacyLogisticsApprovals(businessId = null) {
-  try {
-    const hasManagerApprovals = await tableExists("manager_approvals");
-    const hasRouteApprovals = await tableExists("route_approvals");
-    if (!hasManagerApprovals || !hasRouteApprovals) {
-      return { inserted: 0, available: false };
-    }
+  const cacheKey = getScopedCacheKey(businessId);
+  const cached = legacyLogisticsSyncCache.get(cacheKey);
+  const now = Date.now();
+  if (cached?.promise) return cached.promise;
+  if (cached?.result && now - cached.checkedAt < LEGACY_LOGISTICS_SYNC_TTL_MS) {
+    return cached.result;
+  }
 
-    const managerColumns = await getManagerApprovalsColumns();
-    const managerPkCol = await getManagerApprovalsPkColumn();
-    const routeApprovalColumns = await getTableColumns("route_approvals");
-    const canUseManagerQueue =
-      managerColumns.has("approval_type") &&
-      managerColumns.has("status") &&
-      (
-        managerColumns.has("route_id") ||
-        managerColumns.has("related_record_id") ||
-        managerColumns.has("delivery_id") ||
-        managerColumns.has("request_data") ||
-        managerColumns.has("extra_data")
-      );
-
-    if (!canUseManagerQueue) {
-      return { inserted: 0, available: false };
-    }
-
-    const routeParams = [];
-    let routeWhere = "1=1";
-    if (businessId && routeApprovalColumns.has("business_id")) {
-      routeParams.push(businessId);
-      routeWhere += ` AND COALESCE(ra.business_id, 0) = $${routeParams.length}`;
-    }
-
-    const legacyRoutesResult = await pool.query(
-      `SELECT ra.*
-       FROM route_approvals ra
-       WHERE ${routeWhere}
-       ORDER BY COALESCE(ra.submitted_at, ra.created_at, NOW()) DESC, ra.id DESC
-       LIMIT 500`,
-      routeParams
-    );
-
-    if (legacyRoutesResult.rows.length === 0) {
-      return { inserted: 0, available: true };
-    }
-
-    const managerParams = [];
-    let managerWhere = `approval_type = 'route_optimization'`;
-    if (businessId && managerColumns.has("business_id")) {
-      managerParams.push(businessId);
-      managerWhere += ` AND COALESCE(business_id, 0) = $${managerParams.length}`;
-    }
-
-    const managerRowsResult = await pool.query(
-      `SELECT * FROM manager_approvals
-       WHERE ${managerWhere}
-       ORDER BY ${
-         managerColumns.has("created_at")
-           ? "created_at DESC NULLS LAST"
-           : `${managerPkCol} DESC`
-       }`,
-      managerParams
-    );
-
-    const existingKeys = new Set();
-    for (const row of managerRowsResult.rows) {
-      const requestData = parseMaybeJsonObject(row.request_data) || {};
-      const extraData = parseMaybeJsonObject(row.extra_data) || {};
-      const routeData =
-        extraData.route && typeof extraData.route === "object" ? extraData.route : {};
-      normalizeRouteIdCandidates(row.route_id || row.related_record_id || row.delivery_id || row[managerPkCol], [
-        requestData.route_id,
-        routeData.route_id
-      ]).forEach((candidate) => existingKeys.add(candidate));
-    }
-
-    let inserted = 0;
-
-    for (const row of legacyRoutesResult.rows) {
-      const routeIdValue =
-        (routeApprovalColumns.has("route_id") ? row.route_id : null) || row.id || null;
-      const routeKeyCandidates = normalizeRouteIdCandidates(routeIdValue, [
-        row.id,
-        row.route_id,
-        row.route_name
-      ]);
-
-      if (routeKeyCandidates.some((candidate) => existingKeys.has(candidate))) {
-        continue;
+  const syncPromise = (async () => {
+    try {
+      const hasManagerApprovals = await tableExists("manager_approvals");
+      const hasRouteApprovals = await tableExists("route_approvals");
+      if (!hasManagerApprovals || !hasRouteApprovals) {
+        return { inserted: 0, available: false };
       }
 
-      const normalizedStatus = normalizeLogisticsManagerStatus(row.status);
-      const submittedAt = row.submitted_at || row.created_at || new Date().toISOString();
-      const reviewedAt =
-        normalizedStatus === "pending"
-          ? null
-          : row.approved_at || row.updated_at || submittedAt;
-      const routeSnapshot = {
-        route_id: row.route_id ?? row.id ?? null,
-        route_name: row.route_name || null,
-        route_type: row.route_type || "STANDARD",
-        from_location: row.from_location || null,
-        to_location: row.to_location || null,
-        driver_name: row.driver_name || null,
-        vehicle_type: row.vehicle_type || null,
-        departure_time: row.departure_time || null,
-        original_distance: row.original_distance ?? null,
-        optimized_distance: row.optimized_distance ?? null,
-        original_fuel: row.original_fuel ?? null,
-        optimized_fuel: row.optimized_fuel ?? null,
-        original_co2: row.original_co2 ?? null,
-        optimized_co2: row.optimized_co2 ?? null,
-        savings_km: row.savings_km ?? null,
-        savings_fuel: row.savings_fuel ?? null,
-        savings_co2: row.savings_co2 ?? null,
-        ai_suggestion: row.ai_suggestion || null,
-        route_path: row.route_path || null
-      };
-      const requestData = {
-        ...routeSnapshot,
-        submitted_by: row.submitted_by || null,
-        submitted_at: submittedAt
-      };
-      const extraData = {
-        route: routeSnapshot,
-        optimization: {
+      const managerColumns = await getManagerApprovalsColumns();
+      const managerPkCol = await getManagerApprovalsPkColumn();
+      const routeApprovalColumns = await getTableColumns("route_approvals");
+      const routeApprovalPkCol = getFirstExistingColumn(routeApprovalColumns, [
+        "id",
+        "route_approval_id",
+        "approval_id",
+        "route_id"
+      ]);
+      const canUseManagerQueue =
+        managerColumns.has("approval_type") &&
+        managerColumns.has("status") &&
+        (
+          managerColumns.has("route_id") ||
+          managerColumns.has("related_record_id") ||
+          managerColumns.has("delivery_id") ||
+          managerColumns.has("request_data") ||
+          managerColumns.has("extra_data")
+        );
+
+      if (!canUseManagerQueue || !routeApprovalPkCol) {
+        return { inserted: 0, available: false };
+      }
+
+      const routeParams = [];
+      let routeWhere = "1=1";
+      if (businessId && routeApprovalColumns.has("business_id")) {
+        routeParams.push(businessId);
+        routeWhere += ` AND COALESCE(ra.business_id, 0) = $${routeParams.length}`;
+      }
+      const routeApprovalOrderExpr = getDescOrderExpr(
+        routeApprovalColumns,
+        "ra",
+        ["submitted_at", "approved_at", "created_at", routeApprovalPkCol],
+        `ra.${routeApprovalPkCol} DESC`
+      );
+
+      const legacyRoutesResult = await pool.query(
+        `SELECT ra.*
+         FROM route_approvals ra
+         WHERE ${routeWhere}
+         ORDER BY ${routeApprovalOrderExpr}
+         LIMIT 500`,
+        routeParams
+      );
+
+      if (legacyRoutesResult.rows.length === 0) {
+        return { inserted: 0, available: true };
+      }
+
+      const managerParams = [];
+      let managerWhere = `approval_type = 'route_optimization'`;
+      if (businessId && managerColumns.has("business_id")) {
+        managerParams.push(businessId);
+        managerWhere += ` AND COALESCE(business_id, 0) = $${managerParams.length}`;
+      }
+
+      const managerRowsResult = await pool.query(
+        `SELECT * FROM manager_approvals
+         WHERE ${managerWhere}
+         ORDER BY ${
+           managerColumns.has("created_at")
+             ? "created_at DESC NULLS LAST"
+             : `${managerPkCol} DESC`
+         }`,
+        managerParams
+      );
+
+      const existingKeys = new Set();
+      for (const row of managerRowsResult.rows) {
+        const requestData = parseMaybeJsonObject(row.request_data) || {};
+        const extraData = parseMaybeJsonObject(row.extra_data) || {};
+        const routeData =
+          extraData.route && typeof extraData.route === "object" ? extraData.route : {};
+        normalizeRouteIdCandidates(row.route_id || row.related_record_id || row.delivery_id || row[managerPkCol], [
+          requestData.route_id,
+          routeData.route_id
+        ]).forEach((candidate) => existingKeys.add(candidate));
+      }
+
+      let inserted = 0;
+
+      for (const row of legacyRoutesResult.rows) {
+        const routeIdValue =
+          (routeApprovalColumns.has("route_id") ? row.route_id : null) ||
+          (routeApprovalPkCol ? row[routeApprovalPkCol] : null) ||
+          null;
+        const routeKeyCandidates = normalizeRouteIdCandidates(routeIdValue, [
+          routeApprovalPkCol ? row[routeApprovalPkCol] : null,
+          routeApprovalColumns.has("route_id") ? row.route_id : null,
+          row.route_name
+        ]);
+
+        if (routeKeyCandidates.some((candidate) => existingKeys.has(candidate))) {
+          continue;
+        }
+
+        const normalizedStatus = normalizeLogisticsManagerStatus(row.status);
+        const submittedAt =
+          row.submitted_at ||
+          row.approved_at ||
+          row.created_at ||
+          row.updated_at ||
+          new Date().toISOString();
+        const reviewedAt =
+          normalizedStatus === "pending"
+            ? null
+            : row.approved_at || row.updated_at || submittedAt;
+        const routeSnapshot = {
+          route_id: row.route_id ?? row[routeApprovalPkCol] ?? null,
+          route_name: row.route_name || null,
+          route_type: row.route_type || "STANDARD",
+          from_location: row.from_location || null,
+          to_location: row.to_location || null,
+          driver_name: row.driver_name || null,
+          vehicle_type: row.vehicle_type || null,
+          departure_time: row.departure_time || null,
+          original_distance: row.original_distance ?? null,
           optimized_distance: row.optimized_distance ?? null,
+          original_fuel: row.original_fuel ?? null,
           optimized_fuel: row.optimized_fuel ?? null,
+          original_co2: row.original_co2 ?? null,
           optimized_co2: row.optimized_co2 ?? null,
           savings_km: row.savings_km ?? null,
           savings_fuel: row.savings_fuel ?? null,
-          savings_co2: row.savings_co2 ?? null
+          savings_co2: row.savings_co2 ?? null,
+          ai_suggestion: row.ai_suggestion || null,
+          route_path: row.route_path || null
+        };
+        const requestData = {
+          ...routeSnapshot,
+          submitted_by: row.submitted_by || null,
+          submitted_at: submittedAt
+        };
+        const extraData = {
+          route: routeSnapshot,
+          optimization: {
+            optimized_distance: row.optimized_distance ?? null,
+            optimized_fuel: row.optimized_fuel ?? null,
+            optimized_co2: row.optimized_co2 ?? null,
+            savings_km: row.savings_km ?? null,
+            savings_fuel: row.savings_fuel ?? null,
+            savings_co2: row.savings_co2 ?? null
+          }
+        };
+
+        const insertCols = [];
+        const insertVals = [];
+        const insertParams = [];
+        let idx = 1;
+        const push = (column, value) => {
+          insertCols.push(column);
+          insertVals.push(`$${idx++}`);
+          insertParams.push(value);
+        };
+
+        if (managerColumns.has("business_id")) push("business_id", row.business_id ?? businessId ?? null);
+        if (managerColumns.has("approval_type")) push("approval_type", "route_optimization");
+        if (managerColumns.has("status")) push("status", normalizedStatus);
+        if (managerColumns.has("required_role")) {
+          push("required_role", "logistics_manager");
         }
-      };
+        if (managerColumns.has("route_id")) push("route_id", row.route_id ?? row[routeApprovalPkCol] ?? null);
+        if (managerColumns.has("related_record_id")) push("related_record_id", row[routeApprovalPkCol] ?? row.route_id ?? null);
+        if (managerColumns.has("delivery_id")) push("delivery_id", row.route_id ?? row[routeApprovalPkCol] ?? null);
+        if (managerColumns.has("product_name")) push("product_name", row.route_type || row.route_name || "STANDARD");
+        if (managerColumns.has("location")) push("location", row.from_location || "Origin");
+        if (managerColumns.has("priority")) push("priority", "MEDIUM");
+        if (managerColumns.has("ai_suggestion")) push("ai_suggestion", row.ai_suggestion || null);
+        if (managerColumns.has("submitted_by")) push("submitted_by", row.submitted_by || null);
+        if (managerColumns.has("manager_comment") && normalizedStatus !== "pending") {
+          push("manager_comment", row.manager_comment || null);
+        }
+        if (managerColumns.has("decision_notes") && normalizedStatus !== "pending") {
+          push("decision_notes", row.manager_comment || null);
+        }
+        if (managerColumns.has("reviewed_at") && reviewedAt) push("reviewed_at", reviewedAt);
+        if (managerColumns.has("request_data")) push("request_data", JSON.stringify(requestData));
+        if (managerColumns.has("extra_data")) push("extra_data", JSON.stringify(extraData));
+        if (managerColumns.has("created_at")) push("created_at", submittedAt);
 
-      const insertCols = [];
-      const insertVals = [];
-      const insertParams = [];
-      let idx = 1;
-      const push = (column, value) => {
-        insertCols.push(column);
-        insertVals.push(`$${idx++}`);
-        insertParams.push(value);
-      };
+        if (insertCols.length === 0) continue;
 
-      if (managerColumns.has("business_id")) push("business_id", row.business_id ?? businessId ?? null);
-      if (managerColumns.has("approval_type")) push("approval_type", "route_optimization");
-      if (managerColumns.has("status")) push("status", normalizedStatus);
-      if (managerColumns.has("required_role")) {
-        push("required_role", normalizedStatus === "pending" ? "logistics_manager" : "logistics_manager");
+        await pool.query(
+          `INSERT INTO manager_approvals (${insertCols.join(", ")})
+           VALUES (${insertVals.join(", ")})`,
+          insertParams
+        );
+
+        routeKeyCandidates.forEach((candidate) => existingKeys.add(candidate));
+        inserted += 1;
       }
-      if (managerColumns.has("route_id")) push("route_id", row.route_id ?? row.id ?? null);
-      if (managerColumns.has("related_record_id")) push("related_record_id", row.id ?? row.route_id ?? null);
-      if (managerColumns.has("delivery_id")) push("delivery_id", row.route_id ?? row.id ?? null);
-      if (managerColumns.has("product_name")) push("product_name", row.route_type || row.route_name || "STANDARD");
-      if (managerColumns.has("location")) push("location", row.from_location || "Origin");
-      if (managerColumns.has("priority")) push("priority", "MEDIUM");
-      if (managerColumns.has("ai_suggestion")) push("ai_suggestion", row.ai_suggestion || null);
-      if (managerColumns.has("submitted_by")) push("submitted_by", row.submitted_by || null);
-      if (managerColumns.has("manager_comment") && normalizedStatus !== "pending") {
-        push("manager_comment", row.manager_comment || null);
-      }
-      if (managerColumns.has("decision_notes") && normalizedStatus !== "pending") {
-        push("decision_notes", row.manager_comment || null);
-      }
-      if (managerColumns.has("reviewed_at") && reviewedAt) push("reviewed_at", reviewedAt);
-      if (managerColumns.has("request_data")) push("request_data", JSON.stringify(requestData));
-      if (managerColumns.has("extra_data")) push("extra_data", JSON.stringify(extraData));
-      if (managerColumns.has("created_at")) push("created_at", submittedAt);
 
-      if (insertCols.length === 0) continue;
-
-      await pool.query(
-        `INSERT INTO manager_approvals (${insertCols.join(", ")})
-         VALUES (${insertVals.join(", ")})`,
-        insertParams
-      );
-
-      routeKeyCandidates.forEach((candidate) => existingKeys.add(candidate));
-      inserted += 1;
+      return { inserted, available: true };
+    } catch (err) {
+      console.warn("Legacy logistics approval sync failed:", err.message);
+      return { inserted: 0, available: false };
     }
+  })();
 
-    return { inserted, available: true };
-  } catch (err) {
-    console.warn("Legacy logistics approval sync failed:", err.message);
-    return { inserted: 0, available: false };
-  }
+  legacyLogisticsSyncCache.set(cacheKey, {
+    checkedAt: now,
+    promise: syncPromise,
+    result: cached?.result || { inserted: 0, available: false }
+  });
+
+  const result = await syncPromise;
+  legacyLogisticsSyncCache.set(cacheKey, {
+    checkedAt: Date.now(),
+    result
+  });
+  return result;
 }
 
 app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
@@ -3792,8 +3938,10 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
 
     const routeTableCheck = await pool.query(`SELECT to_regclass('public.route_approvals') AS tbl`);
     const hasRouteApprovals = !!routeTableCheck.rows[0]?.tbl;
-    const routeApprovalColumnsApprove = hasRouteApprovals ? await getTableColumns("route_approvals") : new Set();
     const routeApprovalColumns = hasRouteApprovals ? await getTableColumns("route_approvals") : new Set();
+    const routeApprovalPkCol = hasRouteApprovals
+      ? getFirstExistingColumn(routeApprovalColumns, ["id", "route_approval_id", "approval_id", "route_id"])
+      : null;
     const routeApprovalRefExpr = routeApprovalColumns.has("route_id")
       ? "COALESCE(ra.route_id, ra.id)"
       : "ra.id";
@@ -3801,6 +3949,25 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
       hasRouteApprovals && routeApprovalColumns.has("route_id")
         ? "COALESCE(route_id::text, id::text)"
         : "id::text";
+    const routeApprovalSubmittedAtExpr = hasRouteApprovals
+      ? getCoalesceColumns(routeApprovalColumns, "ra", ["submitted_at", "approved_at", "created_at"], "NULL::timestamp")
+      : "NULL::timestamp";
+    const routeApprovalSubmittedByExpr =
+      hasRouteApprovals && routeApprovalColumns.has("submitted_by") ? "ra.submitted_by" : "NULL";
+    const routeApprovalOrderExpr = hasRouteApprovals
+      ? getDescOrderExpr(
+          routeApprovalColumns,
+          "ra",
+          ["submitted_at", "approved_at", "created_at", routeApprovalPkCol],
+          routeApprovalPkCol ? `ra.${routeApprovalPkCol} DESC` : "1 DESC"
+        )
+      : "1 DESC";
+    const routeApprovalSavingsCo2Expr =
+      hasRouteApprovals && routeApprovalColumns.has("savings_co2") ? "savings_co2" : "0";
+    const routeApprovalSavingsKmExpr =
+      hasRouteApprovals && routeApprovalColumns.has("savings_km") ? "savings_km" : "0";
+    const routePendingWhere =
+      hasRouteApprovals && routeApprovalColumns.has("status") ? pendingRouteStatusPredicate : "FALSE";
     const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
     const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
     const managerColumns = hasManagerApprovals ? await getManagerApprovalsColumns() : new Set();
@@ -3977,22 +4144,22 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
             ra.savings_co2,
             ra.ai_suggestion, 
             ra.status, 
-            ra.submitted_by, 
-            ra.submitted_at
+            ${routeApprovalSubmittedByExpr} as submitted_by, 
+            ${routeApprovalSubmittedAtExpr} as submitted_at
           FROM route_approvals ra 
-          WHERE ${pendingRouteStatusPredicate}
-          ORDER BY submitted_at DESC 
+          WHERE ${routePendingWhere}
+          ORDER BY ${routeApprovalOrderExpr}
           LIMIT 20`
         );
 
         statsResult = await pool.query(
           `SELECT 
-            (SELECT COUNT(*) FROM route_approvals WHERE ${pendingRouteStatusPredicate}) as pending_count,
+            (SELECT COUNT(*) FROM route_approvals WHERE ${routePendingWhere}) as pending_count,
             (SELECT COUNT(*) FROM route_approvals WHERE UPPER(COALESCE(status, '')) = 'APPROVED') as approved_count,
             (SELECT COUNT(*) FROM route_approvals WHERE UPPER(COALESCE(status, '')) = 'DECLINED') as declined_count,
-            COALESCE(AVG(savings_co2) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as avg_co2_saved,
-            COALESCE(SUM(savings_co2) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as total_co2_reduced,
-            COALESCE(SUM(savings_km) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as total_km_saved
+            COALESCE(AVG(${routeApprovalSavingsCo2Expr}) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as avg_co2_saved,
+            COALESCE(SUM(${routeApprovalSavingsCo2Expr}) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as total_co2_reduced,
+            COALESCE(SUM(${routeApprovalSavingsKmExpr}) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as total_km_saved
           FROM route_approvals`
         );
       }
@@ -4017,22 +4184,22 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
           ra.savings_co2,
           ra.ai_suggestion, 
           ra.status, 
-          ra.submitted_by, 
-          ra.submitted_at
+          ${routeApprovalSubmittedByExpr} as submitted_by, 
+          ${routeApprovalSubmittedAtExpr} as submitted_at
         FROM route_approvals ra 
-        WHERE ${pendingRouteStatusPredicate}
-        ORDER BY submitted_at DESC 
+        WHERE ${routePendingWhere}
+        ORDER BY ${routeApprovalOrderExpr}
         LIMIT 20`
       );
 
       statsResult = await pool.query(
         `SELECT 
-          (SELECT COUNT(*) FROM route_approvals WHERE ${pendingRouteStatusPredicate}) as pending_count,
+          (SELECT COUNT(*) FROM route_approvals WHERE ${routePendingWhere}) as pending_count,
           (SELECT COUNT(*) FROM route_approvals WHERE UPPER(COALESCE(status, '')) = 'APPROVED') as approved_count,
           (SELECT COUNT(*) FROM route_approvals WHERE UPPER(COALESCE(status, '')) = 'DECLINED') as declined_count,
-          COALESCE(AVG(savings_co2) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as avg_co2_saved,
-          COALESCE(SUM(savings_co2) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as total_co2_reduced,
-          COALESCE(SUM(savings_km) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as total_km_saved
+          COALESCE(AVG(${routeApprovalSavingsCo2Expr}) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as avg_co2_saved,
+          COALESCE(SUM(${routeApprovalSavingsCo2Expr}) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as total_co2_reduced,
+          COALESCE(SUM(${routeApprovalSavingsKmExpr}) FILTER (WHERE UPPER(COALESCE(status, '')) = 'APPROVED'), 0) as total_km_saved
         FROM route_approvals`
       );
     } else {
