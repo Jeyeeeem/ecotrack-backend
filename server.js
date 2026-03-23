@@ -1826,8 +1826,8 @@ app.get("/api/routes/:routeId/stops", authenticate, async (req, res) => {
 app.post("/api/routes/:routeId/stops", authenticate, async (req, res) => {
   const { routeId } = req.params;
   const { stop_sequence, location_name, address, latitude, longitude, stop_type } = req.body;
-  
-  if (!stop_sequence || !location_name) {
+
+  if (stop_sequence === undefined || stop_sequence === null || stop_sequence === "" || !location_name) {
     return res.status(400).json({ success: false, message: "Stop sequence and location name are required" });
   }
   
@@ -2101,14 +2101,52 @@ const computePathDistanceKm = (points) => {
   return Number.isFinite(sum) ? sum : 0;
 };
 
-const normalizeLogisticsStop = (stop, index) => {
-  const name = stop?.stop_name || stop?.stopName || stop?.location_name || stop?.location || stop?.name || `Stop ${index + 1}`;
-  const address = stop?.address || stop?.location || stop?.full_address || "";
+const parseLogisticsStopLocation = (value) => {
+  if (!value) return null;
+  if (typeof value === "object") {
+    return Array.isArray(value) ? null : value;
+  }
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch (error) {
+    return null;
+  }
+};
+
+const getLogisticsStopSequence = (stop, index) => {
   const parsedSequence = Number.parseInt(
     stop?.sequence ?? stop?.stop_sequence ?? stop?.stopId ?? stop?.stop_id,
     10
   );
-  const sequence = Number.isFinite(parsedSequence) && parsedSequence > 0 ? parsedSequence : index + 1;
+  return Number.isFinite(parsedSequence) ? parsedSequence : index + 1;
+};
+
+const normalizeLogisticsStop = (stop, index) => {
+  const locationData = parseLogisticsStopLocation(stop?.location);
+  const rawLocation =
+    typeof stop?.location === "string" && !/^\s*[{[]/.test(stop.location) ? stop.location.trim() : "";
+  const name =
+    stop?.stop_name ||
+    stop?.stopName ||
+    stop?.location_name ||
+    stop?.name ||
+    stop?.address ||
+    stop?.full_address ||
+    locationData?.address ||
+    rawLocation ||
+    `Stop ${index + 1}`;
+  const address =
+    stop?.address ||
+    stop?.full_address ||
+    stop?.location_name ||
+    locationData?.address ||
+    rawLocation ||
+    "";
+  const sequence = getLogisticsStopSequence(stop, index);
   return {
     stop_name: String(name),
     stopName: String(name),
@@ -2179,7 +2217,7 @@ const toNormalizedLogisticsStops = (candidateStops) => {
   if (!Array.isArray(candidateStops) || candidateStops.length === 0) return [];
   return candidateStops.map((stop, index) => {
     const base = normalizeLogisticsStop(stop, index);
-    const point = extractLatLng(stop?.location, stop);
+    const point = extractLatLng(parseLogisticsStopLocation(stop?.location), stop);
     return point ? { ...base, latitude: point.latitude, longitude: point.longitude } : base;
   });
 };
@@ -2188,10 +2226,7 @@ const scoreLogisticsStops = (stops) => {
   if (!Array.isArray(stops) || stops.length === 0) return -1;
   const coordinateCount = stops.filter((stop) => stop?.latitude != null && stop?.longitude != null).length;
   const distinctSequences = new Set(
-    stops.map((stop, index) => {
-      const parsed = Number.parseInt(stop?.sequence ?? stop?.stop_sequence ?? index + 1, 10);
-      return Number.isFinite(parsed) && parsed > 0 ? parsed : index + 1;
-    })
+    stops.map((stop, index) => getLogisticsStopSequence(stop, index))
   ).size;
   return stops.length * 100 + coordinateCount * 10 + distinctSequences;
 };
@@ -2220,26 +2255,23 @@ const mergeLogisticsStopCoordinates = (preferredStops, fallbackStops) => {
 
   const fallbackBySequence = new Map();
   fallbackStops.forEach((stop, index) => {
-    const parsedSequence = Number.parseInt(
-      stop?.sequence ?? stop?.stop_sequence ?? stop?.stopId ?? stop?.stop_id ?? index + 1,
-      10
-    );
-    const sequence = Number.isFinite(parsedSequence) && parsedSequence > 0 ? parsedSequence : index + 1;
+    const sequence = getLogisticsStopSequence(stop, index);
     if (!fallbackBySequence.has(sequence)) {
       fallbackBySequence.set(sequence, stop);
     }
   });
 
   return preferredStops.map((stop, index) => {
-    const parsedSequence = Number.parseInt(
-      stop?.sequence ?? stop?.stop_sequence ?? stop?.stopId ?? stop?.stop_id ?? index + 1,
-      10
-    );
-    const sequence = Number.isFinite(parsedSequence) && parsedSequence > 0 ? parsedSequence : index + 1;
+    const sequence = getLogisticsStopSequence(stop, index);
     const fallbackStop = fallbackBySequence.get(sequence);
     const merged = fallbackStop ? { ...fallbackStop, ...stop } : stop;
     const base = normalizeLogisticsStop(merged, index);
-    const point = extractLatLng(stop, fallbackStop);
+    const point = extractLatLng(
+      parseLogisticsStopLocation(stop?.location),
+      parseLogisticsStopLocation(fallbackStop?.location),
+      stop,
+      fallbackStop
+    );
     return point ? { ...base, latitude: point.latitude, longitude: point.longitude } : base;
   });
 };
@@ -8756,8 +8788,8 @@ app.get("/api/driver/delivery/:id", authenticate, async (req, res) => {
       const stopsJsonStatuses = stopsJsonArray
         ? stopsJsonArray.map((s) => String(s?.status || "").trim())
         : [];
-      stops = stopsRows.map(stop => {
-        const idx = Math.max(0, Number(stop.stop_sequence || 1) - 1);
+      stops = stopsRows.map((stop, rowIndex) => {
+        const idx = rowIndex;
         const statusFromDelivery = stopsJsonStatuses[idx];
         const statusFromRouteStops = String(stop.status || "").trim();
         const resolvedStatus =
