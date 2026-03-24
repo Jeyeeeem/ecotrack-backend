@@ -3679,6 +3679,99 @@ const fetchDriverMonitorRows = async (businessId = null) => {
       console.warn("Driver monitor route_approvals lookup fallback:", driverRouteErr.message);
     }
 
+    // Fallback busy drivers from manager approvals (route optimization workflow)
+    try {
+      const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
+      const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
+      if (hasManagerApprovals) {
+        const managerColumns = await getManagerApprovalsColumns();
+        const managerPkCol = await getManagerApprovalsPkColumn();
+        const params = [];
+        let whereClause = `approval_type = 'route_optimization'`;
+        if (managerColumns.has("required_role")) {
+          whereClause += ` AND LOWER(COALESCE(required_role, '')) = 'logistics_manager'`;
+        }
+        if (businessId && managerColumns.has("business_id")) {
+          params.push(businessId);
+          whereClause += ` AND COALESCE(business_id, 0) = $${params.length}`;
+        }
+
+        const statusExpr = managerColumns.has("status") ? "LOWER(COALESCE(status,''))" : "''";
+        const statusPredicate = managerColumns.has("status")
+          ? `(
+              ${statusExpr} IN ('pending','awaiting_approval','submitted','in_review','for_approval','assigned','accepted','in_progress')
+              OR ${statusExpr} LIKE '%pending%'
+              OR ${statusExpr} LIKE '%await%'
+              OR ${statusExpr} LIKE '%review%'
+              OR ${statusExpr} LIKE '%submit%'
+            )`
+          : "TRUE";
+
+        const driverIdExpr = managerColumns.has("driver_user_id")
+          ? "driver_user_id"
+          : managerColumns.has("driver_id")
+          ? "driver_id"
+          : "NULL::int";
+        const driverNameExpr = managerColumns.has("driver_name") ? "NULLIF(driver_name, '')" : "NULL";
+        const driverNameJsonExpr = managerColumns.has("extra_data")
+          ? "NULLIF(COALESCE(extra_data->'route'->>'driver_name', extra_data->'route'->>'driver'), '')"
+          : "NULL";
+        const driverNameCoalesce = `COALESCE(${driverNameExpr}, ${driverNameJsonExpr})`;
+
+        const routeIdExpr = managerColumns.has("route_id")
+          ? "route_id::text"
+          : managerColumns.has("related_record_id")
+          ? "related_record_id::text"
+          : managerColumns.has("delivery_id")
+          ? "delivery_id::text"
+          : `${managerPkCol}::text`;
+        const requestRouteExpr = managerColumns.has("request_data") ? "request_data->>'route_id'" : "NULL";
+        const extraRouteExpr = managerColumns.has("extra_data") ? "extra_data->'route'->>'route_id'" : "NULL";
+        const routeIdCoalesce = `NULLIF(COALESCE(${routeIdExpr}, ${requestRouteExpr}, ${extraRouteExpr}), '')`;
+
+        const routeNameExpr = managerColumns.has("route_name") ? "NULLIF(route_name, '')" : "NULL";
+        const routeNameJsonExpr = managerColumns.has("extra_data")
+          ? "NULLIF(COALESCE(extra_data->'route'->>'route_name', extra_data->'route'->>'routeName', extra_data->'route'->>'route_code'), '')"
+          : "NULL";
+        const routeFromExpr = managerColumns.has("extra_data")
+          ? "COALESCE(extra_data->'route'->>'from', extra_data->'route'->>'from_location', '')"
+          : "''";
+        const routeToExpr = managerColumns.has("extra_data")
+          ? "COALESCE(extra_data->'route'->>'to', extra_data->'route'->>'to_location', '')"
+          : "''";
+        const routeNameFallback = `${routeFromExpr} || CASE WHEN ${routeToExpr} <> '' THEN ' → ' || ${routeToExpr} ELSE '' END`;
+        const routeNameCoalesce = `NULLIF(COALESCE(${routeNameExpr}, ${routeNameJsonExpr}, ${routeNameFallback}), '')`;
+
+        const routeStatusExpr = managerColumns.has("status") ? "UPPER(status)" : "'PENDING'";
+        const identityPredicate = `(${driverNameCoalesce} IS NOT NULL OR ${driverIdExpr} IS NOT NULL)`;
+        const orderExpr = managerColumns.has("created_at")
+          ? "created_at DESC NULLS LAST"
+          : `${managerPkCol} DESC`;
+
+        const managerBusyRows = await pool.query(
+          `SELECT
+             ${driverNameCoalesce} AS driver_name,
+             ${driverIdExpr} AS driver_user_id,
+             ${routeNameCoalesce} AS route_name,
+             ${routeStatusExpr} AS route_status,
+             ${routeIdCoalesce} AS route_id
+           FROM manager_approvals
+           WHERE ${whereClause}
+             AND ${statusPredicate}
+             AND ${identityPredicate}
+           ORDER BY ${orderExpr}
+           LIMIT 50`,
+          params
+        );
+
+        for (const row of managerBusyRows.rows) {
+          upsertBusy(row.driver_name, row.route_name, row.route_status, row.route_id, null, row.driver_user_id);
+        }
+      }
+    } catch (managerRouteErr) {
+      console.warn("Driver monitor manager_approvals lookup fallback:", managerRouteErr.message);
+    }
+
     // Merge busy overlay into existing live-driver rows and add missing busy drivers
     if (driverMonitorRows.length > 0 && busyByDriver.size > 0) {
       const seenKeys = new Set();
