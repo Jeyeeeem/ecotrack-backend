@@ -3409,9 +3409,41 @@ const fetchDriverMonitorRows = async (businessId = null) => {
     );
 
     const busyByDriver = new Map();
+    const knownDriverNames = new Set();
+    const knownDriverIds = new Set();
+
+    usersResult.rows.forEach((u) => {
+      const fallbackName =
+        String(u.full_name || "").trim() ||
+        String(u.username || "").trim() ||
+        String(u.email || "").split("@")[0] ||
+        "";
+      if (fallbackName) knownDriverNames.add(fallbackName.toLowerCase());
+      if (u.user_id && Number.isFinite(Number(u.user_id))) {
+        knownDriverIds.add(`id:${Number(u.user_id)}`);
+      }
+    });
+
+    const isPlaceholderDriverName = (name) => {
+      const normalized = String(name || "").trim().toLowerCase();
+      if (!normalized) return true;
+      if (normalized === "driver not assigned") return true;
+      if (normalized === "not assigned") return true;
+      if (normalized === "unassigned") return true;
+      if (normalized === "n/a") return true;
+      if (normalized === "na") return true;
+      if (normalized.startsWith("driver not assigned")) return true;
+      return false;
+    };
+
     const upsertBusy = (driverName, routeName, routeStatus, routeId = null, vehicleType = null, driverUserId = null) => {
+      if (isPlaceholderDriverName(driverName)) return;
       const keyName = String(driverName || "").trim().toLowerCase();
       const keyId = driverUserId && Number.isFinite(Number(driverUserId)) ? `id:${Number(driverUserId)}` : null;
+      const isKnown =
+        (keyName && knownDriverNames.has(keyName)) ||
+        (keyId && knownDriverIds.has(keyId));
+      if (!isKnown) return;
       const register = (key) => {
         if (!key) return;
         if (busyByDriver.has(key)) return;
@@ -3821,6 +3853,8 @@ const fetchDriverMonitorRows = async (businessId = null) => {
       // add busy drivers not present in live list (e.g., pending assignments)
       for (const [key, busy] of busyByDriver.entries()) {
         if (seenKeys.has(key)) continue;
+        if (key.startsWith("id:") && !knownDriverIds.has(key)) continue;
+        if (!key.startsWith("id:") && !knownDriverNames.has(key)) continue;
         const fallbackName = busy.driver_name || key.replace(/^id:/, "") || "Driver";
         driverMonitorRows.push({
           user_id: null,
