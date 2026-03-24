@@ -3524,6 +3524,12 @@ const fetchDriverMonitorRows = async (businessId = null) => {
           const joinedUserEmailExpr = userJoinClause
             ? getQualifiedColumn(usersColumns, "u", ["email"], "NULL::text")
             : "NULL::text";
+          const stopsCompletedExpr = deliveriesColumns.has("stops_completed")
+            ? "COALESCE(d.stops_completed, 0)"
+            : "0";
+          const stopsTotalExpr = deliveriesColumns.has("stops_total")
+            ? "COALESCE(d.stops_total, 0)"
+            : "0";
           const liveDriverQuery = `
             SELECT
               COALESCE(${liveNameExpr}, ${joinedUserNameExpr}, 'Driver') AS full_name,
@@ -3534,8 +3540,8 @@ const fetchDriverMonitorRows = async (businessId = null) => {
               ${vehicleExpr} AS vehicle_type,
               ${driverIdExpr} AS driver_user_id,
               ${driverIdExpr} AS user_id,
-              COALESCE(d.stops_completed, 0) AS stops_completed,
-              COALESCE(d.stops_total, 0) AS stops_total
+              ${stopsCompletedExpr} AS stops_completed,
+              ${stopsTotalExpr} AS stops_total
             FROM deliveries d
             ${userJoinClause}
             WHERE ${statusExpr} NOT IN ('completed','cancelled','declined','rejected')
