@@ -200,6 +200,10 @@ function getScopedCacheKey(value) {
 
 const normalizeRouteIdCandidates = (routeId, extras = []) => {
   const pushAll = (set, val) => {
+    if (Array.isArray(val)) {
+      val.forEach((item) => pushAll(set, item));
+      return;
+    }
     if (val === undefined || val === null) return;
     const s = String(val).trim();
     if (s) set.add(s);
@@ -215,6 +219,99 @@ const normalizeRouteIdCandidates = (routeId, extras = []) => {
   });
   return Array.from(expanded).filter(Boolean);
 };
+
+async function getStoredRouteStopsFromTable(tableName, routeIdOrCandidates) {
+  const candidates = normalizeRouteIdCandidates(routeIdOrCandidates, []);
+  if (candidates.length === 0) return [];
+
+  try {
+    if (!(await tableExists(tableName))) {
+      return [];
+    }
+
+    const columns = await getTableColumns(tableName);
+    const routeRefCols = getExistingColumns(columns, [
+      "route_id",
+      "delivery_id",
+      "route_approval_id",
+      "approval_id"
+    ]);
+    if (routeRefCols.length === 0) {
+      return [];
+    }
+
+    const sequenceCol = getFirstExistingColumn(columns, [
+      "stop_sequence",
+      "sequence",
+      "sequence_no",
+      "stop_order",
+      "order_index",
+      "sort_order",
+      "position",
+      "id"
+    ]);
+    const orderExpr = sequenceCol ? `${sequenceCol} ASC NULLS LAST` : "1 ASC";
+
+    for (const candidate of candidates) {
+      const numericCandidate = Number(candidate) || 0;
+      for (const routeRefCol of routeRefCols) {
+        try {
+          const result = await pool.query(
+            `SELECT *
+             FROM ${tableName}
+             WHERE ${routeRefCol}::text = $1
+                OR ${routeRefCol} = NULLIF($2, 0)
+             ORDER BY ${orderExpr}`,
+            [candidate, numericCandidate]
+          );
+
+          if (result.rows.length > 0) {
+            return result.rows.map((row, index) => {
+              const base = normalizeLogisticsStop(row, index);
+              const point = extractLatLng(parseLogisticsStopLocation(row?.location), row);
+              const sequence = getLogisticsStopSequence(row, index);
+              return {
+                ...row,
+                stop_id: row.stop_id ?? row.route_stop_id ?? row.id ?? sequence,
+                sequence,
+                stop_sequence: sequence,
+                stop_name: row.stop_name ?? row.stopName ?? row.location_name ?? base.stop_name,
+                location_name: row.location_name ?? row.stop_name ?? row.stopName ?? base.stop_name,
+                address: row.address ?? row.location_name ?? row.stop_name ?? base.address,
+                latitude: point?.latitude ?? null,
+                longitude: point?.longitude ?? null
+              };
+            });
+          }
+        } catch (_) {
+          // Ignore per-column lookup failures and continue with other route references.
+        }
+      }
+    }
+  } catch (_) {
+    return [];
+  }
+
+  return [];
+}
+
+async function getBestStoredRouteStops(routeIdOrCandidates) {
+  const [routeStopDetails, routeStops] = await Promise.all([
+    getStoredRouteStopsFromTable("route_stop_details", routeIdOrCandidates),
+    getStoredRouteStopsFromTable("route_stops", routeIdOrCandidates)
+  ]);
+
+  const detailsScore = scoreLogisticsStops(routeStopDetails);
+  const routeStopsScore = scoreLogisticsStops(routeStops);
+
+  if (detailsScore < 0 && routeStopsScore < 0) {
+    return [];
+  }
+
+  const preferredStops = detailsScore >= routeStopsScore ? routeStopDetails : routeStops;
+  const fallbackStops = preferredStops === routeStopDetails ? routeStops : routeStopDetails;
+  return mergeLogisticsStopCoordinates(preferredStops, fallbackStops);
+}
 
 // Pull authoritative logistics data directly from core tables (no schema change)
 async function getLogisticsDbSnapshot(routeIdOrCandidates) {
@@ -279,20 +376,7 @@ async function getLogisticsDbSnapshot(routeIdOrCandidates) {
   } catch (_) {}
 
   try {
-    for (const candidate of candidates) {
-      const stopsRes = await pool.query(
-        `SELECT stop_id, stop_sequence, location, location_name, address, latitude, longitude,
-                planned_arrival_time, actual_arrival_time, planned_departure_time, actual_departure_time, notes
-         FROM route_stops
-         WHERE route_id::text = $1 OR route_id = NULLIF($2, 0)
-         ORDER BY stop_sequence ASC`,
-        [candidate, Number(candidate) || 0]
-      );
-      if (stopsRes.rows.length > 0) {
-        snapshot.stops = stopsRes.rows;
-        break;
-      }
-    }
+    snapshot.stops = await getBestStoredRouteStops(candidates);
   } catch (_) {}
 
   try {
@@ -2425,6 +2509,14 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     routeId = String(deliveryRoute.route_id);
   }
   const routeOptimizationSnapshot = await getRouteOptimizationSnapshot(routeIdCandidates);
+  const storedOptimizationData = parseMaybeJsonObject(routeOptimizationSnapshot?.optimization_data);
+  const routeApprovalStops = parseMaybeJsonArray(routeApprovalSnapshot?.stops);
+  const routeApprovalOriginalStops = parseMaybeJsonArray(routeApprovalSnapshot?.original_stops);
+  const routeApprovalOptimizedStops = parseMaybeJsonArray(routeApprovalSnapshot?.optimized_stops);
+
+  if (Object.keys(storedOptimizationData).length > 0) {
+    optimizationData = { ...storedOptimizationData, ...optimizationData };
+  }
 
   // If the source row lacks request/extra data (e.g., came from delivery_routes),
   // hydrate from a matching route_approvals row so dashboard cards get real metrics.
@@ -2439,6 +2531,9 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     routeData = {
       route_path: routeApprovalSnapshot.route_path,
       routePath: routeApprovalSnapshot.route_path,
+      stops: routeApprovalStops,
+      original_stops: routeApprovalOriginalStops.length > 0 ? routeApprovalOriginalStops : routeApprovalStops,
+      optimized_stops: routeApprovalOptimizedStops.length > 0 ? routeApprovalOptimizedStops : routeApprovalStops,
       original_distance: routeApprovalSnapshot.original_distance,
       optimized_distance: routeApprovalSnapshot.optimized_distance,
       original_fuel: routeApprovalSnapshot.original_fuel,
@@ -2621,6 +2716,24 @@ async function buildLogisticsRoutePayload(row, options = {}) {
     }
   }
 
+  if (routeApprovalSnapshot) {
+    if (routeApprovalStops.length > 0 && (!Array.isArray(routeData.stops) || routeData.stops.length < routeApprovalStops.length)) {
+      routeData.stops = routeApprovalStops;
+    }
+    if (
+      routeApprovalOriginalStops.length > 0 &&
+      (!Array.isArray(routeData.original_stops) || routeData.original_stops.length < routeApprovalOriginalStops.length)
+    ) {
+      routeData.original_stops = routeApprovalOriginalStops;
+    }
+    if (
+      routeApprovalOptimizedStops.length > 0 &&
+      (!Array.isArray(routeData.optimized_stops) || routeData.optimized_stops.length < routeApprovalOptimizedStops.length)
+    ) {
+      routeData.optimized_stops = routeApprovalOptimizedStops;
+    }
+  }
+
   const fromLocation =
     row.from_location ||
     requestData.from_location ||
@@ -2652,6 +2765,9 @@ async function buildLogisticsRoutePayload(row, options = {}) {
   const dbStops = toNormalizedLogisticsStops(routeStopsFromDb);
   let stops = pickBestLogisticsStops(
     rowStops,
+    routeApprovalStops,
+    routeApprovalOriginalStops,
+    routeApprovalOptimizedStops,
     requestData.stops,
     requestData.original_stops,
     requestData.originalStops,
@@ -2683,15 +2799,9 @@ async function buildLogisticsRoutePayload(row, options = {}) {
 
   if (stops.length === 0 && hasRouteStops && routeId) {
     try {
-      const stopsResult = await pool.query(
-        `SELECT stop_sequence, location_name, address, latitude, longitude
-         FROM route_stops
-         WHERE route_id::text = $1
-         ORDER BY stop_sequence ASC`,
-        [routeId]
-      );
-      if (stopsResult.rows.length > 0) {
-        stops = toNormalizedLogisticsStops(stopsResult.rows);
+      const storedStops = await getBestStoredRouteStops(routeId);
+      if (storedStops.length > 0) {
+        stops = toNormalizedLogisticsStops(storedStops);
       }
     } catch (e) {
       // Ignore route stop lookup failures and keep fallback stops below.
@@ -4499,8 +4609,7 @@ app.get("/api/logistics/dashboard", optionalAuth, async (req, res) => {
         console.warn("Logistics dashboard delivery stats fallback failed:", deliveryStatsErr.message);
       }
     }
-    const routeStopsTableCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
-    const hasRouteStops = !!routeStopsTableCheck.rows[0]?.tbl;
+    const hasRouteStops = (await tableExists("route_stops")) || (await tableExists("route_stop_details"));
     const mappedPendingRoutes = [];
     for (const row of pendingResult.rows) {
       try {
@@ -4983,8 +5092,7 @@ app.get("/api/logistics/route/:routeId", async (req, res) => {
       managerHasRouteKeys;
     const managerPkCol = hasManagerApprovals ? await getManagerApprovalsPkColumn() : "id";
     const routeApprovalColumns = hasRouteApprovals ? await getTableColumns("route_approvals") : new Set();
-    const routeStopsTableCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
-    const hasRouteStops = !!routeStopsTableCheck.rows[0]?.tbl;
+    const hasRouteStops = (await tableExists("route_stops")) || (await tableExists("route_stop_details"));
     const hasDeliveryRoutes = true; // attempt delivery_routes even if to_regclass fails
 
     let row = null;
@@ -5136,31 +5244,28 @@ app.get("/api/logistics/route/:routeId", async (req, res) => {
           console.log("Cargo mapped empty for route", ridInt);
         }
 
-        // Refresh stops directly from route_stops to avoid missing waypoints on details screen
-        const rsCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
-        if (rsCheck.rows[0]?.tbl) {
-          const stopsRes = await pool.query(
-            `SELECT stop_sequence, location_name, address, latitude, longitude
-             FROM route_stops
-             WHERE route_id = $1
-             ORDER BY stop_sequence ASC`,
-            [ridInt]
-          );
-          if (stopsRes.rows.length > 0) {
-            const refreshedStops = toNormalizedLogisticsStops(stopsRes.rows);
-            const currentStops = Array.isArray(route.stops) ? route.stops : [];
-            const preferredStops =
-              currentStops.length >= refreshedStops.length ? currentStops : refreshedStops;
-            const fallbackStops =
-              preferredStops === currentStops ? refreshedStops : currentStops;
-            const mergedStops = mergeLogisticsStopCoordinates(preferredStops, fallbackStops);
-            route.stops = mergedStops.length > 0 ? mergedStops : preferredStops;
-            if (!Array.isArray(route.original_stops) || route.original_stops.length < route.stops.length) {
-              route.original_stops = route.stops;
-            }
-            if (!Array.isArray(route.optimized_stops) || route.optimized_stops.length < route.stops.length) {
-              route.optimized_stops = route.stops;
-            }
+        // Refresh stops from the richest stored source so details screens keep all waypoints.
+        const refreshedStops = await getBestStoredRouteStops([
+          ridInt,
+          route.routeId,
+          route.route_id,
+          row.route_id,
+          row.approval_id
+        ]);
+        if (refreshedStops.length > 0) {
+          const normalizedRefreshedStops = toNormalizedLogisticsStops(refreshedStops);
+          const currentStops = Array.isArray(route.stops) ? route.stops : [];
+          const preferredStops =
+            currentStops.length >= normalizedRefreshedStops.length ? currentStops : normalizedRefreshedStops;
+          const fallbackStops =
+            preferredStops === currentStops ? normalizedRefreshedStops : currentStops;
+          const mergedStops = mergeLogisticsStopCoordinates(preferredStops, fallbackStops);
+          route.stops = mergedStops.length > 0 ? mergedStops : preferredStops;
+          if (!Array.isArray(route.original_stops) || route.original_stops.length < route.stops.length) {
+            route.original_stops = route.stops;
+          }
+          if (!Array.isArray(route.optimized_stops) || route.optimized_stops.length < route.stops.length) {
+            route.optimized_stops = route.stops;
           }
         }
       }
@@ -5510,7 +5615,7 @@ app.get("/api/logistics/driver-monitor", async (req, res) => {
 
 app.patch("/api/logistics/:id/approve", async (req, res) => {
   const { id } = req.params;
-  const { comment, driver_id } = req.body;
+  const { comment, driver_id, driverName } = req.body;
   try {
     const businessId = req.user?.businessId || req.user?.business_id || null;
     await syncLegacyLogisticsApprovals(businessId);
@@ -5538,10 +5643,12 @@ app.patch("/api/logistics/:id/approve", async (req, res) => {
          RETURNING *`,
         [comment || '', managerApprovalId]
       );
+      let resolvedRouteRef = id;
       if (hasRouteApprovals) {
         if (maResult.rows.length > 0) {
           const routeRef = maResult.rows[0].route_id || maResult.rows[0].delivery_id;
           if (routeRef) {
+            resolvedRouteRef = routeRef;
             await pool.query(
               `UPDATE route_approvals 
                SET status = 'APPROVED', manager_comment = $1, approved_at = NOW()
@@ -5557,6 +5664,100 @@ app.patch("/api/logistics/:id/approve", async (req, res) => {
              WHERE id = $2`,
             [comment || '', id]
           );
+        }
+      }
+
+      // Persist driver assignment even when manager_approvals is present
+      const requestedDriverName = String(driverName || '').trim();
+      let resolvedDriverName = requestedDriverName || null;
+      if (!resolvedDriverName && driver_id) {
+        const driverResult = await pool.query(
+          `SELECT COALESCE(NULLIF(full_name, ''), NULLIF(name, ''), email) AS name
+           FROM users WHERE user_id = $1 AND role = 'driver'`,
+          [driver_id]
+        );
+        if (driverResult.rows.length > 0) {
+          resolvedDriverName = driverResult.rows[0].name;
+        }
+      }
+
+      if (hasRouteApprovals && resolvedDriverName) {
+        const routeApprovalColumns = await getTableColumns("route_approvals");
+        const idCol = routeApprovalColumns.has("driver_user_id")
+          ? "driver_user_id"
+          : routeApprovalColumns.has("driver_id")
+          ? "driver_id"
+          : null;
+        if (idCol && driver_id) {
+          await pool.query(
+            `UPDATE route_approvals
+             SET driver_name = COALESCE($1, driver_name),
+                 ${idCol} = COALESCE($2, ${idCol})
+             WHERE id = $3`,
+            [resolvedDriverName, driver_id, resolvedRouteRef]
+          );
+        } else {
+          await pool.query(
+            `UPDATE route_approvals
+             SET driver_name = COALESCE($1, driver_name)
+             WHERE id = $2`,
+            [resolvedDriverName, resolvedRouteRef]
+          );
+        }
+      }
+
+      if (driver_id && resolvedDriverName) {
+        const deliveriesCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
+        if (deliveriesCheck.rows[0]?.tbl) {
+          const routeResult = await pool.query(`SELECT * FROM route_approvals WHERE id = $1`, [resolvedRouteRef]);
+          if (routeResult.rows.length > 0) {
+            const route = routeResult.rows[0];
+            const existingDelivery = await pool.query(
+              `SELECT delivery_id FROM deliveries WHERE route_id = $1 AND driver_name = $2`,
+              [resolvedRouteRef, resolvedDriverName]
+            );
+            if (existingDelivery.rows.length === 0) {
+              let stopsJson = null;
+              try {
+                const rsCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
+                if (rsCheck.rows[0]?.tbl) {
+                  const rs = await pool.query(
+                    `SELECT stop_sequence, location_name, address, latitude, longitude
+                     FROM route_stops
+                     WHERE route_id = $1
+                     ORDER BY stop_sequence ASC`,
+                    [resolvedRouteRef]
+                  );
+                  if (rs.rows.length) {
+                    stopsJson = rs.rows.map((s, idx) => ({
+                      stopId: s.stop_sequence ?? idx + 1,
+                      sequence: s.stop_sequence ?? idx + 1,
+                      stopName: s.location_name || s.address || `Stop ${idx + 1}`,
+                      address: s.address || s.location_name || "",
+                      latitude: toFiniteNumber(s.latitude),
+                      longitude: toFiniteNumber(s.longitude),
+                      status: "pending"
+                    }));
+                  }
+                }
+              } catch (routeStopsErr) {
+                console.warn("delivery insert route_stops fetch failed:", routeStopsErr.message);
+              }
+
+              await pool.query(
+                `INSERT INTO deliveries 
+                  (route_id, status, driver_name, vehicle_type, departure_time, from_location, to_location,
+                   distance_km, estimated_fuel_consumption_liters, estimated_carbon_kg, stops_json)
+                 VALUES ($1, 'assigned', $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+                [resolvedRouteRef, resolvedDriverName, route.vehicle_type, route.departure_time, route.from_location, 
+                 route.to_location, route.optimized_distance || route.original_distance,
+                 route.optimized_fuel || route.original_fuel, route.optimized_co2 || route.original_co2,
+                 stopsJson]
+              );
+            }
+          }
+        } else {
+          console.warn("deliveries table missing; driver assignment saved without delivery record");
         }
       }
       return res.json({ success: true, message: "Approved" });
