@@ -3577,7 +3577,7 @@ const fetchDriverMonitorRows = async (businessId = null) => {
                   return `AND (business_id = $${params.length} OR business_id IS NULL)`;
                 })()
               : "";
-          const activeStatuses = ['assigned', 'accepted', 'in_progress', 'pending', 'planned'];
+          const activeStatuses = ['assigned', 'accepted', 'in_progress', 'pending', 'planned', 'assigned_to_driver'];
           params.push(activeStatuses);
           const activeClause = `${statusCol} = ANY($${params.length}::text[])`;
           const drRows = await pool.query(
@@ -5719,17 +5719,14 @@ app.get("/api/logistics/stats", async (req, res) => {
   } catch (err) { res.json({ success: true, data: { pending_count: 0, approved_count: 0, declined_count: 0, avg_co2_saved: 0 }, message: "Logistics stats unavailable" }); }
 });
 
-app.get("/api/logistics/driver-monitor", async (req, res) => {
+app.get("/api/logistics/driver-monitor", optionalAuth, async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT u.user_id, COALESCE(NULLIF(u.full_name, ''), u.name, u.email) as full_name, u.email, d.from_location || ' → ' || d.to_location as route_name, 
-             d.status as route_status, 0 as stops_completed, 2 as stops_total 
-      FROM users u 
-      LEFT JOIN deliveries d ON d.driver_name = COALESCE(NULLIF(u.full_name, ''), u.name) AND d.status IN ('assigned', 'accepted', 'in_progress') 
-      WHERE u.role = 'driver' ORDER BY COALESCE(NULLIF(u.full_name, ''), u.name, u.email) ASC
-    `);
-    res.json({ success: true, data: result.rows, message: null });
-  } catch (err) { res.json({ success: true, data: [], message: "Driver monitor unavailable" }); }
+    const businessId = req.user?.businessId || req.user?.business_id || null;
+    const driverMonitorRows = await fetchDriverMonitorRows(businessId);
+    res.json({ success: true, data: driverMonitorRows, message: null });
+  } catch (err) {
+    res.json({ success: false, data: [], message: "Driver monitor unavailable" });
+  }
 });
 
 app.patch("/api/logistics/:id/approve", async (req, res) => {
@@ -6954,7 +6951,11 @@ app.post("/api/logistics/approve", async (req, res) => {
           ? Array.from(routeApprovalKeys)
           : [String(resolvedRouteId || routeId || "")].filter(Boolean);
         if (routeKeys.length > 0) {
-          const updates = ["status = LOWER($1::text)"];
+          const deliveryRouteStatus =
+            status === 'APPROVED'
+              ? 'assigned'
+              : String(status || '').trim().toLowerCase();
+          const updates = ["status = $1::text"];
           if (deliveryRoutesColumns.has("driver_name")) updates.push("driver_name = COALESCE($2, driver_name)");
           if (deliveryRoutesColumns.has("driver_user_id")) updates.push("driver_user_id = COALESCE($3, driver_user_id)");
           else if (deliveryRoutesColumns.has("driver_id")) updates.push("driver_id = COALESCE($3, driver_id)");
@@ -6963,7 +6964,7 @@ app.post("/api/logistics/approve", async (req, res) => {
             `UPDATE delivery_routes
              SET ${updates.join(", ")}
              WHERE route_id::text = ANY($4)`,
-            [status, assignedDriver, selectedDriverId, routeKeys]
+            [deliveryRouteStatus, assignedDriver, selectedDriverId, routeKeys]
           );
         }
       }
