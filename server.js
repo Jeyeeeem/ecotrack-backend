@@ -3713,9 +3713,13 @@ const fetchDriverMonitorRows = async (businessId = null) => {
           ? "driver_id"
           : "NULL::int";
         const driverNameExpr = managerColumns.has("driver_name") ? "NULLIF(driver_name, '')" : "NULL";
-        const driverNameJsonExpr = managerColumns.has("extra_data")
+        const driverNameExtraExpr = managerColumns.has("extra_data")
           ? "NULLIF(COALESCE(extra_data->'route'->>'driver_name', extra_data->'route'->>'driver'), '')"
           : "NULL";
+        const driverNameRequestExpr = managerColumns.has("request_data")
+          ? "NULLIF(COALESCE(request_data->'route'->>'driver_name', request_data->'route'->>'driver', request_data->>'driver_name', request_data->>'driver'), '')"
+          : "NULL";
+        const driverNameJsonExpr = `COALESCE(${driverNameExtraExpr}, ${driverNameRequestExpr})`;
         const driverNameCoalesce = `COALESCE(${driverNameExpr}, ${driverNameJsonExpr})`;
 
         const routeIdExpr = managerColumns.has("route_id")
@@ -3725,19 +3729,41 @@ const fetchDriverMonitorRows = async (businessId = null) => {
           : managerColumns.has("delivery_id")
           ? "delivery_id::text"
           : `${managerPkCol}::text`;
-        const requestRouteExpr = managerColumns.has("request_data") ? "request_data->>'route_id'" : "NULL";
-        const extraRouteExpr = managerColumns.has("extra_data") ? "extra_data->'route'->>'route_id'" : "NULL";
+        const requestRouteExpr = managerColumns.has("request_data")
+          ? "COALESCE(request_data->>'route_id', request_data->'route'->>'route_id')"
+          : "NULL";
+        const extraRouteExpr = managerColumns.has("extra_data")
+          ? "COALESCE(extra_data->'route'->>'route_id', extra_data->>'route_id')"
+          : "NULL";
         const routeIdCoalesce = `NULLIF(COALESCE(${routeIdExpr}, ${requestRouteExpr}, ${extraRouteExpr}), '')`;
 
         const routeNameExpr = managerColumns.has("route_name") ? "NULLIF(route_name, '')" : "NULL";
-        const routeNameJsonExpr = managerColumns.has("extra_data")
+        const routeNameExtraExpr = managerColumns.has("extra_data")
           ? "NULLIF(COALESCE(extra_data->'route'->>'route_name', extra_data->'route'->>'routeName', extra_data->'route'->>'route_code'), '')"
           : "NULL";
-        const routeFromExpr = managerColumns.has("extra_data")
-          ? "COALESCE(extra_data->'route'->>'from', extra_data->'route'->>'from_location', '')"
+        const routeNameRequestExpr = managerColumns.has("request_data")
+          ? "NULLIF(COALESCE(request_data->'route'->>'route_name', request_data->'route'->>'routeName', request_data->'route'->>'route_code', request_data->>'route_name'), '')"
+          : "NULL";
+        const routeNameJsonExpr = `COALESCE(${routeNameExtraExpr}, ${routeNameRequestExpr})`;
+        const routeFromExpr = managerColumns.has("extra_data") || managerColumns.has("request_data")
+          ? `COALESCE(
+               ${managerColumns.has("extra_data") ? "extra_data->'route'->>'from'" : "NULL"},
+               ${managerColumns.has("extra_data") ? "extra_data->'route'->>'from_location'" : "NULL"},
+               ${managerColumns.has("request_data") ? "request_data->'route'->>'from'" : "NULL"},
+               ${managerColumns.has("request_data") ? "request_data->'route'->>'from_location'" : "NULL"},
+               ${managerColumns.has("request_data") ? "request_data->>'from_location'" : "NULL"},
+               ''
+             )`
           : "''";
-        const routeToExpr = managerColumns.has("extra_data")
-          ? "COALESCE(extra_data->'route'->>'to', extra_data->'route'->>'to_location', '')"
+        const routeToExpr = managerColumns.has("extra_data") || managerColumns.has("request_data")
+          ? `COALESCE(
+               ${managerColumns.has("extra_data") ? "extra_data->'route'->>'to'" : "NULL"},
+               ${managerColumns.has("extra_data") ? "extra_data->'route'->>'to_location'" : "NULL"},
+               ${managerColumns.has("request_data") ? "request_data->'route'->>'to'" : "NULL"},
+               ${managerColumns.has("request_data") ? "request_data->'route'->>'to_location'" : "NULL"},
+               ${managerColumns.has("request_data") ? "request_data->>'to_location'" : "NULL"},
+               ''
+             )`
           : "''";
         const routeNameFallback = `${routeFromExpr} || CASE WHEN ${routeToExpr} <> '' THEN ' → ' || ${routeToExpr} ELSE '' END`;
         const routeNameCoalesce = `NULLIF(COALESCE(${routeNameExpr}, ${routeNameJsonExpr}, ${routeNameFallback}), '')`;
