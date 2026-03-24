@@ -5294,6 +5294,96 @@ app.get("/api/logistics/route/:routeId", async (req, res) => {
 
     const route = await buildLogisticsRoutePayload(row, { routeIdFromParams: routeId, hasRouteStops });
 
+    // Prefer live delivery assignment data when available (avoids stale driver/status on route_approvals).
+    try {
+      const deliveriesTableCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
+      const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
+      if (hasDeliveries) {
+        const deliveriesColumns = await getTableColumns("deliveries");
+        const hasRouteIdCol = deliveriesColumns.has("route_id");
+        const routeNameCol = deliveriesColumns.has("route_name") ? "route_name" : null;
+        const driverNameCol = deliveriesColumns.has("driver_name")
+          ? "driver_name"
+          : deliveriesColumns.has("assigned_driver")
+          ? "assigned_driver"
+          : null;
+        const driverIdCol = deliveriesColumns.has("driver_user_id")
+          ? "driver_user_id"
+          : deliveriesColumns.has("driver_id")
+          ? "driver_id"
+          : null;
+        const statusCol = deliveriesColumns.has("status") ? "status" : null;
+        const vehicleCol = deliveriesColumns.has("vehicle_type") ? "vehicle_type" : null;
+        const orderExpr = getDescOrderExpr(
+          deliveriesColumns,
+          "d",
+          ["updated_at", "departure_time", "created_at", "delivery_id", "id"],
+          "1 DESC"
+        );
+
+        const idKeys = [];
+        if (routeId) idKeys.push(String(routeId));
+        if (numericRouteId && String(numericRouteId) !== String(routeId)) idKeys.push(String(numericRouteId));
+        if (route?.route_id) idKeys.push(String(route.route_id));
+        if (route?.routeId) idKeys.push(String(route.routeId));
+        const nameKeys = [];
+        if (route?.route_name) nameKeys.push(String(route.route_name));
+        if (route?.routeName) nameKeys.push(String(route.routeName));
+        if (row?.route_name) nameKeys.push(String(row.route_name));
+
+        const whereClauses = [];
+        const params = [];
+        if (hasRouteIdCol && idKeys.length > 0) {
+          params.push(idKeys);
+          whereClauses.push(`d.route_id::text = ANY($${params.length}::text[])`);
+        }
+        if (routeNameCol && nameKeys.length > 0) {
+          params.push(nameKeys);
+          whereClauses.push(`d.${routeNameCol}::text = ANY($${params.length}::text[])`);
+        }
+
+        if (whereClauses.length > 0) {
+          const deliveryResult = await pool.query(
+            `SELECT d.*
+             FROM deliveries d
+             WHERE ${whereClauses.join(" OR ")}
+             ORDER BY ${orderExpr}
+             LIMIT 1`,
+            params
+          );
+          const deliveryRow = deliveryResult.rows[0] || null;
+          if (deliveryRow) {
+            const deliveryDriver = driverNameCol ? deliveryRow[driverNameCol] : null;
+            const deliveryDriverId = driverIdCol ? deliveryRow[driverIdCol] : null;
+            const deliveryStatus = statusCol ? deliveryRow[statusCol] : null;
+            const deliveryVehicle = vehicleCol ? deliveryRow[vehicleCol] : null;
+            const deliveryRouteName = routeNameCol ? deliveryRow[routeNameCol] : null;
+
+            if (deliveryDriver) {
+              route.driver_name = deliveryDriver;
+              route.driver = deliveryDriver;
+            }
+            if (deliveryDriverId) {
+              route.driver_user_id = deliveryDriverId;
+            }
+            if (deliveryStatus) {
+              route.status = deliveryStatus;
+            }
+            if (deliveryVehicle) {
+              route.vehicle_type = deliveryVehicle;
+              route.vehicle = deliveryVehicle;
+            }
+            if (deliveryRouteName) {
+              route.route_name = deliveryRouteName;
+              route.routeName = deliveryRouteName;
+            }
+          }
+        }
+      }
+    } catch (deliveryOverlayErr) {
+      console.warn("Route details delivery overlay failed:", deliveryOverlayErr.message);
+    }
+
     // Ensure cargo is populated directly from delivery_items for this route_id
     try {
       const ridInt = (() => {
