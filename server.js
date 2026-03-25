@@ -9569,6 +9569,14 @@ app.post("/api/driver/start-delivery", authenticate, async (req, res) => {
 app.post("/api/driver/complete-delivery", authenticate, async (req, res) => {
   const { deliveryId, actualFuel, actualDistance, actualCO2, notes } = req.body;
   try {
+    const parsedFuel = Number(actualFuel);
+    const parsedDistance = Number(actualDistance);
+    const parsedCarbon = Number(actualCO2);
+    const safeFuel = Number.isFinite(parsedFuel) && parsedFuel > 0 ? parsedFuel : null;
+    const safeDistance = Number.isFinite(parsedDistance) && parsedDistance > 0 ? parsedDistance : null;
+    const computedCarbon = Number.isFinite(parsedCarbon) && parsedCarbon >= 0
+      ? parsedCarbon
+      : (safeFuel != null ? Number((safeFuel * 2.31).toFixed(2)) : null);
     const driverAliases = await resolveDriverFilterAliases({ queryDriverName: null, user: req.user });
     if (!driverAliases.length) {
       return res.status(400).json({ success: false, message: "Driver context missing" });
@@ -9580,13 +9588,110 @@ app.post("/api/driver/complete-delivery", authenticate, async (req, res) => {
            carbon_verification_status = 'pending'
        WHERE delivery_id = $5
          AND LOWER(COALESCE(driver_name, '')) = ANY($6)
-       RETURNING delivery_id`,
-      [actualFuel, actualDistance, actualCO2, notes, deliveryId, driverAliases]
+       RETURNING delivery_id, route_id, business_id, driver_name, vehicle_type,
+                 departure_time, arrival_time, completed_at,
+                 estimated_fuel_consumption_liters, estimated_carbon_kg,
+                 fuel_consumption, distance_km, carbon_emissions`,
+      [safeFuel, safeDistance, computedCarbon, notes, deliveryId, driverAliases]
     );
     if (!updated.rows.length) {
       return res.status(403).json({ success: false, message: "Delivery not assigned to this driver" });
     }
-    res.json({ success: true, message: "Completed" });
+    const completedDelivery = updated.rows[0];
+
+    if (completedDelivery.route_id && await tableExists("delivery_logs")) {
+      try {
+        await pool.query(
+          `INSERT INTO delivery_logs
+            (route_id, business_id, driver_user_id, actual_distance_km, actual_duration_minutes,
+             actual_fuel_used_liters, actual_carbon_kg, delivery_date, driver_name, notes)
+           VALUES ($1, $2, $3, $4, NULL, $5, $6, CURRENT_DATE, $7, $8)`,
+          [
+            completedDelivery.route_id,
+            completedDelivery.business_id || req.user?.businessId || null,
+            req.user?.userId || null,
+            safeDistance,
+            safeFuel,
+            computedCarbon,
+            completedDelivery.driver_name || null,
+            notes || null
+          ]
+        );
+      } catch (logErr) {
+        console.warn("driver complete-delivery log insert failed:", logErr.message);
+      }
+    }
+
+    if (completedDelivery.route_id && await tableExists("carbon_footprint_records")) {
+      try {
+        const existingCarbon = await pool.query(
+          `SELECT record_id
+           FROM carbon_footprint_records
+           WHERE route_id = $1 AND business_id = $2
+           ORDER BY created_at DESC NULLS LAST, record_id DESC
+           LIMIT 1`,
+          [completedDelivery.route_id, completedDelivery.business_id || req.user?.businessId || null]
+        );
+
+        const factorsUsed = JSON.stringify({
+          source: "driver_complete_delivery",
+          delivery_id: completedDelivery.delivery_id,
+          route_id: completedDelivery.route_id,
+          actual_fuel_liters: safeFuel,
+          actual_distance_km: safeDistance,
+          actual_carbon_kg: computedCarbon,
+          driver_user_id: req.user?.userId || null
+        });
+
+        if (existingCarbon.rows.length > 0) {
+          await pool.query(
+            `UPDATE carbon_footprint_records
+             SET calculation_date = CURRENT_DATE,
+                 transportation_carbon_kg = COALESCE($1, transportation_carbon_kg),
+                 total_carbon_kg = COALESCE($1, total_carbon_kg),
+                 calculation_method = COALESCE($2, calculation_method),
+                 factors_used = COALESCE($3::jsonb, factors_used),
+                 verification_status = 'pending',
+                 verified_by = NULL,
+                 verified_at = NULL,
+                 is_actual = TRUE,
+                 revision_notes = NULL
+             WHERE record_id = $4`,
+            [computedCarbon, "driver_reported_actual", factorsUsed, existingCarbon.rows[0].record_id]
+          );
+        } else {
+          await pool.query(
+            `INSERT INTO carbon_footprint_records
+              (business_id, calculation_date, transportation_carbon_kg, total_carbon_kg,
+               calculation_method, factors_used, verification_status, verified_by,
+               verified_at, is_actual, route_id, revision_notes)
+             VALUES ($1, CURRENT_DATE, COALESCE($2, 0), COALESCE($2, 0),
+                     $3, $4::jsonb, 'pending', NULL, NULL, TRUE, $5, NULL)`,
+            [
+              completedDelivery.business_id || req.user?.businessId || null,
+              computedCarbon,
+              "driver_reported_actual",
+              factorsUsed,
+              completedDelivery.route_id
+            ]
+          );
+        }
+      } catch (carbonErr) {
+        console.warn("driver complete-delivery carbon sync failed:", carbonErr.message);
+      }
+    }
+
+    res.json({
+      success: true,
+      message: "Completed",
+      data: {
+        deliveryId: completedDelivery.delivery_id,
+        routeId: completedDelivery.route_id,
+        actualFuel: safeFuel,
+        actualDistance: safeDistance,
+        actualCO2: computedCarbon
+      }
+    });
   } catch (err) { res.status(500).json({ success: false }); }
 });
 
