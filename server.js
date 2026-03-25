@@ -3871,28 +3871,46 @@ const fetchDriverMonitorRows = async (businessId = null) => {
       }
     }
 
-    // Base driver list mapped with busy overlay
-    if (driverMonitorRows.length === 0) {
-      driverMonitorRows = usersResult.rows.map((u) => {
+    // Always include idle drivers (no active/busy assignment) so the monitor shows "IDLE" people.
+    const seenDriverKeys = new Set(
+      driverMonitorRows.flatMap((row) => {
+        const keys = [];
+        if (row.full_name) keys.push(String(row.full_name).trim().toLowerCase());
+        if (row.user_id) keys.push(`id:${row.user_id}`);
+        if (row.driver_user_id) keys.push(`id:${row.driver_user_id}`);
+        return keys;
+      })
+    );
+
+    const idleDrivers = usersResult.rows
+      .map((u) => {
         const fallbackName =
           String(u.full_name || "").trim() ||
           String(u.username || "").trim() ||
           String(u.email || "").split("@")[0] ||
           "Driver";
-        const busy = getBusyForDriver(fallbackName, u.user_id);
+        const keyName = fallbackName.trim().toLowerCase();
+        const keyId = u.user_id ? `id:${u.user_id}` : null;
+        const alreadySeen =
+          (keyName && seenDriverKeys.has(keyName)) ||
+          (keyId && seenDriverKeys.has(keyId));
+        if (alreadySeen) return null;
         return {
           user_id: u.user_id,
+          driver_user_id: u.user_id,
           full_name: fallbackName,
           email: u.email,
-          route_name: busy?.route_name || null,
-          route_status: busy?.route_status || null,
-          route_id: busy?.route_id || null,
-          vehicle_type: busy?.vehicle_type || null,
+          route_name: null,
+          route_status: null,
+          route_id: null,
+          vehicle_type: null,
           stops_completed: 0,
-          stops_total: 2
+          stops_total: 0
         };
-      });
-    }
+      })
+      .filter(Boolean);
+
+    driverMonitorRows = driverMonitorRows.concat(idleDrivers);
 
     return driverMonitorRows;
   } catch (err) {
