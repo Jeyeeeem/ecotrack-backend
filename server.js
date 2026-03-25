@@ -8719,13 +8719,16 @@ app.get("/api/driver/dashboard", authenticate, async (req, res) => {
   try {
     const { driver_name } = req.query;
     const driverAliases = await resolveDriverFilterAliases({ queryDriverName: driver_name, user: req.user });
+    const driverAliasesLower = driverAliases
+      .map((a) => (a ? String(a).toLowerCase().trim() : ""))
+      .filter((a) => a.length > 0);
     const driverId = Number(req.user?.userId || req.user?.id || 0) || null;
-    const hasDriverFilter = driverAliases.length > 0;
+    const hasDriverFilter = driverAliasesLower.length > 0;
     // Allow fallbacks to show something even if name/id missing, to avoid empty dashboards.
     const args = [];
     const filters = [];
     if (hasDriverFilter) {
-      args.push(driverAliases);
+      args.push(driverAliasesLower);
       filters.push(`LOWER(COALESCE(d.driver_name, '')) = ANY($${args.length})`);
     }
     const deliveriesColumns = await getTableColumns("deliveries");
@@ -8852,8 +8855,8 @@ app.get("/api/driver/dashboard", authenticate, async (req, res) => {
           const raCols = await getTableColumns("route_approvals");
           const raArgs = [];
           const raWhere = [`LOWER(COALESCE(status,'')) = 'approved'`];
-          if (driverAliases.length) {
-            raArgs.push(driverAliases);
+          if (driverAliasesLower.length) {
+            raArgs.push(driverAliasesLower);
             raWhere.push(`LOWER(COALESCE(driver_name,'')) = ANY($${raArgs.length})`);
           }
           if (driverId && (raCols.has("driver_user_id") || raCols.has("driver_id"))) {
