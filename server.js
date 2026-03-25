@@ -5952,7 +5952,13 @@ app.patch("/api/logistics/:id/approve", async (req, res) => {
       let resolvedDriverName = requestedDriverName || null;
       if (!resolvedDriverName && driver_id) {
         const driverResult = await pool.query(
-          `SELECT COALESCE(NULLIF(full_name, ''), NULLIF(name, ''), email) AS name
+          `SELECT COALESCE(
+              NULLIF(full_name, ''),
+              NULLIF(name, ''),
+              NULLIF(username, ''),
+              NULLIF(email, ''),
+              NULLIF(split_part(email, '@', 1), '')
+            ) AS name
            FROM users WHERE user_id = $1 AND role = 'driver'`,
           [driver_id]
         );
@@ -5995,8 +6001,8 @@ app.patch("/api/logistics/:id/approve", async (req, res) => {
           if (routeResult.rows.length > 0) {
             const route = routeResult.rows[0];
             const existingDelivery = await pool.query(
-              `SELECT delivery_id FROM deliveries WHERE route_id = $1 AND driver_name = $2`,
-              [resolvedRouteRef, resolvedDriverName]
+              `SELECT delivery_id FROM deliveries WHERE route_id = $1 LIMIT 1`,
+              [resolvedRouteRef]
             );
             try {
               if (existingDelivery.rows.length === 0) {
