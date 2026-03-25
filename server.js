@@ -3397,7 +3397,7 @@ const fetchDriverMonitorRows = async (businessId = null) => {
       ? "NULLIF(u.email, '')"
       : "NULL";
     const userJoinIdExpr = getCoalesceColumns(usersColumns, "u", ["user_id", "id"], "NULL::int");
-    const usersResult = await pool.query(
+    let usersResult = await pool.query(
       `SELECT
         ${idExpr} AS user_id,
         ${nameExpr} AS full_name,
@@ -3408,6 +3408,20 @@ const fetchDriverMonitorRows = async (businessId = null) => {
        ORDER BY COALESCE(${nameExpr}, ${usernameExpr}, ${emailExpr}) ASC`,
       usersParams
     );
+
+    // If no drivers found under the scoped business filter, relax to all drivers (cross-tenant) so idle drivers still show.
+    if (usersResult.rows.length === 0 && businessId && hasBusinessColumn) {
+      usersResult = await pool.query(
+        `SELECT
+          ${idExpr} AS user_id,
+          ${nameExpr} AS full_name,
+          ${emailExpr} AS email,
+          ${usernameExpr} AS username
+         FROM users u
+         WHERE u.role = 'driver'
+         ORDER BY COALESCE(${nameExpr}, ${usernameExpr}, ${emailExpr}) ASC`
+      );
+    }
 
     const busyByDriver = new Map();
     const knownDriverNames = new Set();
