@@ -3630,7 +3630,7 @@ const fetchDriverMonitorRows = async (businessId = null) => {
                   return `AND (business_id = $${params.length} OR business_id IS NULL)`;
                 })()
               : "";
-          const activeStatuses = ['assigned', 'accepted', 'in_progress', 'pending', 'planned', 'assigned_to_driver', 'approved'];
+          const activeStatuses = ['assigned', 'accepted', 'in_progress', 'pending', 'planned', 'assigned_to_driver'];
           params.push(activeStatuses);
           const activeClause = `${statusCol} = ANY($${params.length}::text[])`;
           const drRows = await pool.query(
@@ -3695,12 +3695,11 @@ const fetchDriverMonitorRows = async (businessId = null) => {
         const routeStatusExpr = routeStatusAvailable ? "UPPER(status)" : "'PENDING'";
         const routeStatusPredicate = routeStatusAvailable
           ? `(
-              LOWER(COALESCE(status, '')) IN ('pending', 'awaiting_approval', 'submitted', 'in_review', 'for_approval', 'assigned', 'accepted', 'in_progress', 'approved')
+              LOWER(COALESCE(status, '')) IN ('pending', 'awaiting_approval', 'submitted', 'in_review', 'for_approval', 'assigned', 'accepted', 'in_progress')
               OR LOWER(COALESCE(status, '')) LIKE '%pending%'
               OR LOWER(COALESCE(status, '')) LIKE '%await%'
               OR LOWER(COALESCE(status, '')) LIKE '%review%'
               OR LOWER(COALESCE(status, '')) LIKE '%submit%'
-              OR LOWER(COALESCE(status, '')) LIKE '%approv%'
             )`
           : "TRUE";
         const driverNameExpr = routeColumns.has("driver_name") ? "COALESCE(driver_name, '')" : "''";
