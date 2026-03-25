@@ -3630,7 +3630,7 @@ const fetchDriverMonitorRows = async (businessId = null) => {
                   return `AND (business_id = $${params.length} OR business_id IS NULL)`;
                 })()
               : "";
-          const activeStatuses = ['assigned', 'accepted', 'in_progress', 'pending', 'planned', 'assigned_to_driver'];
+          const activeStatuses = ['assigned', 'accepted', 'in_progress', 'pending', 'planned', 'assigned_to_driver', 'approved'];
           params.push(activeStatuses);
           const activeClause = `${statusCol} = ANY($${params.length}::text[])`;
           const drRows = await pool.query(
@@ -3695,11 +3695,12 @@ const fetchDriverMonitorRows = async (businessId = null) => {
         const routeStatusExpr = routeStatusAvailable ? "UPPER(status)" : "'PENDING'";
         const routeStatusPredicate = routeStatusAvailable
           ? `(
-              LOWER(COALESCE(status, '')) IN ('pending', 'awaiting_approval', 'submitted', 'in_review', 'for_approval', 'assigned', 'accepted', 'in_progress')
+              LOWER(COALESCE(status, '')) IN ('pending', 'awaiting_approval', 'submitted', 'in_review', 'for_approval', 'assigned', 'accepted', 'in_progress', 'approved')
               OR LOWER(COALESCE(status, '')) LIKE '%pending%'
               OR LOWER(COALESCE(status, '')) LIKE '%await%'
               OR LOWER(COALESCE(status, '')) LIKE '%review%'
               OR LOWER(COALESCE(status, '')) LIKE '%submit%'
+              OR LOWER(COALESCE(status, '')) LIKE '%approv%'
             )`
           : "TRUE";
         const driverNameExpr = routeColumns.has("driver_name") ? "COALESCE(driver_name, '')" : "''";
@@ -5988,6 +5989,8 @@ app.patch("/api/logistics/:id/approve", async (req, res) => {
       if (driver_id && resolvedDriverName) {
         const deliveriesCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
         if (deliveriesCheck.rows[0]?.tbl) {
+          const deliveriesColumns = await getTableColumns("deliveries");
+          const hasDriverIdCol = deliveriesColumns.has("driver_user_id");
           const routeResult = await pool.query(`SELECT * FROM route_approvals WHERE id = $1`, [resolvedRouteRef]);
           if (routeResult.rows.length > 0) {
             const route = routeResult.rows[0];
@@ -6024,24 +6027,80 @@ app.patch("/api/logistics/:id/approve", async (req, res) => {
                   console.warn("delivery insert route_stops fetch failed:", routeStopsErr.message);
                 }
 
-                await pool.query(
-                  `INSERT INTO deliveries 
-                    (route_id, status, driver_name, vehicle_type, departure_time, from_location, to_location,
-                     distance_km, estimated_fuel_consumption_liters, estimated_carbon_kg, stops_json, driver_user_id)
-                   VALUES ($1, 'assigned', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-                  [resolvedRouteRef, resolvedDriverName, route.vehicle_type, route.departure_time, route.from_location, 
-                   route.to_location, route.optimized_distance || route.original_distance,
-                   route.optimized_fuel || route.original_fuel, route.optimized_co2 || route.original_co2,
-                   stopsJson, driver_id]
-                );
+                const insertColumns = [
+                  "route_id",
+                  "status",
+                  "driver_name",
+                  "vehicle_type",
+                  "departure_time",
+                  "from_location",
+                  "to_location",
+                  "distance_km",
+                  "estimated_fuel_consumption_liters",
+                  "estimated_carbon_kg",
+                  "stops_json"
+                ].filter((col) => deliveriesColumns.has(col));
+                const insertValues = [
+                  resolvedRouteRef,
+                  "assigned",
+                  resolvedDriverName,
+                  route.vehicle_type,
+                  route.departure_time,
+                  route.from_location,
+                  route.to_location,
+                  route.optimized_distance || route.original_distance,
+                  route.optimized_fuel || route.original_fuel,
+                  route.optimized_co2 || route.original_co2,
+                  stopsJson
+                ].filter((_, idx) => deliveriesColumns.has([
+                  "route_id",
+                  "status",
+                  "driver_name",
+                  "vehicle_type",
+                  "departure_time",
+                  "from_location",
+                  "to_location",
+                  "distance_km",
+                  "estimated_fuel_consumption_liters",
+                  "estimated_carbon_kg",
+                  "stops_json"
+                ][idx]));
+
+                if (hasDriverIdCol) {
+                  insertColumns.push("driver_user_id");
+                  insertValues.push(driver_id);
+                }
+
+                if (insertColumns.length > 0) {
+                  const placeholders = insertColumns.map((_, idx) => `$${idx + 1}`).join(", ");
+                  await pool.query(
+                    `INSERT INTO deliveries (${insertColumns.join(", ")})
+                     VALUES (${placeholders})`,
+                    insertValues
+                  );
+                }
               } else {
                 // Update driver assignment on existing delivery
-                await pool.query(
-                  `UPDATE deliveries 
-                   SET driver_name = $1, driver_user_id = COALESCE($2, driver_user_id), status = COALESCE(status, 'assigned')
-                   WHERE route_id = $3`,
-                  [resolvedDriverName, driver_id, resolvedRouteRef]
+                const updateColumns = ["driver_name", "status"].filter((col) => deliveriesColumns.has(col));
+                const updateValues = [resolvedDriverName, "assigned"].filter((_, idx) =>
+                  deliveriesColumns.has(["driver_name", "status"][idx])
                 );
+                if (hasDriverIdCol) {
+                  updateColumns.push("driver_user_id");
+                  updateValues.push(driver_id);
+                }
+                if (deliveriesColumns.has("updated_at")) {
+                  updateColumns.push("updated_at");
+                  updateValues.push(new Date().toISOString());
+                }
+                if (updateColumns.length > 0) {
+                  const setClause = updateColumns.map((col, idx) => `${col} = $${idx + 1}`).join(", ");
+                  updateValues.push(resolvedRouteRef);
+                  await pool.query(
+                    `UPDATE deliveries SET ${setClause} WHERE route_id = $${updateValues.length}`,
+                    updateValues
+                  );
+                }
               }
             } catch (deliveryErr) {
               console.warn("delivery create/update failed for route", resolvedRouteRef, deliveryErr.message);
