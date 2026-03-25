@@ -5995,44 +5995,56 @@ app.patch("/api/logistics/:id/approve", async (req, res) => {
               `SELECT delivery_id FROM deliveries WHERE route_id = $1 AND driver_name = $2`,
               [resolvedRouteRef, resolvedDriverName]
             );
-            if (existingDelivery.rows.length === 0) {
-              let stopsJson = null;
-              try {
-                const rsCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
-                if (rsCheck.rows[0]?.tbl) {
-                  const rs = await pool.query(
-                    `SELECT stop_sequence, location_name, address, latitude, longitude
-                     FROM route_stops
-                     WHERE route_id = $1
-                     ORDER BY stop_sequence ASC`,
-                    [resolvedRouteRef]
-                  );
-                  if (rs.rows.length) {
-                    stopsJson = rs.rows.map((s, idx) => ({
-                      stopId: s.stop_sequence ?? idx + 1,
-                      sequence: s.stop_sequence ?? idx + 1,
-                      stopName: s.location_name || s.address || `Stop ${idx + 1}`,
-                      address: s.address || s.location_name || "",
-                      latitude: toFiniteNumber(s.latitude),
-                      longitude: toFiniteNumber(s.longitude),
-                      status: "pending"
-                    }));
+            try {
+              if (existingDelivery.rows.length === 0) {
+                let stopsJson = null;
+                try {
+                  const rsCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
+                  if (rsCheck.rows[0]?.tbl) {
+                    const rs = await pool.query(
+                      `SELECT stop_sequence, location_name, address, latitude, longitude
+                       FROM route_stops
+                       WHERE route_id = $1
+                       ORDER BY stop_sequence ASC`,
+                      [resolvedRouteRef]
+                    );
+                    if (rs.rows.length) {
+                      stopsJson = rs.rows.map((s, idx) => ({
+                        stopId: s.stop_sequence ?? idx + 1,
+                        sequence: s.stop_sequence ?? idx + 1,
+                        stopName: s.location_name || s.address || `Stop ${idx + 1}`,
+                        address: s.address || s.location_name || "",
+                        latitude: toFiniteNumber(s.latitude),
+                        longitude: toFiniteNumber(s.longitude),
+                        status: "pending"
+                      }));
+                    }
                   }
+                } catch (routeStopsErr) {
+                  console.warn("delivery insert route_stops fetch failed:", routeStopsErr.message);
                 }
-              } catch (routeStopsErr) {
-                console.warn("delivery insert route_stops fetch failed:", routeStopsErr.message);
-              }
 
-              await pool.query(
-                `INSERT INTO deliveries 
-                  (route_id, status, driver_name, vehicle_type, departure_time, from_location, to_location,
-                   distance_km, estimated_fuel_consumption_liters, estimated_carbon_kg, stops_json)
-                 VALUES ($1, 'assigned', $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-                [resolvedRouteRef, resolvedDriverName, route.vehicle_type, route.departure_time, route.from_location, 
-                 route.to_location, route.optimized_distance || route.original_distance,
-                 route.optimized_fuel || route.original_fuel, route.optimized_co2 || route.original_co2,
-                 stopsJson]
-              );
+                await pool.query(
+                  `INSERT INTO deliveries 
+                    (route_id, status, driver_name, vehicle_type, departure_time, from_location, to_location,
+                     distance_km, estimated_fuel_consumption_liters, estimated_carbon_kg, stops_json, driver_user_id)
+                   VALUES ($1, 'assigned', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+                  [resolvedRouteRef, resolvedDriverName, route.vehicle_type, route.departure_time, route.from_location, 
+                   route.to_location, route.optimized_distance || route.original_distance,
+                   route.optimized_fuel || route.original_fuel, route.optimized_co2 || route.original_co2,
+                   stopsJson, driver_id]
+                );
+              } else {
+                // Update driver assignment on existing delivery
+                await pool.query(
+                  `UPDATE deliveries 
+                   SET driver_name = $1, driver_user_id = COALESCE($2, driver_user_id), status = COALESCE(status, 'assigned')
+                   WHERE route_id = $3`,
+                  [resolvedDriverName, driver_id, resolvedRouteRef]
+                );
+              }
+            } catch (deliveryErr) {
+              console.warn("delivery create/update failed for route", resolvedRouteRef, deliveryErr.message);
             }
           }
         } else {
@@ -6087,46 +6099,57 @@ app.patch("/api/logistics/:id/approve", async (req, res) => {
           [id, driverName]
         );
         
-        if (existingDelivery.rows.length === 0) {
-          // Copy route stops (with coordinates) into the delivery so geofence/arrival logic has real points.
-          let stopsJson = null;
-          try {
-            const rsCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
-            if (rsCheck.rows[0]?.tbl) {
-              const rs = await pool.query(
-                `SELECT stop_sequence, location_name, address, latitude, longitude
-                 FROM route_stops
-                 WHERE route_id = $1
-                 ORDER BY stop_sequence ASC`,
-                [id]
-              );
-              if (rs.rows.length) {
-                stopsJson = rs.rows.map((s, idx) => ({
-                  stopId: s.stop_sequence ?? idx + 1,
-                  sequence: s.stop_sequence ?? idx + 1,
-                  stopName: s.location_name || s.address || `Stop ${idx + 1}`,
-                  address: s.address || s.location_name || "",
-                  latitude: toFiniteNumber(s.latitude),
-                  longitude: toFiniteNumber(s.longitude),
-                  status: "pending"
-                }));
+        try {
+          if (existingDelivery.rows.length === 0) {
+            // Copy route stops (with coordinates) into the delivery so geofence/arrival logic has real points.
+            let stopsJson = null;
+            try {
+              const rsCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
+              if (rsCheck.rows[0]?.tbl) {
+                const rs = await pool.query(
+                  `SELECT stop_sequence, location_name, address, latitude, longitude
+                   FROM route_stops
+                   WHERE route_id = $1
+                   ORDER BY stop_sequence ASC`,
+                  [id]
+                );
+                if (rs.rows.length) {
+                  stopsJson = rs.rows.map((s, idx) => ({
+                    stopId: s.stop_sequence ?? idx + 1,
+                    sequence: s.stop_sequence ?? idx + 1,
+                    stopName: s.location_name || s.address || `Stop ${idx + 1}`,
+                    address: s.address || s.location_name || "",
+                    latitude: toFiniteNumber(s.latitude),
+                    longitude: toFiniteNumber(s.longitude),
+                    status: "pending"
+                  }));
+                }
               }
+            } catch (routeStopsErr) {
+              console.warn("delivery insert route_stops fetch failed:", routeStopsErr.message);
             }
-          } catch (routeStopsErr) {
-            console.warn("delivery insert route_stops fetch failed:", routeStopsErr.message);
-          }
 
-          // Create a new delivery record
-          await pool.query(
-            `INSERT INTO deliveries 
-              (route_id, status, driver_name, vehicle_type, departure_time, from_location, to_location,
-               distance_km, estimated_fuel_consumption_liters, estimated_carbon_kg, stops_json)
-             VALUES ($1, 'assigned', $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-            [id, driverName, route.vehicle_type, route.departure_time, route.from_location, 
-             route.to_location, route.optimized_distance || route.original_distance,
-             route.optimized_fuel || route.original_fuel, route.optimized_co2 || route.original_co2,
-             stopsJson]
-          );
+            // Create a new delivery record
+            await pool.query(
+              `INSERT INTO deliveries 
+                (route_id, status, driver_name, vehicle_type, departure_time, from_location, to_location,
+                 distance_km, estimated_fuel_consumption_liters, estimated_carbon_kg, stops_json, driver_user_id)
+               VALUES ($1, 'assigned', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+              [id, driverName, route.vehicle_type, route.departure_time, route.from_location, 
+               route.to_location, route.optimized_distance || route.original_distance,
+               route.optimized_fuel || route.original_fuel, route.optimized_co2 || route.original_co2,
+               stopsJson, driver_id]
+            );
+          } else {
+            await pool.query(
+              `UPDATE deliveries 
+               SET driver_name = $1, driver_user_id = COALESCE($2, driver_user_id), status = COALESCE(status, 'assigned')
+               WHERE route_id = $3`,
+              [driverName, driver_id, id]
+            );
+          }
+        } catch (deliveryErr) {
+          console.warn("delivery create/update failed (legacy branch) for route", id, deliveryErr.message);
         }
       }
     }
