@@ -3377,8 +3377,7 @@ const fetchDriverMonitorRows = async (businessId = null) => {
     const usersWhere = ["u.role = 'driver'"];
     if (businessId && hasBusinessColumn) {
       usersParams.push(businessId);
-      // Allow global drivers (NULL business) to appear alongside tenant-scoped drivers
-      usersWhere.push(`(u.business_id = $${usersParams.length} OR u.business_id IS NULL)`);
+      usersWhere.push(`u.business_id = $${usersParams.length}`);
     }
     const idExpr = usersColumns.has("user_id")
       ? "u.user_id"
@@ -3397,7 +3396,7 @@ const fetchDriverMonitorRows = async (businessId = null) => {
       ? "NULLIF(u.email, '')"
       : "NULL";
     const userJoinIdExpr = getCoalesceColumns(usersColumns, "u", ["user_id", "id"], "NULL::int");
-    let usersResult = await pool.query(
+    const usersResult = await pool.query(
       `SELECT
         ${idExpr} AS user_id,
         ${nameExpr} AS full_name,
@@ -3409,56 +3408,10 @@ const fetchDriverMonitorRows = async (businessId = null) => {
       usersParams
     );
 
-    // If no drivers found under the scoped business filter, relax to all drivers (cross-tenant) so idle drivers still show.
-    if (usersResult.rows.length === 0 && businessId && hasBusinessColumn) {
-      usersResult = await pool.query(
-        `SELECT
-          ${idExpr} AS user_id,
-          ${nameExpr} AS full_name,
-          ${emailExpr} AS email,
-          ${usernameExpr} AS username
-         FROM users u
-         WHERE u.role = 'driver'
-         ORDER BY COALESCE(${nameExpr}, ${usernameExpr}, ${emailExpr}) ASC`
-      );
-    }
-
     const busyByDriver = new Map();
-    const knownDriverNames = new Set();
-    const knownDriverIds = new Set();
-
-    usersResult.rows.forEach((u) => {
-      const fallbackName =
-        String(u.full_name || "").trim() ||
-        String(u.username || "").trim() ||
-        String(u.email || "").split("@")[0] ||
-        "";
-      if (fallbackName) knownDriverNames.add(fallbackName.toLowerCase());
-      if (u.user_id && Number.isFinite(Number(u.user_id))) {
-        knownDriverIds.add(`id:${Number(u.user_id)}`);
-      }
-    });
-
-    const isPlaceholderDriverName = (name) => {
-      const normalized = String(name || "").trim().toLowerCase();
-      if (!normalized) return true;
-      if (normalized === "driver not assigned") return true;
-      if (normalized === "not assigned") return true;
-      if (normalized === "unassigned") return true;
-      if (normalized === "n/a") return true;
-      if (normalized === "na") return true;
-      if (normalized.startsWith("driver not assigned")) return true;
-      return false;
-    };
-
     const upsertBusy = (driverName, routeName, routeStatus, routeId = null, vehicleType = null, driverUserId = null) => {
-      if (isPlaceholderDriverName(driverName)) return;
       const keyName = String(driverName || "").trim().toLowerCase();
       const keyId = driverUserId && Number.isFinite(Number(driverUserId)) ? `id:${Number(driverUserId)}` : null;
-      const isKnown =
-        (keyName && knownDriverNames.has(keyName)) ||
-        (keyId && knownDriverIds.has(keyId));
-      if (!isKnown) return;
       const register = (key) => {
         if (!key) return;
         if (busyByDriver.has(key)) return;
@@ -3571,12 +3524,6 @@ const fetchDriverMonitorRows = async (businessId = null) => {
           const joinedUserEmailExpr = userJoinClause
             ? getQualifiedColumn(usersColumns, "u", ["email"], "NULL::text")
             : "NULL::text";
-          const stopsCompletedExpr = deliveriesColumns.has("stops_completed")
-            ? "COALESCE(d.stops_completed, 0)"
-            : "0";
-          const stopsTotalExpr = deliveriesColumns.has("stops_total")
-            ? "COALESCE(d.stops_total, 0)"
-            : "0";
           const liveDriverQuery = `
             SELECT
               COALESCE(${liveNameExpr}, ${joinedUserNameExpr}, 'Driver') AS full_name,
@@ -3587,8 +3534,8 @@ const fetchDriverMonitorRows = async (businessId = null) => {
               ${vehicleExpr} AS vehicle_type,
               ${driverIdExpr} AS driver_user_id,
               ${driverIdExpr} AS user_id,
-              ${stopsCompletedExpr} AS stops_completed,
-              ${stopsTotalExpr} AS stops_total
+              COALESCE(d.stops_completed, 0) AS stops_completed,
+              COALESCE(d.stops_total, 0) AS stops_total
             FROM deliveries d
             ${userJoinClause}
             WHERE ${statusExpr} NOT IN ('completed','cancelled','declined','rejected')
@@ -3630,7 +3577,7 @@ const fetchDriverMonitorRows = async (businessId = null) => {
                   return `AND (business_id = $${params.length} OR business_id IS NULL)`;
                 })()
               : "";
-          const activeStatuses = ['assigned', 'accepted', 'in_progress', 'pending', 'planned', 'assigned_to_driver'];
+          const activeStatuses = ['assigned', 'accepted', 'in_progress', 'pending', 'planned'];
           params.push(activeStatuses);
           const activeClause = `${statusCol} = ANY($${params.length}::text[])`;
           const drRows = await pool.query(
@@ -3732,125 +3679,6 @@ const fetchDriverMonitorRows = async (businessId = null) => {
       console.warn("Driver monitor route_approvals lookup fallback:", driverRouteErr.message);
     }
 
-    // Fallback busy drivers from manager approvals (route optimization workflow)
-    try {
-      const managerTableCheck = await pool.query(`SELECT to_regclass('public.manager_approvals') AS tbl`);
-      const hasManagerApprovals = !!managerTableCheck.rows[0]?.tbl;
-      if (hasManagerApprovals) {
-        const managerColumns = await getManagerApprovalsColumns();
-        const managerPkCol = await getManagerApprovalsPkColumn();
-        const params = [];
-        let whereClause = `approval_type = 'route_optimization'`;
-        if (managerColumns.has("required_role")) {
-          whereClause += ` AND LOWER(COALESCE(required_role, '')) = 'logistics_manager'`;
-        }
-        if (businessId && managerColumns.has("business_id")) {
-          params.push(businessId);
-          whereClause += ` AND COALESCE(business_id, 0) = $${params.length}`;
-        }
-
-        const statusExpr = managerColumns.has("status") ? "LOWER(COALESCE(status,''))" : "''";
-        const statusPredicate = managerColumns.has("status")
-          ? `(
-              ${statusExpr} IN ('pending','awaiting_approval','submitted','in_review','for_approval','assigned','accepted','in_progress')
-              OR ${statusExpr} LIKE '%pending%'
-              OR ${statusExpr} LIKE '%await%'
-              OR ${statusExpr} LIKE '%review%'
-              OR ${statusExpr} LIKE '%submit%'
-            )`
-          : "TRUE";
-
-        const driverIdExpr = managerColumns.has("driver_user_id")
-          ? "driver_user_id"
-          : managerColumns.has("driver_id")
-          ? "driver_id"
-          : "NULL::int";
-        const driverNameExpr = managerColumns.has("driver_name") ? "NULLIF(driver_name, '')" : "NULL";
-        const driverNameExtraExpr = managerColumns.has("extra_data")
-          ? "NULLIF(COALESCE(extra_data->'route'->>'driver_name', extra_data->'route'->>'driver'), '')"
-          : "NULL";
-        const driverNameRequestExpr = managerColumns.has("request_data")
-          ? "NULLIF(COALESCE(request_data->'route'->>'driver_name', request_data->'route'->>'driver', request_data->>'driver_name', request_data->>'driver'), '')"
-          : "NULL";
-        const driverNameJsonExpr = `COALESCE(${driverNameExtraExpr}, ${driverNameRequestExpr})`;
-        const driverNameCoalesce = `COALESCE(${driverNameExpr}, ${driverNameJsonExpr})`;
-
-        const routeIdExpr = managerColumns.has("route_id")
-          ? "route_id::text"
-          : managerColumns.has("related_record_id")
-          ? "related_record_id::text"
-          : managerColumns.has("delivery_id")
-          ? "delivery_id::text"
-          : `${managerPkCol}::text`;
-        const requestRouteExpr = managerColumns.has("request_data")
-          ? "COALESCE(request_data->>'route_id', request_data->'route'->>'route_id')"
-          : "NULL";
-        const extraRouteExpr = managerColumns.has("extra_data")
-          ? "COALESCE(extra_data->'route'->>'route_id', extra_data->>'route_id')"
-          : "NULL";
-        const routeIdCoalesce = `NULLIF(COALESCE(${routeIdExpr}, ${requestRouteExpr}, ${extraRouteExpr}), '')`;
-
-        const routeNameExpr = managerColumns.has("route_name") ? "NULLIF(route_name, '')" : "NULL";
-        const routeNameExtraExpr = managerColumns.has("extra_data")
-          ? "NULLIF(COALESCE(extra_data->'route'->>'route_name', extra_data->'route'->>'routeName', extra_data->'route'->>'route_code'), '')"
-          : "NULL";
-        const routeNameRequestExpr = managerColumns.has("request_data")
-          ? "NULLIF(COALESCE(request_data->'route'->>'route_name', request_data->'route'->>'routeName', request_data->'route'->>'route_code', request_data->>'route_name'), '')"
-          : "NULL";
-        const routeNameJsonExpr = `COALESCE(${routeNameExtraExpr}, ${routeNameRequestExpr})`;
-        const routeFromExpr = managerColumns.has("extra_data") || managerColumns.has("request_data")
-          ? `COALESCE(
-               ${managerColumns.has("extra_data") ? "extra_data->'route'->>'from'" : "NULL"},
-               ${managerColumns.has("extra_data") ? "extra_data->'route'->>'from_location'" : "NULL"},
-               ${managerColumns.has("request_data") ? "request_data->'route'->>'from'" : "NULL"},
-               ${managerColumns.has("request_data") ? "request_data->'route'->>'from_location'" : "NULL"},
-               ${managerColumns.has("request_data") ? "request_data->>'from_location'" : "NULL"},
-               ''
-             )`
-          : "''";
-        const routeToExpr = managerColumns.has("extra_data") || managerColumns.has("request_data")
-          ? `COALESCE(
-               ${managerColumns.has("extra_data") ? "extra_data->'route'->>'to'" : "NULL"},
-               ${managerColumns.has("extra_data") ? "extra_data->'route'->>'to_location'" : "NULL"},
-               ${managerColumns.has("request_data") ? "request_data->'route'->>'to'" : "NULL"},
-               ${managerColumns.has("request_data") ? "request_data->'route'->>'to_location'" : "NULL"},
-               ${managerColumns.has("request_data") ? "request_data->>'to_location'" : "NULL"},
-               ''
-             )`
-          : "''";
-        const routeNameFallback = `${routeFromExpr} || CASE WHEN ${routeToExpr} <> '' THEN ' → ' || ${routeToExpr} ELSE '' END`;
-        const routeNameCoalesce = `NULLIF(COALESCE(${routeNameExpr}, ${routeNameJsonExpr}, ${routeNameFallback}), '')`;
-
-        const routeStatusExpr = managerColumns.has("status") ? "UPPER(status)" : "'PENDING'";
-        const identityPredicate = `(${driverNameCoalesce} IS NOT NULL OR ${driverIdExpr} IS NOT NULL)`;
-        const orderExpr = managerColumns.has("created_at")
-          ? "created_at DESC NULLS LAST"
-          : `${managerPkCol} DESC`;
-
-        const managerBusyRows = await pool.query(
-          `SELECT
-             ${driverNameCoalesce} AS driver_name,
-             ${driverIdExpr} AS driver_user_id,
-             ${routeNameCoalesce} AS route_name,
-             ${routeStatusExpr} AS route_status,
-             ${routeIdCoalesce} AS route_id
-           FROM manager_approvals
-           WHERE ${whereClause}
-             AND ${statusPredicate}
-             AND ${identityPredicate}
-           ORDER BY ${orderExpr}
-           LIMIT 50`,
-          params
-        );
-
-        for (const row of managerBusyRows.rows) {
-          upsertBusy(row.driver_name, row.route_name, row.route_status, row.route_id, null, row.driver_user_id);
-        }
-      }
-    } catch (managerRouteErr) {
-      console.warn("Driver monitor manager_approvals lookup fallback:", managerRouteErr.message);
-    }
-
     // Merge busy overlay into existing live-driver rows and add missing busy drivers
     if (driverMonitorRows.length > 0 && busyByDriver.size > 0) {
       const seenKeys = new Set();
@@ -3868,8 +3696,6 @@ const fetchDriverMonitorRows = async (businessId = null) => {
       // add busy drivers not present in live list (e.g., pending assignments)
       for (const [key, busy] of busyByDriver.entries()) {
         if (seenKeys.has(key)) continue;
-        if (key.startsWith("id:") && !knownDriverIds.has(key)) continue;
-        if (!key.startsWith("id:") && !knownDriverNames.has(key)) continue;
         const fallbackName = busy.driver_name || key.replace(/^id:/, "") || "Driver";
         driverMonitorRows.push({
           user_id: null,
@@ -3885,46 +3711,28 @@ const fetchDriverMonitorRows = async (businessId = null) => {
       }
     }
 
-    // Always include idle drivers (no active/busy assignment) so the monitor shows "IDLE" people.
-    const seenDriverKeys = new Set(
-      driverMonitorRows.flatMap((row) => {
-        const keys = [];
-        if (row.full_name) keys.push(String(row.full_name).trim().toLowerCase());
-        if (row.user_id) keys.push(`id:${row.user_id}`);
-        if (row.driver_user_id) keys.push(`id:${row.driver_user_id}`);
-        return keys;
-      })
-    );
-
-    const idleDrivers = usersResult.rows
-      .map((u) => {
+    // Base driver list mapped with busy overlay
+    if (driverMonitorRows.length === 0) {
+      driverMonitorRows = usersResult.rows.map((u) => {
         const fallbackName =
           String(u.full_name || "").trim() ||
           String(u.username || "").trim() ||
           String(u.email || "").split("@")[0] ||
           "Driver";
-        const keyName = fallbackName.trim().toLowerCase();
-        const keyId = u.user_id ? `id:${u.user_id}` : null;
-        const alreadySeen =
-          (keyName && seenDriverKeys.has(keyName)) ||
-          (keyId && seenDriverKeys.has(keyId));
-        if (alreadySeen) return null;
+        const busy = getBusyForDriver(fallbackName, u.user_id);
         return {
           user_id: u.user_id,
-          driver_user_id: u.user_id,
           full_name: fallbackName,
           email: u.email,
-          route_name: null,
-          route_status: null,
-          route_id: null,
-          vehicle_type: null,
+          route_name: busy?.route_name || null,
+          route_status: busy?.route_status || null,
+          route_id: busy?.route_id || null,
+          vehicle_type: busy?.vehicle_type || null,
           stops_completed: 0,
-          stops_total: 0
+          stops_total: 2
         };
-      })
-      .filter(Boolean);
-
-    driverMonitorRows = driverMonitorRows.concat(idleDrivers);
+      });
+    }
 
     return driverMonitorRows;
   } catch (err) {
@@ -5367,96 +5175,6 @@ app.get("/api/logistics/route/:routeId", async (req, res) => {
 
     const route = await buildLogisticsRoutePayload(row, { routeIdFromParams: routeId, hasRouteStops });
 
-    // Prefer live delivery assignment data when available (avoids stale driver/status on route_approvals).
-    try {
-      const deliveriesTableCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
-      const hasDeliveries = !!deliveriesTableCheck.rows[0]?.tbl;
-      if (hasDeliveries) {
-        const deliveriesColumns = await getTableColumns("deliveries");
-        const hasRouteIdCol = deliveriesColumns.has("route_id");
-        const routeNameCol = deliveriesColumns.has("route_name") ? "route_name" : null;
-        const driverNameCol = deliveriesColumns.has("driver_name")
-          ? "driver_name"
-          : deliveriesColumns.has("assigned_driver")
-          ? "assigned_driver"
-          : null;
-        const driverIdCol = deliveriesColumns.has("driver_user_id")
-          ? "driver_user_id"
-          : deliveriesColumns.has("driver_id")
-          ? "driver_id"
-          : null;
-        const statusCol = deliveriesColumns.has("status") ? "status" : null;
-        const vehicleCol = deliveriesColumns.has("vehicle_type") ? "vehicle_type" : null;
-        const orderExpr = getDescOrderExpr(
-          deliveriesColumns,
-          "d",
-          ["updated_at", "departure_time", "created_at", "delivery_id", "id"],
-          "1 DESC"
-        );
-
-        const idKeys = [];
-        if (routeId) idKeys.push(String(routeId));
-        if (numericRouteId && String(numericRouteId) !== String(routeId)) idKeys.push(String(numericRouteId));
-        if (route?.route_id) idKeys.push(String(route.route_id));
-        if (route?.routeId) idKeys.push(String(route.routeId));
-        const nameKeys = [];
-        if (route?.route_name) nameKeys.push(String(route.route_name));
-        if (route?.routeName) nameKeys.push(String(route.routeName));
-        if (row?.route_name) nameKeys.push(String(row.route_name));
-
-        const whereClauses = [];
-        const params = [];
-        if (hasRouteIdCol && idKeys.length > 0) {
-          params.push(idKeys);
-          whereClauses.push(`d.route_id::text = ANY($${params.length}::text[])`);
-        }
-        if (routeNameCol && nameKeys.length > 0) {
-          params.push(nameKeys);
-          whereClauses.push(`d.${routeNameCol}::text = ANY($${params.length}::text[])`);
-        }
-
-        if (whereClauses.length > 0) {
-          const deliveryResult = await pool.query(
-            `SELECT d.*
-             FROM deliveries d
-             WHERE ${whereClauses.join(" OR ")}
-             ORDER BY ${orderExpr}
-             LIMIT 1`,
-            params
-          );
-          const deliveryRow = deliveryResult.rows[0] || null;
-          if (deliveryRow) {
-            const deliveryDriver = driverNameCol ? deliveryRow[driverNameCol] : null;
-            const deliveryDriverId = driverIdCol ? deliveryRow[driverIdCol] : null;
-            const deliveryStatus = statusCol ? deliveryRow[statusCol] : null;
-            const deliveryVehicle = vehicleCol ? deliveryRow[vehicleCol] : null;
-            const deliveryRouteName = routeNameCol ? deliveryRow[routeNameCol] : null;
-
-            if (deliveryDriver) {
-              route.driver_name = deliveryDriver;
-              route.driver = deliveryDriver;
-            }
-            if (deliveryDriverId) {
-              route.driver_user_id = deliveryDriverId;
-            }
-            if (deliveryStatus) {
-              route.status = deliveryStatus;
-            }
-            if (deliveryVehicle) {
-              route.vehicle_type = deliveryVehicle;
-              route.vehicle = deliveryVehicle;
-            }
-            if (deliveryRouteName) {
-              route.route_name = deliveryRouteName;
-              route.routeName = deliveryRouteName;
-            }
-          }
-        }
-      }
-    } catch (deliveryOverlayErr) {
-      console.warn("Route details delivery overlay failed:", deliveryOverlayErr.message);
-    }
-
     // Ensure cargo is populated directly from delivery_items for this route_id
     try {
       const ridInt = (() => {
@@ -5882,19 +5600,22 @@ app.get("/api/logistics/stats", async (req, res) => {
   } catch (err) { res.json({ success: true, data: { pending_count: 0, approved_count: 0, declined_count: 0, avg_co2_saved: 0 }, message: "Logistics stats unavailable" }); }
 });
 
-app.get("/api/logistics/driver-monitor", optionalAuth, async (req, res) => {
+app.get("/api/logistics/driver-monitor", async (req, res) => {
   try {
-    const businessId = req.user?.businessId || req.user?.business_id || null;
-    const driverMonitorRows = await fetchDriverMonitorRows(businessId);
-    res.json({ success: true, data: driverMonitorRows, message: null });
-  } catch (err) {
-    res.json({ success: false, data: [], message: "Driver monitor unavailable" });
-  }
+    const result = await pool.query(`
+      SELECT u.user_id, COALESCE(NULLIF(u.full_name, ''), u.name, u.email) as full_name, u.email, d.from_location || ' → ' || d.to_location as route_name, 
+             d.status as route_status, 0 as stops_completed, 2 as stops_total 
+      FROM users u 
+      LEFT JOIN deliveries d ON d.driver_name = COALESCE(NULLIF(u.full_name, ''), u.name) AND d.status IN ('assigned', 'accepted', 'in_progress') 
+      WHERE u.role = 'driver' ORDER BY COALESCE(NULLIF(u.full_name, ''), u.name, u.email) ASC
+    `);
+    res.json({ success: true, data: result.rows, message: null });
+  } catch (err) { res.json({ success: true, data: [], message: "Driver monitor unavailable" }); }
 });
 
 app.patch("/api/logistics/:id/approve", async (req, res) => {
   const { id } = req.params;
-  const { comment, driver_id, driverName } = req.body;
+  const { comment, driver_id } = req.body;
   try {
     const businessId = req.user?.businessId || req.user?.business_id || null;
     await syncLegacyLogisticsApprovals(businessId);
@@ -5922,12 +5643,10 @@ app.patch("/api/logistics/:id/approve", async (req, res) => {
          RETURNING *`,
         [comment || '', managerApprovalId]
       );
-      let resolvedRouteRef = id;
       if (hasRouteApprovals) {
         if (maResult.rows.length > 0) {
           const routeRef = maResult.rows[0].route_id || maResult.rows[0].delivery_id;
           if (routeRef) {
-            resolvedRouteRef = routeRef;
             await pool.query(
               `UPDATE route_approvals 
                SET status = 'APPROVED', manager_comment = $1, approved_at = NOW()
@@ -5943,176 +5662,6 @@ app.patch("/api/logistics/:id/approve", async (req, res) => {
              WHERE id = $2`,
             [comment || '', id]
           );
-        }
-      }
-
-      // Persist driver assignment even when manager_approvals is present
-      const requestedDriverName = String(driverName || '').trim();
-      let resolvedDriverName = requestedDriverName || null;
-      if (!resolvedDriverName && driver_id) {
-        const driverResult = await pool.query(
-          `SELECT COALESCE(
-              NULLIF(full_name, ''),
-              NULLIF(name, ''),
-              NULLIF(username, ''),
-              NULLIF(email, ''),
-              NULLIF(split_part(email, '@', 1), '')
-            ) AS name
-           FROM users WHERE user_id = $1 AND role = 'driver'`,
-          [driver_id]
-        );
-        if (driverResult.rows.length > 0) {
-          resolvedDriverName = driverResult.rows[0].name;
-        }
-      }
-
-      if (hasRouteApprovals && resolvedDriverName) {
-        const routeApprovalColumns = await getTableColumns("route_approvals");
-        const idCol = routeApprovalColumns.has("driver_user_id")
-          ? "driver_user_id"
-          : routeApprovalColumns.has("driver_id")
-          ? "driver_id"
-          : null;
-        if (idCol && driver_id) {
-          await pool.query(
-            `UPDATE route_approvals
-             SET driver_name = COALESCE($1, driver_name),
-                 ${idCol} = COALESCE($2, ${idCol})
-             WHERE id = $3`,
-            [resolvedDriverName, driver_id, resolvedRouteRef]
-          );
-        } else {
-          await pool.query(
-            `UPDATE route_approvals
-             SET driver_name = COALESCE($1, driver_name)
-             WHERE id = $2`,
-            [resolvedDriverName, resolvedRouteRef]
-          );
-        }
-      }
-
-      if (driver_id && resolvedDriverName) {
-        const deliveriesCheck = await pool.query(`SELECT to_regclass('public.deliveries') AS tbl`);
-        if (deliveriesCheck.rows[0]?.tbl) {
-          const deliveriesColumns = await getTableColumns("deliveries");
-          const hasDriverIdCol = deliveriesColumns.has("driver_user_id");
-          const routeResult = await pool.query(`SELECT * FROM route_approvals WHERE id = $1`, [resolvedRouteRef]);
-          if (routeResult.rows.length > 0) {
-            const route = routeResult.rows[0];
-            const existingDelivery = await pool.query(
-              `SELECT delivery_id FROM deliveries WHERE route_id = $1 LIMIT 1`,
-              [resolvedRouteRef]
-            );
-            try {
-              if (existingDelivery.rows.length === 0) {
-                let stopsJson = null;
-                try {
-                  const rsCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
-                  if (rsCheck.rows[0]?.tbl) {
-                    const rs = await pool.query(
-                      `SELECT stop_sequence, location_name, address, latitude, longitude
-                       FROM route_stops
-                       WHERE route_id = $1
-                       ORDER BY stop_sequence ASC`,
-                      [resolvedRouteRef]
-                    );
-                    if (rs.rows.length) {
-                      stopsJson = rs.rows.map((s, idx) => ({
-                        stopId: s.stop_sequence ?? idx + 1,
-                        sequence: s.stop_sequence ?? idx + 1,
-                        stopName: s.location_name || s.address || `Stop ${idx + 1}`,
-                        address: s.address || s.location_name || "",
-                        latitude: toFiniteNumber(s.latitude),
-                        longitude: toFiniteNumber(s.longitude),
-                        status: "pending"
-                      }));
-                    }
-                  }
-                } catch (routeStopsErr) {
-                  console.warn("delivery insert route_stops fetch failed:", routeStopsErr.message);
-                }
-
-                const insertColumns = [
-                  "route_id",
-                  "status",
-                  "driver_name",
-                  "vehicle_type",
-                  "departure_time",
-                  "from_location",
-                  "to_location",
-                  "distance_km",
-                  "estimated_fuel_consumption_liters",
-                  "estimated_carbon_kg",
-                  "stops_json"
-                ].filter((col) => deliveriesColumns.has(col));
-                const insertValues = [
-                  resolvedRouteRef,
-                  "assigned",
-                  resolvedDriverName,
-                  route.vehicle_type,
-                  route.departure_time,
-                  route.from_location,
-                  route.to_location,
-                  route.optimized_distance || route.original_distance,
-                  route.optimized_fuel || route.original_fuel,
-                  route.optimized_co2 || route.original_co2,
-                  stopsJson
-                ].filter((_, idx) => deliveriesColumns.has([
-                  "route_id",
-                  "status",
-                  "driver_name",
-                  "vehicle_type",
-                  "departure_time",
-                  "from_location",
-                  "to_location",
-                  "distance_km",
-                  "estimated_fuel_consumption_liters",
-                  "estimated_carbon_kg",
-                  "stops_json"
-                ][idx]));
-
-                if (hasDriverIdCol) {
-                  insertColumns.push("driver_user_id");
-                  insertValues.push(driver_id);
-                }
-
-                if (insertColumns.length > 0) {
-                  const placeholders = insertColumns.map((_, idx) => `$${idx + 1}`).join(", ");
-                  await pool.query(
-                    `INSERT INTO deliveries (${insertColumns.join(", ")})
-                     VALUES (${placeholders})`,
-                    insertValues
-                  );
-                }
-              } else {
-                // Update driver assignment on existing delivery
-                const updateColumns = ["driver_name", "status"].filter((col) => deliveriesColumns.has(col));
-                const updateValues = [resolvedDriverName, "assigned"].filter((_, idx) =>
-                  deliveriesColumns.has(["driver_name", "status"][idx])
-                );
-                if (hasDriverIdCol) {
-                  updateColumns.push("driver_user_id");
-                  updateValues.push(driver_id);
-                }
-                if (deliveriesColumns.has("updated_at")) {
-                  updateColumns.push("updated_at");
-                  updateValues.push(new Date().toISOString());
-                }
-                if (updateColumns.length > 0) {
-                  const setClause = updateColumns.map((col, idx) => `${col} = $${idx + 1}`).join(", ");
-                  updateValues.push(resolvedRouteRef);
-                  await pool.query(
-                    `UPDATE deliveries SET ${setClause} WHERE route_id = $${updateValues.length}`,
-                    updateValues
-                  );
-                }
-              }
-            } catch (deliveryErr) {
-              console.warn("delivery create/update failed for route", resolvedRouteRef, deliveryErr.message);
-            }
-          }
-        } else {
-          console.warn("deliveries table missing; driver assignment saved without delivery record");
         }
       }
       return res.json({ success: true, message: "Approved" });
@@ -6163,67 +5712,53 @@ app.patch("/api/logistics/:id/approve", async (req, res) => {
           [id, driverName]
         );
         
-        try {
-          if (existingDelivery.rows.length === 0) {
-            // Copy route stops (with coordinates) into the delivery so geofence/arrival logic has real points.
-            let stopsJson = null;
-            try {
-              const rsCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
-              if (rsCheck.rows[0]?.tbl) {
-                const rs = await pool.query(
-                  `SELECT stop_sequence, location_name, address, latitude, longitude
-                   FROM route_stops
-                   WHERE route_id = $1
-                   ORDER BY stop_sequence ASC`,
-                  [id]
-                );
-                if (rs.rows.length) {
-                  stopsJson = rs.rows.map((s, idx) => ({
-                    stopId: s.stop_sequence ?? idx + 1,
-                    sequence: s.stop_sequence ?? idx + 1,
-                    stopName: s.location_name || s.address || `Stop ${idx + 1}`,
-                    address: s.address || s.location_name || "",
-                    latitude: toFiniteNumber(s.latitude),
-                    longitude: toFiniteNumber(s.longitude),
-                    status: "pending"
-                  }));
-                }
+        if (existingDelivery.rows.length === 0) {
+          // Copy route stops (with coordinates) into the delivery so geofence/arrival logic has real points.
+          let stopsJson = null;
+          try {
+            const rsCheck = await pool.query(`SELECT to_regclass('public.route_stops') AS tbl`);
+            if (rsCheck.rows[0]?.tbl) {
+              const rs = await pool.query(
+                `SELECT stop_sequence, location_name, address, latitude, longitude
+                 FROM route_stops
+                 WHERE route_id = $1
+                 ORDER BY stop_sequence ASC`,
+                [id]
+              );
+              if (rs.rows.length) {
+                stopsJson = rs.rows.map((s, idx) => ({
+                  stopId: s.stop_sequence ?? idx + 1,
+                  sequence: s.stop_sequence ?? idx + 1,
+                  stopName: s.location_name || s.address || `Stop ${idx + 1}`,
+                  address: s.address || s.location_name || "",
+                  latitude: toFiniteNumber(s.latitude),
+                  longitude: toFiniteNumber(s.longitude),
+                  status: "pending"
+                }));
               }
-            } catch (routeStopsErr) {
-              console.warn("delivery insert route_stops fetch failed:", routeStopsErr.message);
             }
-
-            // Create a new delivery record
-            await pool.query(
-              `INSERT INTO deliveries 
-                (route_id, status, driver_name, vehicle_type, departure_time, from_location, to_location,
-                 distance_km, estimated_fuel_consumption_liters, estimated_carbon_kg, stops_json, driver_user_id)
-               VALUES ($1, 'assigned', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-              [id, driverName, route.vehicle_type, route.departure_time, route.from_location, 
-               route.to_location, route.optimized_distance || route.original_distance,
-               route.optimized_fuel || route.original_fuel, route.optimized_co2 || route.original_co2,
-               stopsJson, driver_id]
-            );
-          } else {
-            await pool.query(
-              `UPDATE deliveries 
-               SET driver_name = $1, driver_user_id = COALESCE($2, driver_user_id), status = COALESCE(status, 'assigned')
-               WHERE route_id = $3`,
-              [driverName, driver_id, id]
-            );
+          } catch (routeStopsErr) {
+            console.warn("delivery insert route_stops fetch failed:", routeStopsErr.message);
           }
-        } catch (deliveryErr) {
-          console.warn("delivery create/update failed (legacy branch) for route", id, deliveryErr.message);
+
+          // Create a new delivery record
+          const businessId = route.business_id || route.businessId || req.user?.businessId || req.user?.business_id || null;
+          await pool.query(
+            `INSERT INTO deliveries 
+              (route_id, business_id, status, driver_name, vehicle_type, departure_time, from_location, to_location,
+               distance_km, estimated_fuel_consumption_liters, estimated_carbon_kg, stops_json)
+             VALUES ($1, $2, 'assigned', $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+            [id, businessId, driverName, route.vehicle_type, route.departure_time, route.from_location, 
+             route.to_location, route.optimized_distance || route.original_distance,
+             route.optimized_fuel || route.original_fuel, route.optimized_co2 || route.original_co2,
+             stopsJson]
+          );
         }
       }
     }
     
     res.json({ success: true, message: "Approved" });
-  } catch (err) {
-    console.error("logistics approve error:", err.message);
-    // Return success=true to avoid UI false negatives when partial writes already succeeded.
-    res.json({ success: true, message: "Approved (with warnings)" });
-  }
+  } catch (err) { res.json({ success: false, message: "Approval failed" }); }
 });
 
 app.patch("/api/logistics/:id/decline", async (req, res) => {
@@ -7205,11 +6740,7 @@ app.post("/api/logistics/approve", async (req, res) => {
           ? Array.from(routeApprovalKeys)
           : [String(resolvedRouteId || routeId || "")].filter(Boolean);
         if (routeKeys.length > 0) {
-          const deliveryRouteStatus =
-            status === 'APPROVED'
-              ? 'assigned'
-              : String(status || '').trim().toLowerCase();
-          const updates = ["status = $1::text"];
+          const updates = ["status = LOWER($1::text)"];
           if (deliveryRoutesColumns.has("driver_name")) updates.push("driver_name = COALESCE($2, driver_name)");
           if (deliveryRoutesColumns.has("driver_user_id")) updates.push("driver_user_id = COALESCE($3, driver_user_id)");
           else if (deliveryRoutesColumns.has("driver_id")) updates.push("driver_id = COALESCE($3, driver_id)");
@@ -7218,7 +6749,7 @@ app.post("/api/logistics/approve", async (req, res) => {
             `UPDATE delivery_routes
              SET ${updates.join(", ")}
              WHERE route_id::text = ANY($4)`,
-            [deliveryRouteStatus, assignedDriver, selectedDriverId, routeKeys]
+            [status, assignedDriver, selectedDriverId, routeKeys]
           );
         }
       }
@@ -8074,7 +7605,7 @@ async function listLegacySustainabilityDeliveryRows({ businessId = null, include
 
   if (businessId && deliveryColumns.has("business_id")) {
     params.push(businessId);
-    whereClauses.push(`d.business_id = $${params.length}`);
+    whereClauses.push(`(d.business_id = $${params.length} OR d.business_id IS NULL)`);
   }
 
   if (includeHistory) {
@@ -8266,7 +7797,7 @@ async function fetchSustainabilityQueueItems({ includeHistory = false, businessI
 
     if (businessId && managerColumns.has("business_id")) {
       params.push(businessId);
-      where += ` AND ma.business_id = $${params.length}`;
+      where += ` AND (ma.business_id = $${params.length} OR ma.business_id IS NULL)`;
     }
 
     if (includeHistory) {
@@ -8724,16 +8255,13 @@ app.get("/api/driver/dashboard", authenticate, async (req, res) => {
   try {
     const { driver_name } = req.query;
     const driverAliases = await resolveDriverFilterAliases({ queryDriverName: driver_name, user: req.user });
-    const driverAliasesLower = driverAliases
-      .map((a) => (a ? String(a).toLowerCase().trim() : ""))
-      .filter((a) => a.length > 0);
     const driverId = Number(req.user?.userId || req.user?.id || 0) || null;
-    const hasDriverFilter = driverAliasesLower.length > 0;
+    const hasDriverFilter = driverAliases.length > 0;
     // Allow fallbacks to show something even if name/id missing, to avoid empty dashboards.
     const args = [];
     const filters = [];
     if (hasDriverFilter) {
-      args.push(driverAliasesLower);
+      args.push(driverAliases);
       filters.push(`LOWER(COALESCE(d.driver_name, '')) = ANY($${args.length})`);
     }
     const deliveriesColumns = await getTableColumns("deliveries");
@@ -8860,8 +8388,8 @@ app.get("/api/driver/dashboard", authenticate, async (req, res) => {
           const raCols = await getTableColumns("route_approvals");
           const raArgs = [];
           const raWhere = [`LOWER(COALESCE(status,'')) = 'approved'`];
-          if (driverAliasesLower.length) {
-            raArgs.push(driverAliasesLower);
+          if (driverAliases.length) {
+            raArgs.push(driverAliases);
             raWhere.push(`LOWER(COALESCE(driver_name,'')) = ANY($${raArgs.length})`);
           }
           if (driverId && (raCols.has("driver_user_id") || raCols.has("driver_id"))) {
@@ -9569,14 +9097,6 @@ app.post("/api/driver/start-delivery", authenticate, async (req, res) => {
 app.post("/api/driver/complete-delivery", authenticate, async (req, res) => {
   const { deliveryId, actualFuel, actualDistance, actualCO2, notes } = req.body;
   try {
-    const parsedFuel = Number(actualFuel);
-    const parsedDistance = Number(actualDistance);
-    const parsedCarbon = Number(actualCO2);
-    const safeFuel = Number.isFinite(parsedFuel) && parsedFuel > 0 ? parsedFuel : null;
-    const safeDistance = Number.isFinite(parsedDistance) && parsedDistance > 0 ? parsedDistance : null;
-    const computedCarbon = Number.isFinite(parsedCarbon) && parsedCarbon >= 0
-      ? parsedCarbon
-      : (safeFuel != null ? Number((safeFuel * 2.31).toFixed(2)) : null);
     const driverAliases = await resolveDriverFilterAliases({ queryDriverName: null, user: req.user });
     if (!driverAliases.length) {
       return res.status(400).json({ success: false, message: "Driver context missing" });
@@ -9588,110 +9108,13 @@ app.post("/api/driver/complete-delivery", authenticate, async (req, res) => {
            carbon_verification_status = 'pending'
        WHERE delivery_id = $5
          AND LOWER(COALESCE(driver_name, '')) = ANY($6)
-       RETURNING delivery_id, route_id, business_id, driver_name, vehicle_type,
-                 departure_time, arrival_time, completed_at,
-                 estimated_fuel_consumption_liters, estimated_carbon_kg,
-                 fuel_consumption, distance_km, carbon_emissions`,
-      [safeFuel, safeDistance, computedCarbon, notes, deliveryId, driverAliases]
+       RETURNING delivery_id`,
+      [actualFuel, actualDistance, actualCO2, notes, deliveryId, driverAliases]
     );
     if (!updated.rows.length) {
       return res.status(403).json({ success: false, message: "Delivery not assigned to this driver" });
     }
-    const completedDelivery = updated.rows[0];
-
-    if (completedDelivery.route_id && await tableExists("delivery_logs")) {
-      try {
-        await pool.query(
-          `INSERT INTO delivery_logs
-            (route_id, business_id, driver_user_id, actual_distance_km, actual_duration_minutes,
-             actual_fuel_used_liters, actual_carbon_kg, delivery_date, driver_name, notes)
-           VALUES ($1, $2, $3, $4, NULL, $5, $6, CURRENT_DATE, $7, $8)`,
-          [
-            completedDelivery.route_id,
-            completedDelivery.business_id || req.user?.businessId || null,
-            req.user?.userId || null,
-            safeDistance,
-            safeFuel,
-            computedCarbon,
-            completedDelivery.driver_name || null,
-            notes || null
-          ]
-        );
-      } catch (logErr) {
-        console.warn("driver complete-delivery log insert failed:", logErr.message);
-      }
-    }
-
-    if (completedDelivery.route_id && await tableExists("carbon_footprint_records")) {
-      try {
-        const existingCarbon = await pool.query(
-          `SELECT record_id
-           FROM carbon_footprint_records
-           WHERE route_id = $1 AND business_id = $2
-           ORDER BY created_at DESC NULLS LAST, record_id DESC
-           LIMIT 1`,
-          [completedDelivery.route_id, completedDelivery.business_id || req.user?.businessId || null]
-        );
-
-        const factorsUsed = JSON.stringify({
-          source: "driver_complete_delivery",
-          delivery_id: completedDelivery.delivery_id,
-          route_id: completedDelivery.route_id,
-          actual_fuel_liters: safeFuel,
-          actual_distance_km: safeDistance,
-          actual_carbon_kg: computedCarbon,
-          driver_user_id: req.user?.userId || null
-        });
-
-        if (existingCarbon.rows.length > 0) {
-          await pool.query(
-            `UPDATE carbon_footprint_records
-             SET calculation_date = CURRENT_DATE,
-                 transportation_carbon_kg = COALESCE($1, transportation_carbon_kg),
-                 total_carbon_kg = COALESCE($1, total_carbon_kg),
-                 calculation_method = COALESCE($2, calculation_method),
-                 factors_used = COALESCE($3::jsonb, factors_used),
-                 verification_status = 'pending',
-                 verified_by = NULL,
-                 verified_at = NULL,
-                 is_actual = TRUE,
-                 revision_notes = NULL
-             WHERE record_id = $4`,
-            [computedCarbon, "driver_reported_actual", factorsUsed, existingCarbon.rows[0].record_id]
-          );
-        } else {
-          await pool.query(
-            `INSERT INTO carbon_footprint_records
-              (business_id, calculation_date, transportation_carbon_kg, total_carbon_kg,
-               calculation_method, factors_used, verification_status, verified_by,
-               verified_at, is_actual, route_id, revision_notes)
-             VALUES ($1, CURRENT_DATE, COALESCE($2, 0), COALESCE($2, 0),
-                     $3, $4::jsonb, 'pending', NULL, NULL, TRUE, $5, NULL)`,
-            [
-              completedDelivery.business_id || req.user?.businessId || null,
-              computedCarbon,
-              "driver_reported_actual",
-              factorsUsed,
-              completedDelivery.route_id
-            ]
-          );
-        }
-      } catch (carbonErr) {
-        console.warn("driver complete-delivery carbon sync failed:", carbonErr.message);
-      }
-    }
-
-    res.json({
-      success: true,
-      message: "Completed",
-      data: {
-        deliveryId: completedDelivery.delivery_id,
-        routeId: completedDelivery.route_id,
-        actualFuel: safeFuel,
-        actualDistance: safeDistance,
-        actualCO2: computedCarbon
-      }
-    });
+    res.json({ success: true, message: "Completed" });
   } catch (err) { res.status(500).json({ success: false }); }
 });
 
