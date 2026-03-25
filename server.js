@@ -3377,7 +3377,8 @@ const fetchDriverMonitorRows = async (businessId = null) => {
     const usersWhere = ["u.role = 'driver'"];
     if (businessId && hasBusinessColumn) {
       usersParams.push(businessId);
-      usersWhere.push(`u.business_id = $${usersParams.length}`);
+      // Allow global drivers (NULL business) to appear alongside tenant-scoped drivers
+      usersWhere.push(`(u.business_id = $${usersParams.length} OR u.business_id IS NULL)`);
     }
     const idExpr = usersColumns.has("user_id")
       ? "u.user_id"
